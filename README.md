@@ -3,7 +3,7 @@
 Платформа доставки супермаркета:
 - backend: Node.js + Express + TypeScript
 - frontend: React + TSX + Vite
-- БД: SQLite
+- БД: PostgreSQL
 
 ## Функции
 
@@ -49,6 +49,32 @@ npm run dev:web
 
 Открыть: `http://localhost:5173`
 
+## Локальный PostgreSQL (подготовка)
+
+В проект добавлен локальный Postgres через Docker Compose:
+
+```bash
+npm run db:up
+```
+
+Проверка логов:
+
+```bash
+npm run db:logs
+```
+
+Остановка:
+
+```bash
+npm run db:down
+```
+
+Пример переменных для Postgres: `.env.postgres.example`
+
+Важно:
+- backend уже работает через PostgreSQL (`DATABASE_URL`);
+- для локальной разработки используйте `docker-compose.postgres.yml`.
+
 ## Production запуск
 
 Собрать frontend и backend:
@@ -64,6 +90,32 @@ npm start
 ```
 
 Открыть: `http://localhost:4000`
+
+## Deploy на Vercel
+
+Проект подготовлен для Vercel:
+- frontend деплоится как static build (`frontend/dist`)
+- backend работает как serverless function (`api/index.ts`)
+
+### Шаги
+
+1. Подключите репозиторий в Vercel.
+2. В настройках проекта задайте переменные окружения:
+   - `JWT_SECRET`
+   - `GEOCODER_PROVIDER`
+   - `YANDEX_GEOCODER_API_KEY` (если используете `yandex`)
+3. Deploy.
+
+### Важно про БД
+
+Используется PostgreSQL через `DATABASE_URL`.
+Для Vercel backend в serverless-режиме лучше подключать внешний Postgres (Supabase, Neon, Render Postgres и т.д.).
+
+### Frontend на Vercel + API отдельно
+
+Для подключения фронтенда Vercel к внешнему API укажи env в Vercel:
+
+`VITE_API_BASE_URL=https://your-api-domain-or-tunnel`
 
 ## Тестовые аккаунты
 

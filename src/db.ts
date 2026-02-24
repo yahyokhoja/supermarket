@@ -1,171 +1,162 @@
 import bcrypt from 'bcryptjs';
-import Database from 'better-sqlite3';
+import { Pool } from 'pg';
 
-export function connectDb(dbPath: string) {
-  const db = new Database(dbPath);
-  db.pragma('journal_mode = WAL');
-  db.pragma('foreign_keys = ON');
-  return db;
+export function connectDb(connectionString: string) {
+  return new Pool({ connectionString });
 }
 
-function ensureColumn(db: any, table: string, column: string, definition: string) {
-  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
-  const exists = columns.some((col) => col.name === column);
-  if (!exists) {
-    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
-  }
-}
-
-export function initDb(db: any) {
-  db.exec(`
+export async function initDb(pool: Pool) {
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id BIGSERIAL PRIMARY KEY,
       full_name TEXT NOT NULL,
       email TEXT UNIQUE NOT NULL,
       phone TEXT,
       address TEXT,
       password_hash TEXT NOT NULL,
       role TEXT NOT NULL DEFAULT 'customer',
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
     CREATE TABLE IF NOT EXISTS products (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id BIGSERIAL PRIMARY KEY,
       name TEXT NOT NULL,
       description TEXT,
-      price REAL NOT NULL,
+      price NUMERIC(12,2) NOT NULL,
       category TEXT,
       image_url TEXT,
-      in_stock INTEGER NOT NULL DEFAULT 1,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      in_stock BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
     CREATE TABLE IF NOT EXISTS cart_items (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER NOT NULL,
-      product_id INTEGER NOT NULL,
+      id BIGSERIAL PRIMARY KEY,
+      user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      product_id BIGINT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
       quantity INTEGER NOT NULL CHECK(quantity > 0),
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      UNIQUE(user_id, product_id),
-      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
-      FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(user_id, product_id)
     );
 
     CREATE TABLE IF NOT EXISTS couriers (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER UNIQUE NOT NULL,
+      id BIGSERIAL PRIMARY KEY,
+      user_id BIGINT UNIQUE NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       vehicle_type TEXT,
       status TEXT NOT NULL DEFAULT 'offline',
       max_active_orders INTEGER NOT NULL DEFAULT 5,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
     CREATE TABLE IF NOT EXISTS orders (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER NOT NULL,
+      id BIGSERIAL PRIMARY KEY,
+      user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       status TEXT NOT NULL DEFAULT 'pending',
-      total REAL NOT NULL,
+      total NUMERIC(12,2) NOT NULL,
       delivery_address TEXT NOT NULL,
-      delivery_lat REAL,
-      delivery_lng REAL,
-      assigned_courier_id INTEGER,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
-      FOREIGN KEY(assigned_courier_id) REFERENCES couriers(id) ON DELETE SET NULL
+      delivery_lat DOUBLE PRECISION,
+      delivery_lng DOUBLE PRECISION,
+      assigned_courier_id BIGINT REFERENCES couriers(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
     CREATE TABLE IF NOT EXISTS order_items (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      order_id INTEGER NOT NULL,
-      product_id INTEGER NOT NULL,
+      id BIGSERIAL PRIMARY KEY,
+      order_id BIGINT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+      product_id BIGINT NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
       product_name TEXT NOT NULL,
       quantity INTEGER NOT NULL,
-      unit_price REAL NOT NULL,
-      FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE,
-      FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE RESTRICT
+      unit_price NUMERIC(12,2) NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS order_events (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      order_id INTEGER NOT NULL,
+      id BIGSERIAL PRIMARY KEY,
+      order_id BIGINT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
       status TEXT NOT NULL,
       comment TEXT,
-      created_by INTEGER,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE,
-      FOREIGN KEY(created_by) REFERENCES users(id) ON DELETE SET NULL
+      created_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
-
-    CREATE TRIGGER IF NOT EXISTS update_orders_timestamp
-    AFTER UPDATE ON orders
-    FOR EACH ROW
-    BEGIN
-      UPDATE orders SET updated_at = datetime('now') WHERE id = OLD.id;
-    END;
   `);
 
-  ensureColumn(db, 'orders', 'delivery_lat', 'REAL');
-  ensureColumn(db, 'orders', 'delivery_lng', 'REAL');
+  await pool.query(`
+    CREATE OR REPLACE FUNCTION set_orders_updated_at()
+    RETURNS TRIGGER AS $$
+    BEGIN
+      NEW.updated_at = NOW();
+      RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+  `);
+
+  await pool.query(`
+    DROP TRIGGER IF EXISTS trg_orders_updated_at ON orders;
+    CREATE TRIGGER trg_orders_updated_at
+    BEFORE UPDATE ON orders
+    FOR EACH ROW
+    EXECUTE FUNCTION set_orders_updated_at();
+  `);
 }
 
-export function seedProducts(db: any) {
-  const count = db.prepare('SELECT COUNT(*) as count FROM products').get() as { count: number };
-  if (count.count > 0) return;
-
-  const insert = db.prepare(`
-    INSERT INTO products (name, description, price, category, image_url, in_stock)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `);
+export async function seedProducts(pool: Pool) {
+  const countRow = await pool.query<{ count: string }>('SELECT COUNT(*)::text as count FROM products');
+  if (Number(countRow.rows[0]?.count || '0') > 0) return;
 
   const products = [
-    ['Молоко 2.5%', 'Свежайшее молоко 1 л', 1.5, 'Молочные продукты', 'https://images.unsplash.com/photo-1563636619-e9143da7973b?w=800', 1],
-    ['Хлеб цельнозерновой', 'Мягкий хлеб 500 г', 1.2, 'Выпечка', 'https://images.unsplash.com/photo-1509440159596-0249088772ff?w=800', 1],
-    ['Яйца С1', 'Упаковка 10 шт', 2.1, 'Бакалея', 'https://images.unsplash.com/photo-1587486913049-53fc88980cfc?w=800', 1],
-    ['Куриное филе', 'Охлажденное, 1 кг', 5.8, 'Мясо', 'https://images.unsplash.com/photo-1607623814075-e51df1bdc82f?w=800', 1],
-    ['Яблоки', 'Сочные красные яблоки, 1 кг', 2.4, 'Фрукты', 'https://images.unsplash.com/photo-1570913149827-d2ac84ab3f9a?w=800', 1],
-    ['Томаты', 'Спелые томаты, 1 кг', 2.0, 'Овощи', 'https://images.unsplash.com/photo-1592924357228-91a4daadcfea?w=800', 1],
-    ['Сыр Гауда', 'Сыр 300 г', 4.3, 'Молочные продукты', 'https://images.unsplash.com/photo-1486297678162-eb2a19b0a32d?w=800', 1],
-    ['Паста', 'Итальянская паста 450 г', 1.7, 'Бакалея', 'https://images.unsplash.com/photo-1551462147-ff29053bfc14?w=800', 1]
+    ['Молоко 2.5%', 'Свежайшее молоко 1 л', 1.5, 'Молочные продукты', 'https://images.unsplash.com/photo-1563636619-e9143da7973b?w=800', true],
+    ['Хлеб цельнозерновой', 'Мягкий хлеб 500 г', 1.2, 'Выпечка', 'https://images.unsplash.com/photo-1509440159596-0249088772ff?w=800', true],
+    ['Яйца С1', 'Упаковка 10 шт', 2.1, 'Бакалея', 'https://images.unsplash.com/photo-1587486913049-53fc88980cfc?w=800', true],
+    ['Куриное филе', 'Охлажденное, 1 кг', 5.8, 'Мясо', 'https://images.unsplash.com/photo-1607623814075-e51df1bdc82f?w=800', true],
+    ['Яблоки', 'Сочные красные яблоки, 1 кг', 2.4, 'Фрукты', 'https://images.unsplash.com/photo-1570913149827-d2ac84ab3f9a?w=800', true],
+    ['Томаты', 'Спелые томаты, 1 кг', 2.0, 'Овощи', 'https://images.unsplash.com/photo-1592924357228-91a4daadcfea?w=800', true],
+    ['Сыр Гауда', 'Сыр 300 г', 4.3, 'Молочные продукты', 'https://images.unsplash.com/photo-1486297678162-eb2a19b0a32d?w=800', true],
+    ['Паста', 'Итальянская паста 450 г', 1.7, 'Бакалея', 'https://images.unsplash.com/photo-1551462147-ff29053bfc14?w=800', true]
   ];
 
-  const tx = db.transaction(() => {
-    for (const product of products) insert.run(...product);
-  });
-
-  tx();
+  for (const product of products) {
+    await pool.query(
+      `
+        INSERT INTO products (name, description, price, category, image_url, in_stock)
+        VALUES ($1, $2, $3, $4, $5, $6)
+      `,
+      product
+    );
+  }
 }
 
-export function seedUsers(db: any) {
+export async function seedUsers(pool: Pool) {
   const defaultPasswordHash = bcrypt.hashSync('Password123!', 10);
 
-  const adminExists = db.prepare("SELECT id FROM users WHERE email = 'admin@universal.local'").get();
-  if (!adminExists) {
-    db.prepare(`
+  await pool.query(
+    `
       INSERT INTO users (full_name, email, phone, address, password_hash, role)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run('System Admin', 'admin@universal.local', '+10000000001', 'HQ', defaultPasswordHash, 'admin');
-  }
+      VALUES ($1, $2, $3, $4, $5, 'admin')
+      ON CONFLICT (email) DO NOTHING
+    `,
+    ['System Admin', 'admin@universal.local', '+10000000001', 'HQ', defaultPasswordHash]
+  );
 
-  const courierUser = db.prepare("SELECT id, role FROM users WHERE email = 'courier@universal.local'").get() as { id: number; role: string } | undefined;
-  let courierUserId = courierUser?.id;
-
-  if (!courierUserId) {
-    const result = db.prepare(`
+  await pool.query(
+    `
       INSERT INTO users (full_name, email, phone, address, password_hash, role)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run('Default Courier', 'courier@universal.local', '+10000000002', 'City Hub', defaultPasswordHash, 'courier');
-    courierUserId = Number(result.lastInsertRowid);
-  } else if (courierUser && courierUser.role !== 'courier') {
-    db.prepare('UPDATE users SET role = ? WHERE id = ?').run('courier', courierUserId);
-  }
+      VALUES ($1, $2, $3, $4, $5, 'courier')
+      ON CONFLICT (email) DO NOTHING
+    `,
+    ['Default Courier', 'courier@universal.local', '+10000000002', 'City Hub', defaultPasswordHash]
+  );
 
-  const courierExists = db.prepare('SELECT id FROM couriers WHERE user_id = ?').get(courierUserId);
-  if (!courierExists) {
-    db.prepare(`
+  await pool.query("UPDATE users SET role = 'courier' WHERE email = 'courier@universal.local'");
+
+  const courierUser = await pool.query<{ id: string }>("SELECT id::text as id FROM users WHERE email = 'courier@universal.local' LIMIT 1");
+  const courierUserId = Number(courierUser.rows[0]?.id || 0);
+  if (!courierUserId) return;
+
+  await pool.query(
+    `
       INSERT INTO couriers (user_id, vehicle_type, status, max_active_orders)
-      VALUES (?, ?, ?, ?)
-    `).run(courierUserId, 'bike', 'available', 5);
-  }
+      VALUES ($1, 'bike', 'available', 5)
+      ON CONFLICT (user_id) DO NOTHING
+    `,
+    [courierUserId]
+  );
 }

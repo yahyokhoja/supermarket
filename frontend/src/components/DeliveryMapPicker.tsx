@@ -6,11 +6,14 @@ type SearchResult = {
   displayName: string;
   lat: number;
   lng: number;
+  locality?: string | null;
   street?: string | null;
   houseNumber?: string | null;
 };
 
 type Props = {
+  locality: string;
+  onLocalityChange: (locality: string) => void;
   address: string;
   onAddressChange: (address: string) => void;
   houseNumber: string;
@@ -22,6 +25,41 @@ type Props = {
 const DEFAULT_CENTER: LatLng = { lat: 55.751244, lng: 37.618423 };
 const MESSAGE_TYPE = 'delivery-map-click';
 const MESSAGE_SET_CENTER = 'delivery-map-set-center';
+
+function sanitizeHouseInput(raw: string) {
+  const value = raw.trim().replace(/^дом\s*/iu, '');
+  if (!value) return '';
+  const match = value.match(/(\d+[A-Za-zА-Яа-я\-\/]*)/u);
+  return match ? match[1] : '';
+}
+
+function extractLocality(displayName: string) {
+  const parts = displayName
+    .split(',')
+    .map((p) => p.trim())
+    .filter(Boolean);
+  if (!parts.length) return '';
+  const first = parts[0] || '';
+  const second = parts[1] || '';
+  if (/\d/.test(first) && second) return second;
+  return first;
+}
+
+function extractStreet(displayName: string, locality?: string) {
+  const parts = displayName
+    .split(',')
+    .map((p) => p.trim())
+    .filter(Boolean);
+  if (!parts.length) return '';
+
+  const streetPattern = /\b(ул\.?|улица|проспект|пр-т|переулок|пер\.?|бульвар|б-р|шоссе|наб\.?|набережная|road|rd\.?|street|st\.?|avenue|ave\.?)\b/iu;
+  const byMarker = parts.find((p) => streetPattern.test(p));
+  if (byMarker) return byMarker;
+
+  const localityLower = (locality || '').trim().toLowerCase();
+  const filtered = parts.find((p) => p.toLowerCase() !== localityLower && p.length >= 3);
+  return filtered || '';
+}
 
 function mapFrameHtml() {
   return `<!doctype html>
@@ -64,6 +102,8 @@ function mapFrameHtml() {
 }
 
 export default function DeliveryMapPicker({
+  locality,
+  onLocalityChange,
   address,
   onAddressChange,
   houseNumber,
@@ -74,6 +114,7 @@ export default function DeliveryMapPicker({
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<SearchResult[]>([]);
   const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState('');
   const [locating, setLocating] = useState(false);
   const [preciseLocating, setPreciseLocating] = useState(false);
   const [geoError, setGeoError] = useState('');
@@ -81,9 +122,12 @@ export default function DeliveryMapPicker({
   const [geoAccuracy, setGeoAccuracy] = useState<number | null>(null);
   const [manualLat, setManualLat] = useState('');
   const [manualLng, setManualLng] = useState('');
+  const [autoLocTried, setAutoLocTried] = useState(false);
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
   const reverseTimerRef = useRef<number | null>(null);
   const pendingCenterRef = useRef<LatLng | null>(null);
+  const searchTimerRef = useRef<number | null>(null);
+  const autoCityCenterRef = useRef('');
 
   const center = location || DEFAULT_CENTER;
   const frameHtml = useMemo(() => mapFrameHtml(), []);
@@ -104,6 +148,9 @@ export default function DeliveryMapPicker({
     return () => {
       if (reverseTimerRef.current) {
         window.clearTimeout(reverseTimerRef.current);
+      }
+      if (searchTimerRef.current) {
+        window.clearTimeout(searchTimerRef.current);
       }
     };
   }, []);
@@ -148,8 +195,12 @@ export default function DeliveryMapPicker({
 
       if (item.street) {
         onAddressChange(item.street);
-      } else if (item.displayName) {
-        onAddressChange(item.displayName);
+      }
+      if (item.locality) {
+        onLocalityChange(item.locality);
+      } else if (item.displayName && !locality.trim()) {
+        const fallbackLocality = extractLocality(item.displayName);
+        if (fallbackLocality) onLocalityChange(fallbackLocality);
       }
 
       if (item.houseNumber && !houseNumber.trim()) {
@@ -169,26 +220,49 @@ export default function DeliveryMapPicker({
     }, 350);
   }
 
-  async function searchAddress() {
-    const q = query.trim();
+  function buildSmartQuery() {
+    return [locality.trim(), address.trim(), houseNumber.trim()].filter(Boolean).join(', ');
+  }
+
+  async function searchAddress(customQuery?: string) {
+    const q = (customQuery ?? query).trim();
     if (!q) return;
 
     setSearching(true);
+    setSearchError('');
     try {
       const params = new URLSearchParams({ q });
       const res = await fetch(`/api/geocode/search?${params.toString()}`);
       if (!res.ok) {
         setResults([]);
+        setSearchError('Не удалось выполнить поиск адреса.');
         return;
       }
       const data = await res.json() as { results?: SearchResult[] };
-      setResults(Array.isArray(data.results) ? data.results : []);
+      const next = Array.isArray(data.results) ? data.results : [];
+      setResults(next);
+      if (!next.length) {
+        setSearchError('Адрес не найден. Уточните город, улицу или номер дома.');
+      }
+    } catch {
+      setResults([]);
+      setSearchError('Сервис поиска недоступен. Попробуйте снова.');
     } finally {
       setSearching(false);
     }
   }
 
-  function choose(lat: number, lng: number, pickedAddress?: string, source: 'map' | 'external' = 'external') {
+  function searchByFormAddress() {
+    const composed = buildSmartQuery();
+    if (!composed) {
+      setSearchError('Введите город или улицу для поиска.');
+      return;
+    }
+    setQuery(composed);
+    void searchAddress(composed);
+  }
+
+  function setCenter(lat: number, lng: number, source: 'map' | 'external' = 'external') {
     onLocationChange({ lat, lng });
     setManualLat(lat.toFixed(6));
     setManualLng(lng.toFixed(6));
@@ -202,6 +276,10 @@ export default function DeliveryMapPicker({
         pendingCenterRef.current = { lat, lng };
       }
     }
+  }
+
+  function choose(lat: number, lng: number, pickedAddress?: string, source: 'map' | 'external' = 'external') {
+    setCenter(lat, lng, source);
 
     if (pickedAddress) {
       onAddressChange(pickedAddress);
@@ -275,6 +353,65 @@ export default function DeliveryMapPicker({
     tryLocate();
   }
 
+  useEffect(() => {
+    if (autoLocTried) return;
+    if (location) return;
+    if (geoPermission === 'denied') return;
+    setAutoLocTried(true);
+    detectMyLocation();
+  }, [autoLocTried, location, geoPermission]);
+
+  useEffect(() => {
+    const city = locality.trim();
+    if (!city) return;
+    if (location) return;
+    const cityKey = city.toLowerCase();
+    if (autoCityCenterRef.current === cityKey) return;
+    autoCityCenterRef.current = cityKey;
+
+    void (async () => {
+      try {
+        const params = new URLSearchParams({ q: city });
+        const res = await fetch(`/api/geocode/search?${params.toString()}`);
+        if (!res.ok) return;
+        const data = await res.json() as { results?: SearchResult[] };
+        const first = Array.isArray(data.results) ? data.results[0] : null;
+        if (!first) return;
+        if (!Number.isFinite(first.lat) || !Number.isFinite(first.lng)) return;
+        setCenter(first.lat, first.lng);
+      } catch {
+        // ignore city fallback errors
+      }
+    })();
+  }, [locality, location]);
+
+  useEffect(() => {
+    const q = query.trim();
+    if (searchTimerRef.current) {
+      window.clearTimeout(searchTimerRef.current);
+    }
+    if (q.length < 3) {
+      setResults([]);
+      setSearchError('');
+      return;
+    }
+    searchTimerRef.current = window.setTimeout(() => {
+      searchAddress();
+    }, 450);
+  }, [query]);
+
+  useEffect(() => {
+    const composed = buildSmartQuery();
+    if (composed.length < 5) return;
+    if (searchTimerRef.current) {
+      window.clearTimeout(searchTimerRef.current);
+    }
+    searchTimerRef.current = window.setTimeout(() => {
+      setQuery(composed);
+      searchAddress(composed);
+    }, 700);
+  }, [locality, address, houseNumber]);
+
   function detectMyLocationPrecise() {
     if (!navigator.geolocation) {
       setGeoError('Ваш браузер не поддерживает геолокацию.');
@@ -343,10 +480,19 @@ export default function DeliveryMapPicker({
 
   return (
     <div className="map-picker">
+      <label>Город / населенный пункт</label>
+      <div className="checkout-search">
+        <input
+          placeholder="Например: Худжанд"
+          value={locality}
+          onChange={(e) => onLocalityChange(e.target.value)}
+        />
+      </div>
+
       <label>Адрес доставки</label>
       <div className="checkout-search">
         <input
-          placeholder="Введите адрес доставки"
+          placeholder="Улица"
           value={address}
           onChange={(e) => onAddressChange(e.target.value)}
         />
@@ -354,53 +500,45 @@ export default function DeliveryMapPicker({
 
       <div className="checkout-search">
         <input
-          placeholder="Номер дома (обязательно)"
+          placeholder="Номер дома (например: 44, 44А, 12/1)"
           value={houseNumber}
-          onChange={(e) => onHouseNumberChange(e.target.value)}
+          onChange={(e) => onHouseNumberChange(sanitizeHouseInput(e.target.value))}
         />
       </div>
 
       <div className="checkout-search">
         <input
-          placeholder="Поиск адреса"
+          placeholder="Поиск адреса (от 3 символов)"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              void searchAddress();
+            }
+          }}
         />
-        <button type="button" onClick={searchAddress} disabled={searching}>
-          {searching ? 'Поиск...' : 'Найти'}
+        <button type="button" onClick={searchByFormAddress} disabled={searching}>
+          {searching ? 'Ищем...' : 'Найти на карте'}
         </button>
-      </div>
-
-      <div className="checkout-search">
-        {geoPermission !== 'granted' ? (
-          <button type="button" onClick={allowGeolocation}>
-            Разрешить геолокацию
-          </button>
-        ) : null}
       </div>
 
       <div className="checkout-search">
         <button type="button" onClick={detectMyLocation} disabled={locating}>
-          {locating ? 'Определяем...' : 'Мое местоположение'}
+          {locating ? 'Определяем...' : 'Определить автоматически'}
         </button>
         <button type="button" onClick={detectMyLocationPrecise} disabled={preciseLocating}>
-          {preciseLocating ? 'Уточняем...' : 'Точное местоположение'}
+          {preciseLocating ? 'Уточняем...' : 'Уточнить точность'}
         </button>
       </div>
 
-      <div className="checkout-search">
-        <input
-          placeholder="Широта"
-          value={manualLat}
-          onChange={(e) => setManualLat(e.target.value)}
-        />
-        <input
-          placeholder="Долгота"
-          value={manualLng}
-          onChange={(e) => setManualLng(e.target.value)}
-        />
-        <button type="button" onClick={applyManualPoint}>Поставить метку</button>
-      </div>
+      {geoPermission !== 'granted' ? (
+        <div className="checkout-search">
+          <button type="button" onClick={allowGeolocation}>
+            Разрешить геолокацию
+          </button>
+        </div>
+      ) : null}
 
       {results.length > 0 && (
         <div className="search-results">
@@ -409,13 +547,20 @@ export default function DeliveryMapPicker({
               className="search-result"
               type="button"
               key={`${item.lat}-${item.lng}-${idx}`}
-              onClick={() => choose(item.lat, item.lng, item.street || item.displayName)}
+              onClick={() => {
+                const pickedStreet = item.street || extractStreet(item.displayName, locality);
+                if (item.locality) onLocalityChange(item.locality);
+                else if (!locality.trim() && item.displayName) onLocalityChange(extractLocality(item.displayName));
+                if (item.houseNumber) onHouseNumberChange(sanitizeHouseInput(String(item.houseNumber)));
+                choose(item.lat, item.lng, pickedStreet);
+              }}
             >
               {item.displayName}
             </button>
           ))}
         </div>
       )}
+      {searchError ? <div className="muted" style={{ color: '#d83434' }}>{searchError}</div> : null}
 
       <div className="map-frame-wrap">
         <iframe
@@ -432,8 +577,25 @@ export default function DeliveryMapPicker({
         Метка фиксирована в центре. Двигайте карту, чтобы выбрать точку. Точка доставки: {location ? `${location.lat.toFixed(6)}, ${location.lng.toFixed(6)}` : 'не выбрана'}.
       </div>
       {geoAccuracy !== null ? <div className="muted">Точность геолокации: около {Math.round(geoAccuracy)} м.</div> : null}
+      {!locality.trim() ? <div className="muted" style={{ color: '#d83434' }}>Укажите город или населенный пункт.</div> : null}
       {!houseNumber.trim() ? <div className="muted" style={{ color: '#d83434' }}>Укажите номер дома для точного адреса.</div> : null}
       {geoError ? <div className="muted" style={{ color: '#d83434' }}>{geoError}</div> : null}
+      <details style={{ marginTop: '10px' }}>
+        <summary className="muted">Расширенные настройки точки</summary>
+        <div className="checkout-search" style={{ marginTop: '8px' }}>
+          <input
+            placeholder="Широта"
+            value={manualLat}
+            onChange={(e) => setManualLat(e.target.value)}
+          />
+          <input
+            placeholder="Долгота"
+            value={manualLng}
+            onChange={(e) => setManualLng(e.target.value)}
+          />
+          <button type="button" onClick={applyManualPoint}>Применить</button>
+        </div>
+      </details>
     </div>
   );
 }

@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: supermarket-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: supermarket
+      POSTGRES_USER: supermarket
+      POSTGRES_PASSWORD: supermarket_dev_password
+    ports:
+      - "55432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U supermarket -d supermarket"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+
+volumes:
+  pgdata:
