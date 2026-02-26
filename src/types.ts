@@ -4,6 +4,7 @@ export interface JwtPayload {
   id: number;
   email: string;
   role: UserRole;
+  sessionVersion: number;
 }
 
 export interface DbUser {
@@ -14,6 +15,9 @@ export interface DbUser {
   address: string | null;
   password_hash: string;
   role: UserRole;
+  is_active: boolean;
+  session_version: number;
+  permissions: string[];
   created_at: string;
 }
 
@@ -24,6 +28,8 @@ export interface PublicUser {
   phone: string | null;
   address: string | null;
   role: UserRole;
+  isActive: boolean;
+  permissions: string[];
   createdAt: string;
 }
 

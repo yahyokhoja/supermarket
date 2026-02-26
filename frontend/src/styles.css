@@ -33,26 +33,12 @@ body {
 
 .topbar h1 { margin: 0; font-size: 1.1rem; }
 .topbar-actions { display: flex; align-items: center; gap: 10px; }
-.header-dropdown {
-  position: relative;
-}
-.header-dropdown-menu {
-  position: absolute;
-  right: 0;
-  top: calc(100% + 6px);
-  min-width: 140px;
-  background: #fff;
-  border: 1px solid #d5deea;
-  border-radius: 10px;
-  box-shadow: 0 10px 24px rgba(16, 24, 38, 0.14);
-  padding: 6px;
-  display: grid;
-  gap: 6px;
-  z-index: 30;
-}
-.header-dropdown-menu button {
-  width: 100%;
-  text-align: left;
+.topbar-filters { display: flex; align-items: center; gap: 8px; }
+.topbar-filters select {
+  width: auto;
+  min-width: 130px;
+  margin-bottom: 0;
+  padding: 8px 10px;
 }
 
 .layout {
@@ -213,6 +199,23 @@ button:disabled {
   display: grid;
   gap: 12px;
   grid-template-columns: 1fr 1fr;
+}
+
+.admin-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.admin-tabs button {
+  background: #e4ecf6;
+  color: #122036;
+}
+
+.admin-tabs button.active {
+  background: var(--accent);
+  color: #fff;
 }
 
 .badge {
