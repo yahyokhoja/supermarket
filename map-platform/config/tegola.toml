@@ -1,0 +1,32 @@
+[webserver]
+port = ":8080"
+
+[[providers]]
+name = "pg"
+type = "postgis"
+uri = "postgres://map:mappass@postgis:5432/mapdb?sslmode=disable"
+srid = 3857
+
+  [[providers.layers]]
+  name = "delivery_zones"
+  geometry_fieldname = "geom"
+  geometry_type = "polygon"
+  id_fieldname = "id"
+  sql = "SELECT id, ST_Transform(geom, 3857) AS geom FROM public.delivery_zones WHERE geom && ST_Transform(!BBOX!, 4326)"
+
+  [[providers.layers]]
+  name = "warehouses"
+  geometry_fieldname = "geom"
+  geometry_type = "point"
+  id_fieldname = "id"
+  sql = "SELECT id, ST_Transform(geom, 3857) AS geom FROM public.warehouses WHERE geom && ST_Transform(!BBOX!, 4326)"
+
+[[maps]]
+name = "delivery"
+center = [68.787038, 38.559772, 10.0]
+
+  [[maps.layers]]
+  provider_layer = "pg.delivery_zones"
+
+  [[maps.layers]]
+  provider_layer = "pg.warehouses"
