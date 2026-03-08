@@ -5,3 +5,7 @@ data.db-*
 dist/
 frontend/dist/
 npm-debug.log*
+
+# local tls
+/certs/
+*.pem

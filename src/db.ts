@@ -18,6 +18,7 @@ export async function initDb(pool: Pool) {
       is_active BOOLEAN NOT NULL DEFAULT TRUE,
       session_version INTEGER NOT NULL DEFAULT 0,
       permissions TEXT[] NOT NULL DEFAULT '{}',
+      warehouse_scopes BIGINT[],
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
@@ -74,6 +75,14 @@ export async function initDb(pool: Pool) {
       delivery_address TEXT NOT NULL,
       delivery_lat DOUBLE PRECISION,
       delivery_lng DOUBLE PRECISION,
+      serviceable BOOLEAN,
+      delivery_zone TEXT,
+      fulfillment_warehouse TEXT,
+      fulfillment_warehouse_code TEXT,
+      warehouse_distance_km NUMERIC(10,3),
+      route_distance_km NUMERIC(10,3),
+      delivery_eta_min INTEGER,
+      delivery_fee NUMERIC(12,2),
       assigned_courier_id BIGINT REFERENCES couriers(id) ON DELETE SET NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -111,6 +120,8 @@ export async function initDb(pool: Pool) {
       id BIGSERIAL PRIMARY KEY,
       code TEXT UNIQUE NOT NULL,
       name TEXT NOT NULL,
+      lat DOUBLE PRECISION,
+      lng DOUBLE PRECISION,
       is_active BOOLEAN NOT NULL DEFAULT TRUE,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
@@ -194,6 +205,11 @@ export async function initDb(pool: Pool) {
   `);
 
   await pool.query(`
+    ALTER TABLE users
+      ADD COLUMN IF NOT EXISTS warehouse_scopes BIGINT[];
+  `);
+
+  await pool.query(`
     ALTER TABLE couriers
       ADD COLUMN IF NOT EXISTS verification_status TEXT NOT NULL DEFAULT 'pending',
       ADD COLUMN IF NOT EXISTS transport_license TEXT,
@@ -215,9 +231,34 @@ export async function initDb(pool: Pool) {
   `);
 
   await pool.query(`
-    INSERT INTO warehouses (code, name, is_active)
-    VALUES ('MAIN', 'Основной склад', TRUE)
-    ON CONFLICT (code) DO NOTHING;
+    ALTER TABLE orders
+      ADD COLUMN IF NOT EXISTS serviceable BOOLEAN,
+      ADD COLUMN IF NOT EXISTS delivery_zone TEXT,
+      ADD COLUMN IF NOT EXISTS fulfillment_warehouse TEXT,
+      ADD COLUMN IF NOT EXISTS fulfillment_warehouse_code TEXT,
+      ADD COLUMN IF NOT EXISTS warehouse_distance_km NUMERIC(10,3),
+      ADD COLUMN IF NOT EXISTS route_distance_km NUMERIC(10,3),
+      ADD COLUMN IF NOT EXISTS delivery_eta_min INTEGER,
+      ADD COLUMN IF NOT EXISTS delivery_fee NUMERIC(12,2);
+  `);
+
+  await pool.query(`
+    ALTER TABLE warehouses
+      ADD COLUMN IF NOT EXISTS lat DOUBLE PRECISION,
+      ADD COLUMN IF NOT EXISTS lng DOUBLE PRECISION;
+  `);
+
+  await pool.query(`
+    INSERT INTO warehouses (code, name, lat, lng, is_active)
+    VALUES
+      ('MAIN', 'Склад Душанбе', 38.5702, 68.7878, TRUE),
+      ('KHUJAND', 'Склад Худжанд', 40.2891, 69.6203, TRUE),
+      ('KHISTEVARZ', 'Склад Хистеварз', 40.1992, 69.8174, TRUE)
+    ON CONFLICT (code) DO UPDATE
+      SET
+        name = EXCLUDED.name,
+        lat = EXCLUDED.lat,
+        lng = EXCLUDED.lng;
   `);
 
   await pool.query(`
@@ -225,7 +266,7 @@ export async function initDb(pool: Pool) {
     SELECT w.id, p.id, GREATEST(COALESCE(p.stock_quantity, 0), 0), 0, 5, 20
     FROM warehouses w
     CROSS JOIN products p
-    WHERE w.code = 'MAIN'
+    WHERE w.is_active = TRUE
     ON CONFLICT (warehouse_id, product_id) DO NOTHING;
   `);
 
@@ -245,6 +286,18 @@ export async function initDb(pool: Pool) {
     BEFORE UPDATE ON orders
     FOR EACH ROW
     EXECUTE FUNCTION set_orders_updated_at();
+  `);
+
+  await pool.query(`
+    UPDATE orders
+    SET status = CASE status
+      WHEN 'pending' THEN 'assembling'
+      WHEN 'assigned' THEN 'courier_assigned'
+      WHEN 'picked_up' THEN 'courier_picked'
+      WHEN 'delivered' THEN 'received'
+      ELSE status
+    END
+    WHERE status IN ('pending', 'assigned', 'picked_up', 'delivered');
   `);
 }
 

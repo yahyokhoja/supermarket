@@ -1,8 +1,17 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
 import DeliveryMapPicker from './components/DeliveryMapPicker';
+import AdminWarehouseLocationMap from './components/AdminWarehouseLocationMap';
 
 type Role = 'customer' | 'courier' | 'admin';
-type Status = 'pending' | 'assigned' | 'picked_up' | 'on_the_way' | 'delivered' | 'cancelled';
+type Status =
+  | 'assembling'
+  | 'courier_assigned'
+  | 'courier_picked'
+  | 'on_the_way'
+  | 'arrived'
+  | 'received'
+  | 'paid'
+  | 'cancelled';
 
 type User = {
   id: number;
@@ -12,6 +21,7 @@ type User = {
   address: string | null;
   role: Role;
   permissions: string[];
+  warehouseScopes?: number[] | null;
 };
 
 type Product = {
@@ -42,8 +52,23 @@ type Order = {
   deliveryAddress: string;
   deliveryLat: number | null;
   deliveryLng: number | null;
+  serviceable: boolean | null;
+  deliveryZone: string | null;
+  fulfillmentWarehouse: string | null;
+  fulfillmentWarehouseCode: string | null;
+  warehouseDistanceKm: number | null;
+  routeDistanceKm: number | null;
+  deliveryEtaMin: number | null;
+  deliveryFee: number | null;
   assignedCourierId: number | null;
   createdAt: string;
+  items?: OrderItem[];
+};
+type OrderItem = {
+  productId: number;
+  name: string;
+  quantity: number;
+  unitPrice: number;
 };
 
 type Courier = {
@@ -74,6 +99,7 @@ type AdminUser = {
   role: Role;
   isActive: boolean;
   permissions: string[];
+  warehouseScopes: number[] | null;
   createdAt: string;
 };
 
@@ -107,6 +133,8 @@ type AdminAnalytics = {
     assignedCount: number;
     pickedUpCount: number;
     onTheWayCount: number;
+    arrivedCount: number;
+    receivedCount: number;
     deliveredCount: number;
     cancelledCount: number;
     revenueTotal: number;
@@ -138,9 +166,11 @@ type WarehouseItem = {
   updatedAt: string;
 };
 type LowStockItem = WarehouseItem & { orderSuggestion: number };
-type WarehouseInfo = { id: number; code: string; name: string; isActive: boolean };
+type WarehouseInfo = { id: number; code: string; name: string; lat: number | null; lng: number | null; isActive: boolean };
 type StockMovement = {
   id: number;
+  warehouseId: number;
+  productId: number;
   movementType: string;
   quantity: number;
   reason: string | null;
@@ -199,6 +229,20 @@ type SavedDelivery = {
   location: { lat: number; lng: number } | null;
 };
 
+type DeliveryQuote = {
+  hasCoordinates: boolean;
+  inDeliveryZone: boolean | null;
+  serviceable: boolean | null;
+  zoneName: string | null;
+  warehouseCode: string | null;
+  warehouseName: string | null;
+  warehouseDistanceKm: number | null;
+  routeDistanceKm: number | null;
+  etaMin: number | null;
+  deliveryFee: number | null;
+  reason: string | null;
+};
+
 type AdminProduct = {
   id: number;
   name: string;
@@ -223,6 +267,26 @@ type SmartProductSuggestion = {
 };
 type HeaderSection = 'catalog' | 'profile' | 'cart' | 'map';
 type AdminTab = 'orders' | 'analytics' | 'products' | 'warehouse' | 'users' | 'couriers' | 'audit' | 'search';
+type StockMovementType = 'receive' | 'writeoff' | 'reserve';
+
+function stockRowKey(warehouseId: number, productId: number) {
+  return `${warehouseId}:${productId}`;
+}
+
+function parseWarehouseRoute(pathname: string) {
+  const parts = pathname.split('/').filter(Boolean);
+  if (parts.length < 3) return null;
+  if (parts[0] !== 'admin' || parts[1] !== 'warehouse') return null;
+  const warehouseCode = decodeURIComponent(parts[2] || 'all');
+  const category = decodeURIComponent(parts.slice(3).join('/') || 'all');
+  return { warehouseCode, category };
+}
+
+function buildWarehouseRoutePath(warehouseCode: string, category: string) {
+  const safeWarehouse = encodeURIComponent(warehouseCode || 'all');
+  const safeCategory = encodeURIComponent(category || 'all');
+  return `/admin/warehouse/${safeWarehouse}/${safeCategory}`;
+}
 
 const ADMIN_PERMISSION_OPTIONS = [
   { key: 'view_orders', label: 'Просмотр заказов' },
@@ -237,20 +301,24 @@ const ADMIN_PERMISSION_OPTIONS = [
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.trim() || '';
 const STATUS_LABELS: Record<Status, string> = {
-  pending: 'Ожидает обработки',
-  assigned: 'Назначен курьер',
-  picked_up: 'Забран',
+  assembling: 'Собирается',
+  courier_assigned: 'Назначен курьер',
+  courier_picked: 'Курьер получил',
   on_the_way: 'В пути',
-  delivered: 'Доставлен',
+  arrived: 'Прибыл',
+  received: 'Получен',
+  paid: 'Оплачен',
   cancelled: 'Отменен'
 };
 
 const STATUS_ACTION_LABELS: Record<Status, string> = {
-  pending: 'В ожидании',
-  assigned: 'Назначить',
-  picked_up: 'Забрал',
+  assembling: 'Собирается',
+  courier_assigned: 'Назначен курьер',
+  courier_picked: 'Курьер получил',
   on_the_way: 'В пути',
-  delivered: 'Доставлен',
+  arrived: 'Прибыл',
+  received: 'Получен',
+  paid: 'Оплачен',
   cancelled: 'Отменить'
 };
 
@@ -271,8 +339,21 @@ const COURIER_VERIFICATION_LABELS: Record<string, string> = {
   approved: 'Подтвержден',
   rejected: 'Отклонен'
 };
+const ADMIN_TAB_LABELS: Record<AdminTab, string> = {
+  orders: 'Заказы',
+  analytics: 'Аналитика',
+  products: 'Товары',
+  warehouse: 'Склад',
+  users: 'Пользователи',
+  couriers: 'Курьеры',
+  search: 'Поиск',
+  audit: 'Аудит-лог'
+};
 const DELIVERY_DRAFT_KEY = 'delivery_draft_v1';
 const LAST_DELIVERY_KEY = 'last_delivery_v1';
+const CART_HINT_KEY = 'cart_checkout_hint_shown_v1';
+const MAX_UPLOAD_FILE_SIZE_BYTES = 6 * 1024 * 1024;
+const MAX_UPLOAD_FILE_SIZE_MB = 6;
 
 function hasStreetName(address: string) {
   const normalized = address.trim().toLowerCase();
@@ -317,12 +398,105 @@ function normalizeStreetInput(streetRaw: string, localityRaw: string) {
   return normalized;
 }
 
+function validateImageUpload(file: File, label: string) {
+  if (!file.type.startsWith('image/')) {
+    return `${label}: разрешены только изображения (JPG, PNG, WEBP).`;
+  }
+  return '';
+}
+
+function loadImageElement(file: File) {
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      resolve(img);
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error('Не удалось прочитать изображение'));
+    };
+    img.src = url;
+  });
+}
+
+function canvasToBlob(canvas: HTMLCanvasElement, quality: number) {
+  return new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (!blob) {
+        reject(new Error('Не удалось обработать изображение'));
+        return;
+      }
+      resolve(blob);
+    }, 'image/jpeg', quality);
+  });
+}
+
+async function prepareImageForUpload(file: File, label: string): Promise<{ file: File | null; error: string }> {
+  const invalidReason = validateImageUpload(file, label);
+  if (invalidReason) return { file: null, error: invalidReason };
+  if (file.size <= MAX_UPLOAD_FILE_SIZE_BYTES) return { file, error: '' };
+
+  try {
+    const image = await loadImageElement(file);
+    const maxSide = 1920;
+    const scale = Math.min(1, maxSide / Math.max(image.width || 1, image.height || 1));
+    const targetWidth = Math.max(1, Math.round(image.width * scale));
+    const targetHeight = Math.max(1, Math.round(image.height * scale));
+
+    const canvas = document.createElement('canvas');
+    canvas.width = targetWidth;
+    canvas.height = targetHeight;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return { file: null, error: `${label}: не удалось подготовить изображение.` };
+    ctx.drawImage(image, 0, 0, targetWidth, targetHeight);
+
+    const qualities = [0.86, 0.76, 0.66, 0.56, 0.46];
+    let bestBlob: Blob | null = null;
+    for (const quality of qualities) {
+      const blob = await canvasToBlob(canvas, quality);
+      if (!bestBlob || blob.size < bestBlob.size) bestBlob = blob;
+      if (blob.size <= MAX_UPLOAD_FILE_SIZE_BYTES) {
+        bestBlob = blob;
+        break;
+      }
+    }
+
+    if (!bestBlob) {
+      return { file: null, error: `${label}: не удалось обработать фото.` };
+    }
+    if (bestBlob.size > MAX_UPLOAD_FILE_SIZE_BYTES) {
+      return {
+        file: null,
+        error: `${label}: файл слишком большой даже после сжатия. Выберите фото меньшего размера.`
+      };
+    }
+
+    const prepared = new File(
+      [bestBlob],
+      `${file.name.replace(/\.[^.]+$/, '') || 'photo'}-compressed.jpg`,
+      { type: 'image/jpeg' }
+    );
+    return { file: prepared, error: '' };
+  } catch {
+    return {
+      file: null,
+      error: `${label}: не удалось завершить обработку фото. На устройстве может не хватать памяти. Закройте лишние приложения и попробуйте снова.`
+    };
+  }
+}
+
 export default function App() {
   const [token, setToken] = useState<string | null>(() => localStorage.getItem('token'));
   const [user, setUser] = useState<User | null>(null);
   const [products, setProducts] = useState<Product[]>([]);
   const [cart, setCart] = useState<{ items: CartItem[]; total: number }>({ items: [], total: 0 });
   const [orders, setOrders] = useState<Order[]>([]);
+  const [repeatingOrderId, setRepeatingOrderId] = useState<number | null>(null);
+  const [editingOrderId, setEditingOrderId] = useState<number | null>(null);
+  const [cancellingOrderId, setCancellingOrderId] = useState<number | null>(null);
+  const [deletingOrderId, setDeletingOrderId] = useState<number | null>(null);
   const [courierOrders, setCourierOrders] = useState<Order[]>([]);
   const [openCourierOrders, setOpenCourierOrders] = useState<Order[]>([]);
   const [allOrders, setAllOrders] = useState<Order[]>([]);
@@ -345,6 +519,8 @@ export default function App() {
       assignedCount: 0,
       pickedUpCount: 0,
       onTheWayCount: 0,
+      arrivedCount: 0,
+      receivedCount: 0,
       deliveredCount: 0,
       cancelledCount: 0,
       revenueTotal: 0,
@@ -368,6 +544,8 @@ export default function App() {
   const [deliveryAddress, setDeliveryAddress] = useState('');
   const [deliveryHouseNumber, setDeliveryHouseNumber] = useState('');
   const [deliveryLocation, setDeliveryLocation] = useState<{ lat: number; lng: number } | null>(null);
+  const [deliveryQuote, setDeliveryQuote] = useState<DeliveryQuote | null>(null);
+  const [deliveryQuoteLoading, setDeliveryQuoteLoading] = useState(false);
   const [lastDelivery, setLastDelivery] = useState<SavedDelivery | null>(() => {
     try {
       const raw = localStorage.getItem(LAST_DELIVERY_KEY);
@@ -398,27 +576,63 @@ export default function App() {
   const [adminResetPasswordValue, setAdminResetPasswordValue] = useState('');
   const [adminReviewComments, setAdminReviewComments] = useState<Record<number, string>>({});
   const [stockActionForm, setStockActionForm] = useState({
-    movementType: 'receive' as 'receive' | 'writeoff' | 'reserve',
+    movementType: 'receive' as StockMovementType,
     warehouseId: 0,
     productId: 0,
     quantity: '1',
     reason: ''
   });
+  const [stockActionSubmitting, setStockActionSubmitting] = useState(false);
+  const [quickStockSubmittingKey, setQuickStockSubmittingKey] = useState('');
+  const [warehouseStockSearch, setWarehouseStockSearch] = useState('');
+  const [warehouseView, setWarehouseView] = useState({
+    warehouseId: 0,
+    category: 'all'
+  });
+  const [warehouseRouteIntent, setWarehouseRouteIntent] = useState<{ warehouseCode: string; category: string } | null>(() => {
+    if (typeof window === 'undefined') return null;
+    return parseWarehouseRoute(window.location.pathname);
+  });
+  const [selectedWarehouseStockKeys, setSelectedWarehouseStockKeys] = useState<Record<string, boolean>>({});
+  const [bulkStockForm, setBulkStockForm] = useState({
+    movementType: 'reserve' as StockMovementType,
+    quantity: '1',
+    reason: ''
+  });
+  const [bulkStockSubmitting, setBulkStockSubmitting] = useState(false);
+  const [warehouseJournalFilters, setWarehouseJournalFilters] = useState({
+    warehouseId: 0,
+    movementType: 'all',
+    product: '',
+    dateFrom: '',
+    dateTo: '',
+    limit: '300'
+  });
+  const [warehouseJournalLoading, setWarehouseJournalLoading] = useState(false);
+  const [warehouseJournal, setWarehouseJournal] = useState<StockMovement[]>([]);
   const [pickTaskCreateForm, setPickTaskCreateForm] = useState({
     orderId: '',
     warehouseId: 0
   });
+  const [warehousePointForm, setWarehousePointForm] = useState({
+    warehouseId: 0,
+    lat: '',
+    lng: ''
+  });
+  const [warehousePointLocating, setWarehousePointLocating] = useState(false);
   const [pickTaskStatusDrafts, setPickTaskStatusDrafts] = useState<Record<number, PickTask['status']>>({});
   const [adminUserRoleDrafts, setAdminUserRoleDrafts] = useState<Record<number, Role>>({});
   const [adminUserActiveDrafts, setAdminUserActiveDrafts] = useState<Record<number, boolean>>({});
   const [adminUserPermissionsDrafts, setAdminUserPermissionsDrafts] = useState<Record<number, string[]>>({});
+  const [adminUserWarehouseScopesDrafts, setAdminUserWarehouseScopesDrafts] = useState<Record<number, number[]>>({});
   const [staffCreateForm, setStaffCreateForm] = useState({
     fullName: '',
     email: '',
     password: '',
     phone: '',
     address: '',
-    permissions: [] as string[]
+    permissions: [] as string[],
+    warehouseScopes: [] as number[]
   });
   const [productForm, setProductForm] = useState({
     id: 0,
@@ -451,8 +665,14 @@ export default function App() {
   const profileSectionRef = useRef<HTMLElement | null>(null);
   const catalogSectionRef = useRef<HTMLElement | null>(null);
   const cartSectionRef = useRef<HTMLElement | null>(null);
+  const authSectionRef = useRef<HTMLElement | null>(null);
+  const loginEmailInputRef = useRef<HTMLInputElement | null>(null);
+  const registerNameInputRef = useRef<HTMLInputElement | null>(null);
   const adminProductFormRef = useRef<HTMLFormElement | null>(null);
   const adminProductNameInputRef = useRef<HTMLInputElement | null>(null);
+  const warehouseOperationFormRef = useRef<HTMLFormElement | null>(null);
+  const warehouseOperationQuantityRef = useRef<HTMLInputElement | null>(null);
+  const sessionExpiredHandledRef = useRef(false);
 
   const loggedIn = Boolean(token && user);
   const isSystemAdmin = user?.email?.trim().toLowerCase() === 'admin@universal.local';
@@ -497,6 +717,17 @@ export default function App() {
       return true;
     });
   }, [products, selectedCategory, selectedSubcategory]);
+  const cartItemsCount = useMemo(
+    () => cart.items.reduce((sum, item) => sum + item.quantity, 0),
+    [cart.items]
+  );
+  const cartQuantityByProduct = useMemo(() => {
+    const map = new Map<number, { itemId: number; quantity: number }>();
+    for (const item of cart.items) {
+      map.set(item.productId, { itemId: item.id, quantity: item.quantity });
+    }
+    return map;
+  }, [cart.items]);
 
   const adminCategoryMap = useMemo(() => {
     const map = new Map<string, Set<string>>();
@@ -526,14 +757,142 @@ export default function App() {
   }, [adminCategoryMap, productFormCategory]);
 
   const warehouseProductOptions = useMemo(() => {
-    const seen = new Map<number, string>();
-    for (const item of warehouseOverview.stock) {
+    const selectedWarehouse = Number(stockActionForm.warehouseId || 0);
+    const source = selectedWarehouse
+      ? warehouseOverview.stock.filter((item) => item.warehouseId === selectedWarehouse)
+      : warehouseOverview.stock;
+    const seen = new Map<number, { id: number; name: string; available: number; total: number; reserved: number }>();
+    for (const item of source) {
       if (!seen.has(item.productId)) {
-        seen.set(item.productId, item.productName);
+        seen.set(item.productId, {
+          id: item.productId,
+          name: item.productName,
+          available: item.availableQuantity,
+          total: item.quantity,
+          reserved: item.reservedQuantity
+        });
       }
     }
-    return Array.from(seen.entries()).map(([id, name]) => ({ id, name }));
-  }, [warehouseOverview.stock]);
+    return Array.from(seen.values());
+  }, [warehouseOverview.stock, stockActionForm.warehouseId]);
+  const selectedStockItem = useMemo(
+    () =>
+      warehouseOverview.stock.find(
+        (item) => item.warehouseId === Number(stockActionForm.warehouseId) && item.productId === Number(stockActionForm.productId)
+      ) || null,
+    [warehouseOverview.stock, stockActionForm.warehouseId, stockActionForm.productId]
+  );
+  const stockActionQuantityNumber = useMemo(() => {
+    const value = Math.floor(Number(stockActionForm.quantity));
+    if (!Number.isFinite(value) || value <= 0) return 0;
+    return value;
+  }, [stockActionForm.quantity]);
+  const stockActionPreview = useMemo(() => {
+    if (!selectedStockItem) {
+      return { nextAvailable: 0, nextReserved: 0, note: 'Выберите товар для предпросмотра операции' };
+    }
+    const qty = stockActionQuantityNumber;
+    const currentAvailable = Number(selectedStockItem.availableQuantity || 0);
+    const currentReserved = Number(selectedStockItem.reservedQuantity || 0);
+    if (qty <= 0) {
+      return { nextAvailable: currentAvailable, nextReserved: currentReserved, note: 'Введите количество больше 0' };
+    }
+
+    if (stockActionForm.movementType === 'receive') {
+      return {
+        nextAvailable: currentAvailable + qty,
+        nextReserved: currentReserved,
+        note: `После приемки +${qty} шт.`
+      };
+    }
+    if (stockActionForm.movementType === 'writeoff') {
+      return {
+        nextAvailable: Math.max(currentAvailable - qty, 0),
+        nextReserved: currentReserved,
+        note: currentAvailable < qty ? 'Недостаточно доступного остатка для полного списания' : `После списания -${qty} шт.`
+      };
+    }
+    return {
+      nextAvailable: Math.max(currentAvailable - qty, 0),
+      nextReserved: currentReserved + qty,
+      note: currentAvailable < qty ? 'Недостаточно доступного остатка для полного резерва' : `После резерва +${qty} шт. в резерв`
+    };
+  }, [selectedStockItem, stockActionQuantityNumber, stockActionForm.movementType]);
+  const filteredWarehouseStock = useMemo(() => {
+    const scopedByWarehouse =
+      Number(warehouseView.warehouseId) > 0
+        ? warehouseOverview.stock.filter((item) => item.warehouseId === Number(warehouseView.warehouseId))
+        : warehouseOverview.stock;
+    const scopedByCategory =
+      warehouseView.category !== 'all'
+        ? scopedByWarehouse.filter((item) => String(item.category || 'Без категории') === warehouseView.category)
+        : scopedByWarehouse;
+    const q = warehouseStockSearch.trim().toLowerCase();
+    if (!q) return scopedByCategory;
+    return scopedByCategory.filter((item) => {
+      const text = `${item.warehouseName} ${item.warehouseCode} ${item.productName} ${item.productId}`.toLowerCase();
+      return text.includes(q);
+    });
+  }, [warehouseOverview.stock, warehouseStockSearch, warehouseView.warehouseId, warehouseView.category]);
+  const warehouseViewCategories = useMemo(() => {
+    const source =
+      Number(warehouseView.warehouseId) > 0
+        ? warehouseOverview.stock.filter((item) => item.warehouseId === Number(warehouseView.warehouseId))
+        : warehouseOverview.stock;
+    const unique = new Set<string>();
+    for (const item of source) unique.add(String(item.category || 'Без категории'));
+    return Array.from(unique).sort((a, b) => a.localeCompare(b, 'ru'));
+  }, [warehouseOverview.stock, warehouseView.warehouseId]);
+  const warehouseViewName = useMemo(() => {
+    if (!Number(warehouseView.warehouseId)) return 'Все склады';
+    return warehouseOverview.warehouses.find((w) => w.id === Number(warehouseView.warehouseId))?.name || 'Склад';
+  }, [warehouseOverview.warehouses, warehouseView.warehouseId]);
+  const warehouseMetrics = useMemo(() => {
+    let totalAvailable = 0;
+    let totalReserved = 0;
+    for (const item of warehouseOverview.stock) {
+      totalAvailable += Number(item.availableQuantity || 0);
+      totalReserved += Number(item.reservedQuantity || 0);
+    }
+    return {
+      skuCount: warehouseOverview.stock.length,
+      lowStockCount: warehouseOverview.lowStock.length,
+      totalAvailable,
+      totalReserved
+    };
+  }, [warehouseOverview.stock, warehouseOverview.lowStock.length]);
+  const selectedWarehouseStockItems = useMemo(
+    () =>
+      warehouseOverview.stock.filter((item) =>
+        Boolean(selectedWarehouseStockKeys[stockRowKey(item.warehouseId, item.productId)])
+      ),
+    [warehouseOverview.stock, selectedWarehouseStockKeys]
+  );
+  const warehousePointLat = useMemo(() => {
+    const raw = warehousePointForm.lat.trim();
+    if (!raw) return null;
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : null;
+  }, [warehousePointForm.lat]);
+  const warehousePointLng = useMemo(() => {
+    const raw = warehousePointForm.lng.trim();
+    if (!raw) return null;
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : null;
+  }, [warehousePointForm.lng]);
+  const availableAdminTabs = useMemo(() => {
+    if (user?.role !== 'admin') return [] as AdminTab[];
+    const allowedTabs: AdminTab[] = [];
+    if (hasAdminPermission('view_orders')) allowedTabs.push('orders');
+    if (hasAdminPermission('view_analytics')) allowedTabs.push('analytics');
+    if (hasAdminPermission('manage_products')) allowedTabs.push('products');
+    if (hasAdminPermission('manage_warehouse')) allowedTabs.push('warehouse');
+    if (hasAdminPermission('manage_users')) allowedTabs.push('users');
+    if (hasAdminPermission('manage_couriers')) allowedTabs.push('couriers');
+    if (hasAdminPermission('search_db')) allowedTabs.push('search');
+    if (hasAdminPermission('view_audit')) allowedTabs.push('audit');
+    return allowedTabs;
+  }, [user?.role, user?.permissions, isSystemAdmin]);
 
   function hasAdminPermission(permission: string) {
     if (!user || user.role !== 'admin') return false;
@@ -603,13 +962,38 @@ export default function App() {
     setTimeout(() => scrollToSection(cartSectionRef), 0);
   }
 
+  function toggleMapInCart() {
+    if (cart.items.length === 0) {
+      notify('Корзина пуста');
+      return;
+    }
+    if (!cartOpen) {
+      openOnlySection('cart');
+      setTimeout(() => scrollToSection(cartSectionRef), 0);
+    }
+    setDeliveryMapOpen((prev) => !prev);
+  }
+
   function goToCart() {
     if (cart.items.length === 0) {
       notify('Корзина пуста');
       return;
     }
+    if (cartOpen && !deliveryMapOpen) {
+      setCartOpen(false);
+      setDeliveryMapOpen(false);
+      return;
+    }
     openOnlySection('cart');
     setTimeout(() => scrollToSection(cartSectionRef), 0);
+  }
+
+  function goToAuth(mode: 'login' | 'register') {
+    setTimeout(() => {
+      scrollToSection(authSectionRef);
+      if (mode === 'login') loginEmailInputRef.current?.focus();
+      else registerNameInputRef.current?.focus();
+    }, 0);
   }
 
   async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -622,6 +1006,21 @@ export default function App() {
 
     const res = await fetch(`${API_BASE}${path}`, { ...init, headers });
     const data = await res.json().catch(() => ({}));
+
+    if (res.status === 401 && token && !path.startsWith('/api/auth/')) {
+      if (!sessionExpiredHandledRef.current) {
+        sessionExpiredHandledRef.current = true;
+        setToken(null);
+        setUser(null);
+        localStorage.removeItem('token');
+        setProfileOpen(false);
+        setCartOpen(false);
+        setDeliveryMapOpen(false);
+        notify('Сессия завершена. Войдите снова.');
+        goToAuth('login');
+      }
+      throw new Error('Сессия завершена. Войдите снова.');
+    }
 
     if (!res.ok) {
       throw new Error(data.message || 'Ошибка API');
@@ -683,6 +1082,41 @@ export default function App() {
     setOrders(data.orders);
   }
 
+  async function loadDeliveryQuote(address: string, location: { lat: number; lng: number } | null) {
+    if (!location) {
+      setDeliveryQuote(null);
+      return;
+    }
+    setDeliveryQuoteLoading(true);
+    try {
+      const data = await api<{ quote: DeliveryQuote }>('/api/delivery/quote', {
+        method: 'POST',
+        body: JSON.stringify({
+          deliveryAddress: address,
+          deliveryLat: location.lat,
+          deliveryLng: location.lng
+        })
+      });
+      setDeliveryQuote(data.quote);
+    } catch (err) {
+      setDeliveryQuote({
+        hasCoordinates: true,
+        inDeliveryZone: null,
+        serviceable: null,
+        zoneName: null,
+        warehouseCode: null,
+        warehouseName: null,
+        warehouseDistanceKm: null,
+        routeDistanceKm: null,
+        etaMin: null,
+        deliveryFee: null,
+        reason: (err as Error).message
+      });
+    } finally {
+      setDeliveryQuoteLoading(false);
+    }
+  }
+
   async function loadCourierOrders() {
     if (user?.role !== 'courier') return;
     const data = await api<{ orders: Order[] }>('/api/orders/assigned');
@@ -720,6 +1154,8 @@ export default function App() {
               assignedCount: 0,
               pickedUpCount: 0,
               onTheWayCount: 0,
+              arrivedCount: 0,
+              receivedCount: 0,
               deliveredCount: 0,
               cancelledCount: 0,
               revenueTotal: 0,
@@ -747,6 +1183,9 @@ export default function App() {
     setAdminUserRoleDrafts(Object.fromEntries(usersRes.users.map((u) => [u.id, u.role])) as Record<number, Role>);
     setAdminUserActiveDrafts(Object.fromEntries(usersRes.users.map((u) => [u.id, u.isActive])) as Record<number, boolean>);
     setAdminUserPermissionsDrafts(Object.fromEntries(usersRes.users.map((u) => [u.id, u.permissions || []])) as Record<number, string[]>);
+    setAdminUserWarehouseScopesDrafts(
+      Object.fromEntries(usersRes.users.map((u) => [u.id, Array.isArray(u.warehouseScopes) ? u.warehouseScopes : []])) as Record<number, number[]>
+    );
   }
 
   async function loadWarehouseData() {
@@ -757,6 +1196,7 @@ export default function App() {
       api<PickTasksResponse>('/api/admin/pick-tasks')
     ]);
     setWarehouseOverview(overviewRes);
+    setWarehouseJournal(overviewRes.movements || []);
     setPickTasks(tasksRes.tasks);
     setPickTaskStatusDrafts(Object.fromEntries(tasksRes.tasks.map((task) => [task.id, task.status])) as Record<number, PickTask['status']>);
 
@@ -769,6 +1209,23 @@ export default function App() {
     setPickTaskCreateForm((prev) => ({
       ...prev,
       warehouseId: prev.warehouseId || fallbackWarehouseId
+    }));
+    setWarehousePointForm((prev) => {
+      const selectedId = prev.warehouseId || fallbackWarehouseId;
+      const selected = overviewRes.warehouses.find((w) => w.id === selectedId);
+      return {
+        warehouseId: selectedId,
+        lat: selected?.lat !== null && selected?.lat !== undefined ? String(selected.lat) : '',
+        lng: selected?.lng !== null && selected?.lng !== undefined ? String(selected.lng) : ''
+      };
+    });
+    setWarehouseView((prev) => ({
+      ...prev,
+      warehouseId: prev.warehouseId || (warehouseRouteIntent ? 0 : fallbackWarehouseId)
+    }));
+    setWarehouseJournalFilters((prev) => ({
+      ...prev,
+      warehouseId: prev.warehouseId || (warehouseRouteIntent ? 0 : fallbackWarehouseId)
     }));
   }
 
@@ -806,6 +1263,8 @@ export default function App() {
       return;
     }
 
+    sessionExpiredHandledRef.current = false;
+
     loadMe()
       .then(() => Promise.all([loadCart(), loadOrders()]))
       .catch(() => {
@@ -833,38 +1292,94 @@ export default function App() {
   }, [adminSearchQuery, user?.role, user?.permissions]);
 
   useEffect(() => {
-    if (user?.role !== 'admin') return;
-    const allowedTabs: AdminTab[] = [];
-    if (hasAdminPermission('view_orders')) allowedTabs.push('orders');
-    if (hasAdminPermission('view_analytics')) allowedTabs.push('analytics');
-    if (hasAdminPermission('manage_products')) allowedTabs.push('products');
-    if (hasAdminPermission('manage_warehouse')) allowedTabs.push('warehouse');
-    if (hasAdminPermission('manage_users')) allowedTabs.push('users');
-    if (hasAdminPermission('manage_couriers')) allowedTabs.push('couriers');
-    if (hasAdminPermission('search_db')) allowedTabs.push('search');
-    if (hasAdminPermission('view_audit')) allowedTabs.push('audit');
-    if (!allowedTabs.length) return;
-    if (!allowedTabs.includes(adminTab)) {
-      setAdminTab(allowedTabs[0]);
+    if (!availableAdminTabs.length) return;
+    if (!availableAdminTabs.includes(adminTab)) {
+      setAdminTab(availableAdminTabs[0]);
     }
-  }, [user?.role, user?.permissions, adminTab]);
+  }, [availableAdminTabs, adminTab]);
+
+  useEffect(() => {
+    if (!warehouseRouteIntent) return;
+    if (user?.role !== 'admin') return;
+    if (!hasAdminPermission('manage_warehouse')) return;
+    setAdminTab('warehouse');
+  }, [warehouseRouteIntent, user?.role, user?.permissions]);
+
+  useEffect(() => {
+    if (!warehouseRouteIntent) return;
+    if (!warehouseOverview.warehouses.length) return;
+
+    const targetWarehouseId =
+      warehouseRouteIntent.warehouseCode.toLowerCase() === 'all'
+        ? 0
+        : warehouseOverview.warehouses.find((w) => w.code.trim().toLowerCase() === warehouseRouteIntent.warehouseCode.trim().toLowerCase())?.id || 0;
+
+    const categories = new Set<string>();
+    const source =
+      targetWarehouseId > 0
+        ? warehouseOverview.stock.filter((item) => item.warehouseId === targetWarehouseId)
+        : warehouseOverview.stock;
+    for (const item of source) categories.add(String(item.category || 'Без категории'));
+
+    const requestedCategory = warehouseRouteIntent.category || 'all';
+    const nextCategory = requestedCategory === 'all' || categories.has(requestedCategory) ? requestedCategory : 'all';
+
+    setWarehouseView({ warehouseId: targetWarehouseId, category: nextCategory });
+    setWarehouseJournalFilters((prev) => ({ ...prev, warehouseId: targetWarehouseId }));
+    setWarehouseRouteIntent(null);
+  }, [warehouseRouteIntent, warehouseOverview.warehouses, warehouseOverview.stock]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    if (user?.role !== 'admin') return;
+    if (!hasAdminPermission('manage_warehouse')) return;
+    if (adminTab !== 'warehouse') return;
+
+    const selected = warehouseOverview.warehouses.find((w) => w.id === Number(warehouseView.warehouseId));
+    const warehouseCode = selected?.code || 'all';
+    const category = warehouseView.category || 'all';
+    const nextPath = buildWarehouseRoutePath(warehouseCode, category);
+    if (window.location.pathname !== nextPath) {
+      window.history.replaceState({}, '', nextPath);
+    }
+  }, [adminTab, user?.role, user?.permissions, warehouseView.warehouseId, warehouseView.category, warehouseOverview.warehouses]);
+
+  useEffect(() => {
+    if (!warehouseOverview.stock.length) {
+      setSelectedWarehouseStockKeys({});
+      return;
+    }
+    const allowed = new Set(warehouseOverview.stock.map((item) => stockRowKey(item.warehouseId, item.productId)));
+    setSelectedWarehouseStockKeys((prev) => {
+      const next: Record<string, boolean> = {};
+      for (const [key, value] of Object.entries(prev)) {
+        if (value && allowed.has(key)) next[key] = true;
+      }
+      return next;
+    });
+  }, [warehouseOverview.stock]);
 
   function visibleOrderActions(order: Order) {
     if (!user) return [] as Status[];
-    if (order.status === 'delivered' || order.status === 'cancelled') return [] as Status[];
+    if (order.status === 'paid' || order.status === 'cancelled') return [] as Status[];
     if (user.role === 'customer') {
-      return order.status === 'pending' ? (['cancelled'] as Status[]) : ([] as Status[]);
+      return order.status === 'assembling' || order.status === 'courier_assigned'
+        ? (['cancelled'] as Status[])
+        : ([] as Status[]);
     }
     if (user.role === 'courier') {
-      if (order.status === 'assigned') return ['picked_up'] as Status[];
-      if (order.status === 'picked_up') return ['on_the_way'] as Status[];
-      if (order.status === 'on_the_way') return ['delivered'] as Status[];
+      if (order.status === 'courier_assigned') return ['courier_picked'] as Status[];
+      if (order.status === 'courier_picked') return ['on_the_way'] as Status[];
+      if (order.status === 'on_the_way') return ['arrived'] as Status[];
+      if (order.status === 'arrived') return ['received'] as Status[];
       return [] as Status[];
     }
-    return ['assigned', 'cancelled'] as Status[];
+    if (order.status === 'assembling') return ['courier_assigned', 'cancelled'] as Status[];
+    return ['cancelled'] as Status[];
   }
 
   function logout() {
+    if (!window.confirm('Выйти из аккаунта?')) return;
     setToken(null);
     setUser(null);
     localStorage.removeItem('token');
@@ -911,6 +1426,39 @@ export default function App() {
     await api('/api/cart/items', { method: 'POST', body: JSON.stringify({ productId, quantity: 1 }) });
     await loadCart();
     notify('Товар добавлен');
+    if (!localStorage.getItem(CART_HINT_KEY)) {
+      window.alert('После выбора перейдите в Мои заказы и оформите заказ');
+      localStorage.setItem(CART_HINT_KEY, '1');
+    }
+  }
+
+  async function adjustProductQty(productId: number, delta: number) {
+    if (!loggedIn) {
+      notify('Сначала войдите');
+      return;
+    }
+    if (!delta) return;
+
+    const current = cartQuantityByProduct.get(productId);
+    const currentQty = current?.quantity || 0;
+    const nextQty = currentQty + delta;
+
+    if (nextQty <= 0) {
+      if (current) {
+        await api(`/api/cart/items/${current.itemId}`, { method: 'DELETE' });
+      }
+      await loadCart();
+      return;
+    }
+
+    if (!current) {
+      await api('/api/cart/items', { method: 'POST', body: JSON.stringify({ productId, quantity: nextQty }) });
+      await loadCart();
+      return;
+    }
+
+    await api(`/api/cart/items/${current.itemId}`, { method: 'PUT', body: JSON.stringify({ quantity: nextQty }) });
+    await loadCart();
   }
 
   async function updateCart(itemId: number, quantity: number) {
@@ -951,6 +1499,10 @@ export default function App() {
     }
     if (!isValidHouseNumber(normalizedHouse)) {
       notify('Укажите номер дома в формате: 44, 44А, 12/1');
+      return;
+    }
+    if (deliveryQuote?.serviceable === false) {
+      notify(deliveryQuote.reason || 'Доставка по этому адресу недоступна');
       return;
     }
     await api('/api/orders', {
@@ -1000,6 +1552,18 @@ export default function App() {
     }
     localStorage.setItem(DELIVERY_DRAFT_KEY, JSON.stringify(draft));
   }, [token, deliveryLocality, deliveryAddress, deliveryHouseNumber, deliveryLocation]);
+
+  useEffect(() => {
+    if (!token || !quickAddress || !deliveryLocation) {
+      setDeliveryQuote(null);
+      setDeliveryQuoteLoading(false);
+      return;
+    }
+    const t = window.setTimeout(() => {
+      void loadDeliveryQuote(quickAddress, deliveryLocation);
+    }, 350);
+    return () => window.clearTimeout(t);
+  }, [token, quickAddress, deliveryLocation]);
 
   async function updateProfile(e: FormEvent) {
     e.preventDefault();
@@ -1074,11 +1638,119 @@ export default function App() {
     }
   }
 
+  async function repeatOrderForEditing(orderId: number) {
+    setRepeatingOrderId(orderId);
+    try {
+      const data = await api<{ items: OrderItem[] }>(`/api/orders/${orderId}`);
+      const items = Array.isArray(data.items) ? data.items : [];
+      if (!items.length) {
+        notify('В выбранном заказе нет товаров');
+        return;
+      }
+
+      if (cart.items.length) {
+        await Promise.all(
+          cart.items.map((item) => api(`/api/cart/items/${item.id}`, { method: 'DELETE' }))
+        );
+      }
+
+      let restored = 0;
+      let skipped = 0;
+      for (const item of items) {
+        if (!item.productId || item.quantity <= 0) continue;
+        try {
+          await api('/api/cart/items', {
+            method: 'POST',
+            body: JSON.stringify({ productId: item.productId, quantity: item.quantity })
+          });
+          restored += 1;
+        } catch {
+          skipped += 1;
+        }
+      }
+
+      await loadCart();
+      openOnlySection('cart');
+      setTimeout(() => scrollToSection(cartSectionRef), 0);
+
+      if (restored === 0) {
+        notify('Не удалось добавить товары из этого заказа');
+        return;
+      }
+      notify(skipped > 0 ? 'Заказ перенесен в корзину частично. Проверьте и отредактируйте.' : 'Заказ перенесен в корзину. Можете отредактировать его перед оформлением.');
+    } catch (err) {
+      notify((err as Error).message);
+    } finally {
+      setRepeatingOrderId(null);
+    }
+  }
+
+  async function cancelMyOrder(orderId: number) {
+    setCancellingOrderId(orderId);
+    try {
+      await api(`/api/orders/${orderId}/status`, {
+        method: 'PATCH',
+        body: JSON.stringify({ status: 'cancelled' as Status })
+      });
+      await Promise.all([loadOrders(), loadCourierOrders(), loadOpenCourierOrders(), loadAdminData()]);
+      notify('Заказ отменен');
+    } catch (err) {
+      notify((err as Error).message);
+    } finally {
+      setCancellingOrderId(null);
+    }
+  }
+
+  async function editMyOrder(order: Order) {
+    if (order.status !== 'assembling' && order.status !== 'courier_assigned') {
+      notify('Изменение доступно только на этапах "Собирается" или "Назначен курьер"');
+      return;
+    }
+    const nextAddress = window.prompt('Новый адрес (формат: Город, улица, дом 44):', order.deliveryAddress);
+    if (!nextAddress) return;
+    setEditingOrderId(order.id);
+    try {
+      await api(`/api/orders/${order.id}/edit`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          deliveryAddress: nextAddress.trim(),
+          deliveryLat: order.deliveryLat,
+          deliveryLng: order.deliveryLng
+        })
+      });
+      await Promise.all([loadOrders(), loadCourierOrders(), loadOpenCourierOrders(), loadAdminData()]);
+      notify('Заказ обновлен');
+    } catch (err) {
+      notify((err as Error).message);
+    } finally {
+      setEditingOrderId(null);
+    }
+  }
+
+  async function deleteMyOrder(orderId: number) {
+    if (!window.confirm('Удалить заказ из истории?')) return;
+    setDeletingOrderId(orderId);
+    try {
+      await api(`/api/orders/${orderId}`, { method: 'DELETE' });
+      await Promise.all([loadOrders(), loadCourierOrders(), loadOpenCourierOrders(), loadAdminData()]);
+      notify('Заказ удален');
+    } catch (err) {
+      notify((err as Error).message);
+    } finally {
+      setDeletingOrderId(null);
+    }
+  }
+
   async function uploadTechPassport(file: File) {
+    const prepared = await prepareImageForUpload(file, 'Фото техпаспорта');
+    if (!prepared.file) {
+      notify(prepared.error);
+      return;
+    }
     setTechPassportUploading(true);
     try {
       const formData = new FormData();
-      formData.append('image', file);
+      formData.append('image', prepared.file);
       const data = await api<{ imageUrl: string }>('/api/couriers/uploads/tech-passport', {
         method: 'POST',
         body: formData
@@ -1150,9 +1822,10 @@ export default function App() {
       return;
     }
     try {
-      const payload: { role: Role; isActive: boolean; permissions?: string[] } = { role, isActive };
+      const payload: { role: Role; isActive: boolean; permissions?: string[]; warehouseScopes?: number[] | null } = { role, isActive };
       if (isSystemAdmin) {
         payload.permissions = adminUserPermissionsDrafts[userId] || [];
+        payload.warehouseScopes = role === 'admin' ? (adminUserWarehouseScopesDrafts[userId] || []) : null;
       }
       await api<{ user: User }>(`/api/admin/users/${userId}`, {
         method: 'PATCH',
@@ -1207,7 +1880,8 @@ export default function App() {
         password: '',
         phone: '',
         address: '',
-        permissions: []
+        permissions: [],
+        warehouseScopes: []
       });
       await loadAdminData();
       notify('Сотрудник создан');
@@ -1335,10 +2009,15 @@ export default function App() {
   }
 
   async function uploadProductImage(file: File) {
+    const prepared = await prepareImageForUpload(file, 'Фото товара');
+    if (!prepared.file) {
+      notify(prepared.error);
+      return;
+    }
     setImageUploading(true);
     try {
       const formData = new FormData();
-      formData.append('image', file);
+      formData.append('image', prepared.file);
       const data = await api<{ imageUrl: string }>('/api/admin/uploads/image', {
         method: 'POST',
         body: formData
@@ -1435,11 +2114,16 @@ export default function App() {
   }
 
   async function setProductAvailability(product: AdminProduct, inStock: boolean) {
-    if (inStock && Number(product.stockQuantity || 0) <= 0) {
-      notify('Нельзя включить наличие: остаток 0 шт.');
-      return;
-    }
     try {
+      if (inStock && Number(product.stockQuantity || 0) <= 0) {
+        await api(`/api/admin/products/${product.id}`, {
+          method: 'PUT',
+          body: JSON.stringify({ stockQuantity: 1, inStock: true })
+        });
+        await Promise.all([loadAdminData(), loadProducts()]);
+        notify('Товар возвращен в наличие (остаток: 1 шт.)');
+        return;
+      }
       await api(`/api/admin/products/${product.id}`, {
         method: 'PUT',
         body: JSON.stringify({ inStock })
@@ -1460,12 +2144,8 @@ export default function App() {
       notify('Выберите склад, товар и корректное количество');
       return;
     }
-    const path =
-      stockActionForm.movementType === 'receive'
-        ? '/api/admin/stock/receive'
-        : stockActionForm.movementType === 'writeoff'
-          ? '/api/admin/stock/writeoff'
-          : '/api/admin/stock/reserve';
+    const path = getStockMovementPath(stockActionForm.movementType);
+    setStockActionSubmitting(true);
     try {
       await api(path, {
         method: 'POST',
@@ -1487,7 +2167,221 @@ export default function App() {
       setStockActionForm((prev) => ({ ...prev, quantity: '1', reason: '' }));
     } catch (err) {
       notify((err as Error).message);
+    } finally {
+      setStockActionSubmitting(false);
     }
+  }
+
+  function getStockMovementPath(movementType: StockMovementType) {
+    return movementType === 'receive'
+      ? '/api/admin/stock/receive'
+      : movementType === 'writeoff'
+        ? '/api/admin/stock/writeoff'
+        : '/api/admin/stock/reserve';
+  }
+
+  function getStockMovementLabel(movementType: StockMovementType) {
+    return movementType === 'receive' ? 'приемку' : movementType === 'writeoff' ? 'списание' : 'резерв';
+  }
+
+  function stockMovementHumanLabel(type: string) {
+    if (type === 'receive') return 'Приемка';
+    if (type === 'writeoff') return 'Списание';
+    if (type === 'reserve') return 'Резерв';
+    if (type === 'release') return 'Снятие резерва';
+    return type;
+  }
+
+  async function loadWarehouseJournal(
+    activeFilters: {
+      warehouseId: number;
+      movementType: string;
+      product: string;
+      dateFrom: string;
+      dateTo: string;
+      limit: string;
+    } = warehouseJournalFilters
+  ) {
+    setWarehouseJournalLoading(true);
+    try {
+      const params = new URLSearchParams();
+      if (Number(activeFilters.warehouseId) > 0) params.set('warehouseId', String(Number(activeFilters.warehouseId)));
+      if (activeFilters.movementType !== 'all') params.set('movementType', activeFilters.movementType);
+      if (activeFilters.product.trim()) params.set('product', activeFilters.product.trim());
+      if (activeFilters.dateFrom) params.set('dateFrom', activeFilters.dateFrom);
+      if (activeFilters.dateTo) params.set('dateTo', activeFilters.dateTo);
+      const limit = Math.min(Math.max(Number(activeFilters.limit) || 300, 50), 1000);
+      params.set('limit', String(limit));
+      const data = await api<{ movements: StockMovement[] }>(`/api/admin/stock/movements?${params.toString()}`);
+      setWarehouseJournal(data.movements || []);
+    } catch (err) {
+      notify((err as Error).message);
+    } finally {
+      setWarehouseJournalLoading(false);
+    }
+  }
+
+  function exportWarehouseJournalCsv() {
+    if (!warehouseJournal.length) {
+      notify('Журнал пуст, экспортировать нечего');
+      return;
+    }
+    const esc = (value: unknown) => {
+      const text = String(value ?? '');
+      return `"${text.replace(/"/g, '""')}"`;
+    };
+    const header = [
+      'id',
+      'createdAt',
+      'movementType',
+      'warehouseId',
+      'warehouseName',
+      'productId',
+      'productName',
+      'quantity',
+      'reason',
+      'createdBy',
+      'referenceType',
+      'referenceId'
+    ];
+    const lines = [
+      header.join(','),
+      ...warehouseJournal.map((m) =>
+        [
+          m.id,
+          new Date(m.createdAt).toISOString(),
+          stockMovementHumanLabel(m.movementType),
+          m.warehouseId,
+          m.warehouseName,
+          m.productId,
+          m.productName,
+          m.quantity,
+          m.reason || '',
+          m.createdBy || '',
+          m.referenceType || '',
+          m.referenceId ?? ''
+        ].map(esc).join(',')
+      )
+    ];
+    const csv = '\uFEFF' + lines.join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `warehouse-journal-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  async function quickStockMovement(item: WarehouseItem, movementType: StockMovementType, quantity: number) {
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      notify('Количество должно быть больше 0');
+      return;
+    }
+    const submitKey = `${stockRowKey(item.warehouseId, item.productId)}:${movementType}:${quantity}`;
+    setQuickStockSubmittingKey(submitKey);
+    try {
+      await api(getStockMovementPath(movementType), {
+        method: 'POST',
+        body: JSON.stringify({
+          warehouseId: item.warehouseId,
+          productId: item.productId,
+          quantity,
+          reason: `Быстрая операция из списка остатков (${getStockMovementLabel(movementType)})`
+        })
+      });
+      setStockActionForm((prev) => ({
+        ...prev,
+        movementType,
+        warehouseId: item.warehouseId,
+        productId: item.productId,
+        quantity: String(quantity)
+      }));
+      await Promise.all([loadWarehouseData(), loadProducts(), loadAdminData()]);
+      notify(
+        movementType === 'receive'
+          ? 'Приемка проведена'
+          : movementType === 'writeoff'
+            ? 'Списание проведено'
+            : 'Резерв создан'
+      );
+    } catch (err) {
+      notify((err as Error).message);
+    } finally {
+      setQuickStockSubmittingKey('');
+    }
+  }
+
+  function openStockActionFormForItem(item: WarehouseItem) {
+    setStockActionForm((prev) => ({
+      ...prev,
+      warehouseId: item.warehouseId,
+      productId: item.productId,
+      quantity: prev.quantity || '1'
+    }));
+    setTimeout(() => {
+      warehouseOperationFormRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      warehouseOperationQuantityRef.current?.focus();
+      warehouseOperationQuantityRef.current?.select();
+    }, 0);
+  }
+
+  async function applyBulkStockMovement() {
+    const quantity = Math.floor(Number(bulkStockForm.quantity));
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      notify('Для массовой операции укажите количество больше 0');
+      return;
+    }
+    if (!selectedWarehouseStockItems.length) {
+      notify('Сначала выберите товары в остатках');
+      return;
+    }
+
+    const path = getStockMovementPath(bulkStockForm.movementType);
+    const reason =
+      bulkStockForm.reason.trim() ||
+      `Массовая операция (${getStockMovementLabel(bulkStockForm.movementType)})`;
+
+    if (!window.confirm(`Провести ${getStockMovementLabel(bulkStockForm.movementType)} для ${selectedWarehouseStockItems.length} выбранных позиций?`)) {
+      return;
+    }
+
+    setBulkStockSubmitting(true);
+    const results = await Promise.allSettled(
+      selectedWarehouseStockItems.map((item) =>
+        api(path, {
+          method: 'POST',
+          body: JSON.stringify({
+            warehouseId: item.warehouseId,
+            productId: item.productId,
+            quantity,
+            reason
+          })
+        })
+      )
+    );
+
+    const success = results.filter((r) => r.status === 'fulfilled').length;
+    const failed = results.length - success;
+
+    if (success > 0) {
+      await Promise.all([loadWarehouseData(), loadProducts(), loadAdminData()]);
+    }
+
+    if (failed === 0) {
+      notify(`Готово: ${success} операций выполнено`);
+      setBulkStockForm((prev) => ({ ...prev, quantity: '1', reason: '' }));
+      setSelectedWarehouseStockKeys({});
+      setBulkStockSubmitting(false);
+      return;
+    }
+
+    const firstError = results.find((r) => r.status === 'rejected') as PromiseRejectedResult | undefined;
+    const reasonText = firstError?.reason instanceof Error ? firstError.reason.message : 'Часть операций не выполнена';
+    notify(`Выполнено: ${success}, ошибок: ${failed}. ${reasonText}`);
+    setBulkStockSubmitting(false);
   }
 
   async function createPickTaskFromOrder(e: FormEvent) {
@@ -1511,6 +2405,83 @@ export default function App() {
     }
   }
 
+  async function saveWarehouseLocation(e: FormEvent) {
+    e.preventDefault();
+    const warehouseId = Number(warehousePointForm.warehouseId);
+    const lat = Number(warehousePointForm.lat);
+    const lng = Number(warehousePointForm.lng);
+    if (!warehouseId || !Number.isFinite(lat) || !Number.isFinite(lng)) {
+      notify('Выберите склад и укажите корректные lat/lng');
+      return;
+    }
+    if (lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+      notify('Координаты вне диапазона');
+      return;
+    }
+
+    try {
+      await api(`/api/admin/warehouses/${warehouseId}/location`, {
+        method: 'PATCH',
+        body: JSON.stringify({ lat, lng })
+      });
+      await loadWarehouseData();
+      notify('Точка склада обновлена');
+    } catch (err) {
+      notify((err as Error).message);
+    }
+  }
+
+  async function deleteWarehouseLocation() {
+    const warehouseId = Number(warehousePointForm.warehouseId);
+    if (!warehouseId) {
+      notify('Сначала выберите склад');
+      return;
+    }
+    if (!window.confirm('Удалить точку у выбранного склада?')) return;
+    try {
+      await api(`/api/admin/warehouses/${warehouseId}/location`, { method: 'DELETE' });
+      setWarehousePointForm((prev) => ({ ...prev, lat: '', lng: '' }));
+      await loadWarehouseData();
+      notify('Точка склада удалена');
+    } catch (err) {
+      notify((err as Error).message);
+    }
+  }
+
+  function detectWarehousePointByGeolocation() {
+    if (!navigator.geolocation) {
+      notify('Браузер не поддерживает геолокацию');
+      return;
+    }
+    if (!window.isSecureContext) {
+      notify('Для геолокации нужен HTTPS или localhost');
+      return;
+    }
+
+    setWarehousePointLocating(true);
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        const lat = pos.coords.latitude;
+        const lng = pos.coords.longitude;
+        setWarehousePointForm((prev) => ({
+          ...prev,
+          lat: lat.toFixed(6),
+          lng: lng.toFixed(6)
+        }));
+        setWarehousePointLocating(false);
+        notify(`Геопозиция определена (точность ~${Math.round(pos.coords.accuracy)} м)`);
+      },
+      (error) => {
+        setWarehousePointLocating(false);
+        if (error.code === 1) notify('Разрешите доступ к геолокации в браузере');
+        else if (error.code === 2) notify('Не удалось определить местоположение');
+        else if (error.code === 3) notify('Таймаут геолокации');
+        else notify('Ошибка геолокации');
+      },
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
+    );
+  }
+
   async function savePickTaskStatus(taskId: number) {
     const status = pickTaskStatusDrafts[taskId];
     if (!status) return;
@@ -1528,7 +2499,7 @@ export default function App() {
 
   return (
     <>
-      <header className="topbar">
+      <header className={`topbar${!loggedIn ? ' topbar-guest' : ''}`}>
         <h1>Universal Market Delivery</h1>
         <div className="topbar-actions">
           {loggedIn ? <button type="button" onClick={goToCatalog}>Товары</button> : null}
@@ -1556,33 +2527,42 @@ export default function App() {
               </select>
             </div>
           ) : null}
-          {loggedIn ? <button type="button" onClick={goToProfile}>Кабинет</button> : null}
-          {loggedIn && cart.items.length > 0 ? <button type="button" onClick={goToCart}>Корзина</button> : null}
+            {loggedIn ? (
+              <button type="button" onClick={goToProfile} title="Редактировать профиль">☰ Кабинет</button>
+            ) : null}
+          {loggedIn && cart.items.length > 0 ? (
+            <button type="button" onClick={goToCart}>☰ Корзина ({cartItemsCount})</button>
+          ) : null}
           {loggedIn && cart.items.length > 0 ? <button type="button" onClick={goToMap}>Карта</button> : null}
-          <span>{user ? `${user.fullName} (${ROLE_LABELS[user.role]})` : 'Гость'}</span>
-          {loggedIn && <button onClick={logout}>Выйти</button>}
-        </div>
-      </header>
+            {!loggedIn ? (
+              <>
+                <button type="button" onClick={() => goToAuth('login')}>Войти</button>
+                <button type="button" onClick={() => goToAuth('register')}>Регистрация</button>
+              </>
+            ) : null}
+            <span>{user ? `${user.fullName} (${ROLE_LABELS[user.role]})` : 'Гость'}</span>
+          </div>
+        </header>
 
       <main className="layout">
         {!loggedIn && (
-          <section className="panel">
+          <section className="panel" ref={authSectionRef}>
             <h2>Вход / Регистрация</h2>
             <div className="auth-grid">
-              <form onSubmit={onLogin}>
+              <form id="login-form" onSubmit={onLogin}>
                 <h3>Вход</h3>
-                <input placeholder="Email" type="email" value={loginState.email} onChange={(e) => setLoginState({ ...loginState, email: e.target.value })} required />
+                <input ref={loginEmailInputRef} placeholder="Email" type="email" value={loginState.email} onChange={(e) => setLoginState({ ...loginState, email: e.target.value })} required />
                 <input placeholder="Пароль" type="password" value={loginState.password} onChange={(e) => setLoginState({ ...loginState, password: e.target.value })} required />
                 <button type="submit">Войти</button>
               </form>
-              <form onSubmit={onRegister}>
+              <form id="register-form" onSubmit={onRegister}>
                 <h3>Регистрация</h3>
-                <input placeholder="ФИО" value={registerState.fullName} onChange={(e) => setRegisterState({ ...registerState, fullName: e.target.value })} required />
+                <input ref={registerNameInputRef} placeholder="ФИО" value={registerState.fullName} onChange={(e) => setRegisterState({ ...registerState, fullName: e.target.value })} required />
                 <input placeholder="Email" type="email" value={registerState.email} onChange={(e) => setRegisterState({ ...registerState, email: e.target.value })} required />
                 <input placeholder="Пароль" type="password" value={registerState.password} onChange={(e) => setRegisterState({ ...registerState, password: e.target.value })} required />
                 <input placeholder="Телефон" value={registerState.phone} onChange={(e) => setRegisterState({ ...registerState, phone: e.target.value })} />
                 <input placeholder="Адрес" value={registerState.address} onChange={(e) => setRegisterState({ ...registerState, address: e.target.value })} />
-                <button type="submit">Создать аккаунт</button>
+                <button type="submit">Регистрация</button>
               </form>
             </div>
           </section>
@@ -1590,7 +2570,7 @@ export default function App() {
 
         {loggedIn && user?.role !== 'courier' && profileOpen && (
           <section className="panel" ref={profileSectionRef}>
-            <h2 style={{ marginTop: 0 }}>Кабинет пользователя</h2>
+            <h2 style={{ marginTop: 0 }}>Редактировать профиль</h2>
             <form onSubmit={updateProfile}>
               <input placeholder="ФИО" value={profileState.fullName} onChange={(e) => setProfileState({ ...profileState, fullName: e.target.value })} required />
               <input placeholder="Телефон" value={profileState.phone} onChange={(e) => setProfileState({ ...profileState, phone: e.target.value })} />
@@ -1616,7 +2596,7 @@ export default function App() {
                   <img src={p.imageUrl} alt={p.name} />
                   <div className="card-content">
                     <h3>{p.name}</h3>
-                    <p className="muted">{p.description}</p>
+                    <p className="muted card-desc">{p.description}</p>
                     <div className="price">${p.price.toFixed(2)}</div>
                     <button onClick={() => addToCart(p.id)}>В корзину</button>
                   </div>
@@ -1637,14 +2617,21 @@ export default function App() {
               <div className="cards">
                 {filteredProducts.map((p) => (
                   <article className="card" key={p.id}>
-                    <img src={p.imageUrl} alt={p.name} />
-                    <div className="card-content">
-                      <h3>{p.name}</h3>
-                      <p className="muted">{p.description}</p>
-                      <div className="price">${p.price.toFixed(2)}</div>
+                  <img src={p.imageUrl} alt={p.name} />
+                  <div className="card-content">
+                    <h3>{p.name}</h3>
+                    <p className="muted card-desc">{p.description}</p>
+                    <div className="price">${p.price.toFixed(2)}</div>
+                    <div className="card-actions">
                       <button onClick={() => addToCart(p.id)}>В корзину</button>
+                      <div className="card-qty">
+                        <button type="button" onClick={() => adjustProductQty(p.id, -1)}>-</button>
+                        <span>{cartQuantityByProduct.get(p.id)?.quantity || 0}</span>
+                        <button type="button" onClick={() => adjustProductQty(p.id, 1)}>+</button>
+                      </div>
                     </div>
-                  </article>
+                  </div>
+                </article>
                 ))}
               </div>
             ) : null}
@@ -1655,11 +2642,6 @@ export default function App() {
           <section className="panel" ref={cartSectionRef}>
               <div className="inline-actions" style={{ justifyContent: 'space-between', marginBottom: '8px' }}>
                 <h2 style={{ margin: 0 }}>Корзина</h2>
-                {user?.role !== 'courier' ? (
-                  <button type="button" onClick={goToMap}>
-                    {cartOpen ? 'Карта открыта' : 'Показать карту'}
-                  </button>
-                ) : null}
               </div>
               {cartOpen ? (
                 <>
@@ -1684,8 +2666,26 @@ export default function App() {
                           ? `Последний адрес: ${lastDelivery.locality}, ${lastDelivery.address}, дом ${lastDelivery.houseNumber}`
                           : 'Укажите улицу и номер дома в форме ниже, затем нажмите одну кнопку.'}
                     </div>
+                    {deliveryQuoteLoading ? <div className="muted">Считаем доставку...</div> : null}
+                    {deliveryQuote ? (
+                      <div className="muted">
+                        {deliveryQuote.serviceable === false ? (
+                          <>Недоступно: {deliveryQuote.reason || 'вне зоны доставки'}</>
+                        ) : (
+                          <>
+                            {deliveryQuote.zoneName ? `Зона: ${deliveryQuote.zoneName}. ` : ''}
+                            {deliveryQuote.warehouseName ? `Склад: ${deliveryQuote.warehouseName}. ` : ''}
+                            {deliveryQuote.warehouseDistanceKm !== null ? `Расстояние: ${deliveryQuote.warehouseDistanceKm.toFixed(2)} км. ` : ''}
+                            {deliveryQuote.routeDistanceKm !== null ? `Маршрут: ${deliveryQuote.routeDistanceKm.toFixed(2)} км. ` : ''}
+                            {deliveryQuote.etaMin !== null ? `ETA: ~${deliveryQuote.etaMin} мин. ` : ''}
+                            {deliveryQuote.deliveryFee !== null ? `Доставка: $${deliveryQuote.deliveryFee.toFixed(2)}.` : ''}
+                            {deliveryQuote.reason ? ` ${deliveryQuote.reason}` : ''}
+                          </>
+                        )}
+                      </div>
+                    ) : null}
                     <div className="inline-actions" style={{ marginTop: '8px' }}>
-                      <button onClick={checkout} disabled={!quickAddress}>
+                      <button onClick={checkout} disabled={!quickAddress || deliveryQuoteLoading || deliveryQuote?.serviceable === false}>
                         Оформить за 1 клик
                       </button>
                       <button onClick={checkoutLastAddress} disabled={!lastDelivery}>
@@ -1696,8 +2696,8 @@ export default function App() {
                   <div className="inline-actions" style={{ justifyContent: 'space-between', marginBottom: '8px' }}>
                     <strong>Карта доставки</strong>
                     {user?.role !== 'courier' ? (
-                      <button type="button" onClick={goToMap}>
-                        {deliveryMapOpen ? 'Карта открыта' : 'Показать карту'}
+                      <button type="button" onClick={toggleMapInCart}>
+                        {deliveryMapOpen ? 'Скрыть карту' : 'Показать карту'}
                       </button>
                     ) : null}
                   </div>
@@ -1728,12 +2728,79 @@ export default function App() {
                 <div className="row" key={order.id}>
                   <div><strong>Заказ #{order.id}</strong> <span className={`badge ${order.status}`}>{STATUS_LABELS[order.status]}</span></div>
                   <div>Сумма: ${order.total.toFixed(2)} | Адрес: {order.deliveryAddress}</div>
-                  <div>Координаты: {order.deliveryLat !== null && order.deliveryLng !== null ? `${order.deliveryLat.toFixed(6)}, ${order.deliveryLng.toFixed(6)}` : 'не указаны'}</div>
-                  <div>Курьер ID: {order.assignedCourierId ?? '-'}</div>
+                  {order.fulfillmentWarehouse || order.deliveryEtaMin !== null || order.deliveryFee !== null ? (
+                    <div className="muted">
+                      {order.deliveryZone ? `Зона: ${order.deliveryZone}. ` : ''}
+                      {order.fulfillmentWarehouse ? `Склад: ${order.fulfillmentWarehouse}. ` : ''}
+                      {order.warehouseDistanceKm !== null ? `Расстояние: ${order.warehouseDistanceKm.toFixed(2)} км. ` : ''}
+                      {order.routeDistanceKm !== null ? `Маршрут: ${order.routeDistanceKm.toFixed(2)} км. ` : ''}
+                      {order.deliveryEtaMin !== null ? `ETA: ~${order.deliveryEtaMin} мин. ` : ''}
+                      {order.deliveryFee !== null ? `Доставка: $${order.deliveryFee.toFixed(2)}.` : ''}
+                    </div>
+                  ) : null}
+                  {Array.isArray(order.items) && order.items.length > 0 ? (
+                    <div className="muted">
+                      Товары: {order.items.map((item) => `${item.name} x${item.quantity} ($${item.unitPrice.toFixed(2)})`).join(' | ')}
+                    </div>
+                  ) : null}
                   <div className="inline-actions">
-                    {visibleOrderActions(order).map((status) => (
-                      <button key={status} onClick={() => setOrderStatus(order.id, status)}>{STATUS_ACTION_LABELS[status]}</button>
-                    ))}
+                    <button
+                      type="button"
+                      onClick={() => repeatOrderForEditing(order.id)}
+                      disabled={repeatingOrderId === order.id}
+                    >
+                      {repeatingOrderId === order.id ? 'Переносим...' : 'Повторить и редактировать'}
+                    </button>
+                    {order.status === 'assembling' || order.status === 'courier_assigned' ? (
+                      <button
+                        type="button"
+                        onClick={() => editMyOrder(order)}
+                        disabled={editingOrderId === order.id}
+                      >
+                        {editingOrderId === order.id ? 'Сохраняем...' : 'Изменить'}
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => notify('Изменение доступно только для заказов в статусе "Собирается" или "Назначен курьер"')}
+                      >
+                        Изменить
+                      </button>
+                    )}
+                    {order.status === 'assembling' || order.status === 'courier_assigned' ? (
+                      <button
+                        type="button"
+                        onClick={() => cancelMyOrder(order.id)}
+                        disabled={cancellingOrderId === order.id}
+                      >
+                        {cancellingOrderId === order.id ? 'Отменяем...' : 'Отменить'}
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => notify('Отмена доступна только для заказов в статусе "Собирается" или "Назначен курьер"')}
+                      >
+                        Отменить
+                      </button>
+                    )}
+                    {order.status === 'cancelled' || order.status === 'paid' ? (
+                      <button
+                        type="button"
+                        className="danger"
+                        onClick={() => deleteMyOrder(order.id)}
+                        disabled={deletingOrderId === order.id}
+                      >
+                        {deletingOrderId === order.id ? 'Удаляем...' : 'Удалить'}
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        className="danger"
+                        onClick={() => notify('Удаление доступно только для отмененных или завершенных заказов')}
+                      >
+                        Удалить
+                      </button>
+                    )}
                   </div>
                 </div>
               ))}
@@ -1829,7 +2896,7 @@ export default function App() {
                 <div>Координаты: {order.deliveryLat !== null && order.deliveryLng !== null ? `${order.deliveryLat.toFixed(6)}, ${order.deliveryLng.toFixed(6)}` : 'не указаны'}</div>
                 <div className="inline-actions">
                   {courierProfile?.isEligible ? (
-                    (['picked_up', 'on_the_way', 'delivered'] as Status[]).map((status) => (
+                    (['courier_picked', 'on_the_way', 'arrived', 'received'] as Status[]).map((status) => (
                       <button key={status} onClick={() => setOrderStatus(order.id, status)}>{STATUS_ACTION_LABELS[status]}</button>
                     ))
                   ) : (
@@ -1843,33 +2910,25 @@ export default function App() {
 
         {user?.role === 'admin' && (
           <section className="panel">
-            <h2>Админ-панель</h2>
-            <div className="admin-tabs">
-              {hasAdminPermission('view_orders') ? (
-                <button type="button" className={adminTab === 'orders' ? 'active' : ''} onClick={() => setAdminTab('orders')}>Заказы</button>
-              ) : null}
-              {hasAdminPermission('view_analytics') ? (
-                <button type="button" className={adminTab === 'analytics' ? 'active' : ''} onClick={() => setAdminTab('analytics')}>Аналитика</button>
-              ) : null}
-              {hasAdminPermission('manage_products') ? (
-                <button type="button" className={adminTab === 'products' ? 'active' : ''} onClick={() => setAdminTab('products')}>Товары</button>
-              ) : null}
-              {hasAdminPermission('manage_warehouse') ? (
-                <button type="button" className={adminTab === 'warehouse' ? 'active' : ''} onClick={() => setAdminTab('warehouse')}>Склад</button>
-              ) : null}
-              {hasAdminPermission('manage_users') ? (
-                <button type="button" className={adminTab === 'users' ? 'active' : ''} onClick={() => setAdminTab('users')}>Пользователи</button>
-              ) : null}
-              {hasAdminPermission('manage_couriers') ? (
-                <button type="button" className={adminTab === 'couriers' ? 'active' : ''} onClick={() => setAdminTab('couriers')}>Курьеры</button>
-              ) : null}
-              {hasAdminPermission('search_db') ? (
-                <button type="button" className={adminTab === 'search' ? 'active' : ''} onClick={() => setAdminTab('search')}>Поиск</button>
-              ) : null}
-              {hasAdminPermission('view_audit') ? (
-                <button type="button" className={adminTab === 'audit' ? 'active' : ''} onClick={() => setAdminTab('audit')}>Аудит-лог</button>
-              ) : null}
+            <div className="admin-head">
+              <h2>Админ-панель</h2>
             </div>
+            {availableAdminTabs.length > 0 ? (
+              <div className="admin-tab-select">
+                <label htmlFor="admin-tab-select">Раздел админ-панели</label>
+                <select
+                  id="admin-tab-select"
+                  value={adminTab}
+                  onChange={(e) => setAdminTab(e.target.value as AdminTab)}
+                >
+                  {availableAdminTabs.map((tab) => (
+                    <option key={`admin-tab-option-${tab}`} value={tab}>
+                      {ADMIN_TAB_LABELS[tab]}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            ) : null}
             {!hasAdminPermission('view_orders') &&
             !hasAdminPermission('view_analytics') &&
             !hasAdminPermission('manage_products') &&
@@ -1914,11 +2973,13 @@ export default function App() {
                   </div>
                   <div className="row">
                     <strong>Статусы заказов</strong>
-                    <div>Ожидает: {adminAnalytics.totals.pendingCount}</div>
-                    <div>Назначен: {adminAnalytics.totals.assignedCount}</div>
-                    <div>Забран: {adminAnalytics.totals.pickedUpCount}</div>
+                    <div>Собирается: {adminAnalytics.totals.pendingCount}</div>
+                    <div>Назначен курьер: {adminAnalytics.totals.assignedCount}</div>
+                    <div>Курьер получил: {adminAnalytics.totals.pickedUpCount}</div>
                     <div>В пути: {adminAnalytics.totals.onTheWayCount}</div>
-                    <div>Доставлен: {adminAnalytics.totals.deliveredCount}</div>
+                    <div>Прибыл: {adminAnalytics.totals.arrivedCount}</div>
+                    <div>Получен: {adminAnalytics.totals.receivedCount}</div>
+                    <div>Оплачен: {adminAnalytics.totals.deliveredCount}</div>
                     <div>Отменен: {adminAnalytics.totals.cancelledCount}</div>
                   </div>
                   <div className="row">
@@ -2153,14 +3214,106 @@ export default function App() {
             {adminTab === 'warehouse' && hasAdminPermission('manage_warehouse') && (
               <div>
                 <h3>Склад</h3>
+                <div className="cards">
+                  <div className="card">
+                    <div className="card-content">
+                      <h3>SKU</h3>
+                      <div className="price">{warehouseMetrics.skuCount}</div>
+                      <div className="muted">Товарных позиций в остатках</div>
+                    </div>
+                  </div>
+                  <div className="card">
+                    <div className="card-content">
+                      <h3>Низкий Остаток</h3>
+                      <div className="price">{warehouseMetrics.lowStockCount}</div>
+                      <div className="muted">Позиции ниже минимума</div>
+                    </div>
+                  </div>
+                  <div className="card">
+                    <div className="card-content">
+                      <h3>Доступно</h3>
+                      <div className="price">{warehouseMetrics.totalAvailable}</div>
+                      <div className="muted">Штук доступно к продаже</div>
+                    </div>
+                  </div>
+                  <div className="card">
+                    <div className="card-content">
+                      <h3>В Резерве</h3>
+                      <div className="price">{warehouseMetrics.totalReserved}</div>
+                      <div className="muted">Штук зарезервировано</div>
+                    </div>
+                  </div>
+                </div>
+                <div className="row">
+                  <strong>Точка склада на карте</strong>
+                  <form onSubmit={saveWarehouseLocation}>
+                    <select
+                      value={warehousePointForm.warehouseId}
+                      onChange={(e) => {
+                        const warehouseId = Number(e.target.value);
+                        const selected = warehouseOverview.warehouses.find((w) => w.id === warehouseId);
+                        setWarehousePointForm({
+                          warehouseId,
+                          lat: selected?.lat !== null && selected?.lat !== undefined ? String(selected.lat) : '',
+                          lng: selected?.lng !== null && selected?.lng !== undefined ? String(selected.lng) : ''
+                        });
+                      }}
+                      required
+                    >
+                      {warehouseOverview.warehouses.map((w) => (
+                        <option key={`warehouse-loc-${w.id}`} value={w.id}>
+                          {w.name} ({w.code})
+                        </option>
+                      ))}
+                    </select>
+                    <input
+                      type="number"
+                      step="0.000001"
+                      placeholder="lat"
+                      value={warehousePointForm.lat}
+                      onChange={(e) => setWarehousePointForm((prev) => ({ ...prev, lat: e.target.value }))}
+                      required
+                    />
+                    <input
+                      type="number"
+                      step="0.000001"
+                      placeholder="lng"
+                      value={warehousePointForm.lng}
+                      onChange={(e) => setWarehousePointForm((prev) => ({ ...prev, lng: e.target.value }))}
+                      required
+                    />
+                    <button type="submit">Сохранить точку</button>
+                    <button type="button" onClick={detectWarehousePointByGeolocation} disabled={warehousePointLocating}>
+                      {warehousePointLocating ? 'Определяем GPS...' : 'Взять мою геопозицию'}
+                    </button>
+                    <button type="button" className="danger" onClick={deleteWarehouseLocation}>
+                      Удалить точку
+                    </button>
+                  </form>
+                  <AdminWarehouseLocationMap
+                    warehouses={warehouseOverview.warehouses}
+                    selectedWarehouseId={warehousePointForm.warehouseId}
+                    lat={warehousePointLat}
+                    lng={warehousePointLng}
+                    onPick={(lat, lng) => {
+                      setWarehousePointForm((prev) => ({
+                        ...prev,
+                        lat: lat.toFixed(6),
+                        lng: lng.toFixed(6)
+                      }));
+                    }}
+                  />
+                  <div className="muted">
+                    Координаты синхронизируются в обе БД: складская логика и карта.
+                  </div>
+                </div>
+
                 <div className="row">
                   <strong>Складская операция</strong>
-                  <form onSubmit={submitStockMovement}>
+                  <form onSubmit={submitStockMovement} ref={warehouseOperationFormRef}>
                     <select
                       value={stockActionForm.movementType}
-                      onChange={(e) =>
-                        setStockActionForm((prev) => ({ ...prev, movementType: e.target.value as 'receive' | 'writeoff' | 'reserve' }))
-                      }
+                      onChange={(e) => setStockActionForm((prev) => ({ ...prev, movementType: e.target.value as StockMovementType }))}
                     >
                       <option value="receive">Приемка</option>
                       <option value="writeoff">Списание</option>
@@ -2168,7 +3321,15 @@ export default function App() {
                     </select>
                     <select
                       value={stockActionForm.warehouseId}
-                      onChange={(e) => setStockActionForm((prev) => ({ ...prev, warehouseId: Number(e.target.value) }))}
+                      onChange={(e) => {
+                        const nextWarehouseId = Number(e.target.value);
+                        const firstProduct = warehouseOverview.stock.find((item) => item.warehouseId === nextWarehouseId);
+                        setStockActionForm((prev) => ({
+                          ...prev,
+                          warehouseId: nextWarehouseId,
+                          productId: firstProduct?.productId || 0
+                        }));
+                      }}
                       required
                     >
                       {warehouseOverview.warehouses.map((w) => (
@@ -2185,7 +3346,7 @@ export default function App() {
                       <option value={0}>Выберите товар</option>
                       {warehouseProductOptions.map((p) => (
                         <option key={`stock-product-${p.id}`} value={p.id}>
-                          #{p.id} {p.name}
+                          #{p.id} {p.name} (доступно {p.available}, всего {p.total}, резерв {p.reserved})
                         </option>
                       ))}
                     </select>
@@ -2193,6 +3354,7 @@ export default function App() {
                       type="number"
                       min="1"
                       step="1"
+                      ref={warehouseOperationQuantityRef}
                       value={stockActionForm.quantity}
                       onChange={(e) => setStockActionForm((prev) => ({ ...prev, quantity: e.target.value }))}
                       required
@@ -2202,7 +3364,46 @@ export default function App() {
                       value={stockActionForm.reason}
                       onChange={(e) => setStockActionForm((prev) => ({ ...prev, reason: e.target.value }))}
                     />
-                    <button type="submit">Провести</button>
+                    <div className="inline-actions">
+                      <button type="button" onClick={() => setStockActionForm((prev) => ({ ...prev, quantity: '1' }))}>1 шт</button>
+                      <button type="button" onClick={() => setStockActionForm((prev) => ({ ...prev, quantity: '5' }))}>5 шт</button>
+                      <button type="button" onClick={() => setStockActionForm((prev) => ({ ...prev, quantity: '10' }))}>10 шт</button>
+                      <button type="button" onClick={() => setStockActionForm((prev) => ({ ...prev, quantity: '20' }))}>20 шт</button>
+                    </div>
+                    {selectedStockItem ? (
+                      <div className="card">
+                        {selectedStockItem.imageUrl ? (
+                          <img
+                            src={selectedStockItem.imageUrl}
+                            alt={selectedStockItem.productName}
+                            style={{ height: '130px', objectFit: 'cover' }}
+                          />
+                        ) : null}
+                        <div className="card-content">
+                          <h3>
+                            #{selectedStockItem.productId} {selectedStockItem.productName}
+                          </h3>
+                          <div className="muted">
+                            Склад: {selectedStockItem.warehouseName} ({selectedStockItem.warehouseCode})
+                          </div>
+                          <div className="muted">
+                            Категория: {selectedStockItem.category || 'Без категории'}
+                          </div>
+                          <div>
+                            Сейчас: доступно {selectedStockItem.availableQuantity} шт., в резерве {selectedStockItem.reservedQuantity} шт., всего {selectedStockItem.quantity} шт.
+                          </div>
+                          <div>
+                            После операции: доступно {stockActionPreview.nextAvailable} шт., в резерве {stockActionPreview.nextReserved} шт.
+                          </div>
+                          <div className="muted">{stockActionPreview.note}</div>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="muted">Выберите склад и товар для операции.</div>
+                    )}
+                    <button type="submit" disabled={stockActionSubmitting}>
+                      {stockActionSubmitting ? 'Проводим...' : 'Провести'}
+                    </button>
                   </form>
                 </div>
 
@@ -2276,25 +3477,246 @@ export default function App() {
 
                 <div className="row">
                   <strong>Остатки по складу</strong>
-                  {warehouseOverview.stock.length === 0 ? (
+                  <div className="muted">
+                    Путь: Склад {'>'} {warehouseViewName} {'>'} {warehouseView.category === 'all' ? 'Все товары' : warehouseView.category}
+                  </div>
+                  <div className="inline-actions">
+                    <select
+                      value={warehouseView.warehouseId}
+                      onChange={(e) =>
+                        setWarehouseView((prev) => ({
+                          ...prev,
+                          warehouseId: Number(e.target.value),
+                          category: 'all'
+                        }))
+                      }
+                    >
+                      <option value={0}>Все склады</option>
+                      {warehouseOverview.warehouses.map((w) => (
+                        <option key={`warehouse-view-${w.id}`} value={w.id}>
+                          {w.name} ({w.code})
+                        </option>
+                      ))}
+                    </select>
+                    <select
+                      value={warehouseView.category}
+                      onChange={(e) => setWarehouseView((prev) => ({ ...prev, category: e.target.value }))}
+                    >
+                      <option value="all">Все категории</option>
+                      {warehouseViewCategories.map((category) => (
+                        <option key={`warehouse-category-${category}`} value={category}>
+                          {category}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <input
+                    placeholder="Поиск по складу или товару (например: рис, MAIN, 12)"
+                    value={warehouseStockSearch}
+                    onChange={(e) => setWarehouseStockSearch(e.target.value)}
+                  />
+                  <div className="inline-actions">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setSelectedWarehouseStockKeys((prev) => {
+                          const next = { ...prev };
+                          for (const item of filteredWarehouseStock) {
+                            next[stockRowKey(item.warehouseId, item.productId)] = true;
+                          }
+                          return next;
+                        })
+                      }
+                    >
+                      Выбрать все в фильтре ({filteredWarehouseStock.length})
+                    </button>
+                    <button type="button" onClick={() => setSelectedWarehouseStockKeys({})}>
+                      Снять выбор
+                    </button>
+                    <div className="muted">
+                      Выбрано: {selectedWarehouseStockItems.length}
+                    </div>
+                  </div>
+                  <div className="row">
+                    <strong>Массовая операция</strong>
+                    <select
+                      value={bulkStockForm.movementType}
+                      onChange={(e) => setBulkStockForm((prev) => ({ ...prev, movementType: e.target.value as StockMovementType }))}
+                    >
+                      <option value="receive">Приемка</option>
+                      <option value="writeoff">Списание</option>
+                      <option value="reserve">Резерв</option>
+                    </select>
+                    <input
+                      type="number"
+                      min="1"
+                      step="1"
+                      value={bulkStockForm.quantity}
+                      onChange={(e) => setBulkStockForm((prev) => ({ ...prev, quantity: e.target.value }))}
+                    />
+                    <input
+                      placeholder="Причина для всех (опц.)"
+                      value={bulkStockForm.reason}
+                      onChange={(e) => setBulkStockForm((prev) => ({ ...prev, reason: e.target.value }))}
+                    />
+                    <button type="button" onClick={applyBulkStockMovement} disabled={selectedWarehouseStockItems.length === 0 || bulkStockSubmitting}>
+                      {bulkStockSubmitting ? 'Выполняем...' : 'Выполнить для выбранных'}
+                    </button>
+                  </div>
+                  {filteredWarehouseStock.length === 0 ? (
                     <div className="muted">Данных по складу пока нет.</div>
                   ) : (
-                    warehouseOverview.stock.map((item) => (
-                      <div key={`stock-row-${item.warehouseId}-${item.productId}`}>
-                        {item.warehouseName} | {item.productName}: всего {item.quantity} шт., резерв {item.reservedQuantity} шт., доступно {item.availableQuantity} шт.
+                    filteredWarehouseStock.map((item) => (
+                      <div key={`stock-row-${item.warehouseId}-${item.productId}`} className="row">
+                        {item.imageUrl ? (
+                          <img
+                            src={item.imageUrl}
+                            alt={item.productName}
+                            style={{ width: '88px', height: '88px', objectFit: 'cover', borderRadius: '10px', marginBottom: '8px' }}
+                          />
+                        ) : null}
+                        <strong>{item.warehouseName} | #{item.productId} {item.productName}</strong>
+                        <div>Всего {item.quantity} шт., резерв {item.reservedQuantity} шт., доступно {item.availableQuantity} шт.</div>
+                        <label>
+                          <input
+                            type="checkbox"
+                            checked={Boolean(selectedWarehouseStockKeys[stockRowKey(item.warehouseId, item.productId)])}
+                            onChange={(e) =>
+                              setSelectedWarehouseStockKeys((prev) => ({
+                                ...prev,
+                                [stockRowKey(item.warehouseId, item.productId)]: e.target.checked
+                              }))
+                            }
+                          />
+                          Выбрать для массовой операции
+                        </label>
+                        <div className="inline-actions">
+                          <button
+                            type="button"
+                            disabled={quickStockSubmittingKey !== ''}
+                            onClick={() => quickStockMovement(item, 'receive', 10)}
+                          >
+                            +10 приемка
+                          </button>
+                          <button
+                            type="button"
+                            disabled={quickStockSubmittingKey !== ''}
+                            onClick={() => quickStockMovement(item, 'writeoff', 1)}
+                          >
+                            Списать 1
+                          </button>
+                          <button
+                            type="button"
+                            disabled={quickStockSubmittingKey !== ''}
+                            onClick={() => quickStockMovement(item, 'reserve', 1)}
+                          >
+                            Резерв 1
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => openStockActionFormForItem(item)}
+                          >
+                            В форму
+                          </button>
+                        </div>
                       </div>
                     ))
                   )}
                 </div>
 
                 <div className="row">
-                  <strong>Последние движения</strong>
-                  {warehouseOverview.movements.length === 0 ? (
+                  <strong>Операционный журнал</strong>
+                  <form
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      void loadWarehouseJournal();
+                    }}
+                  >
+                    <select
+                      value={warehouseJournalFilters.warehouseId}
+                      onChange={(e) => setWarehouseJournalFilters((prev) => ({ ...prev, warehouseId: Number(e.target.value) }))}
+                    >
+                      <option value={0}>Все склады</option>
+                      {warehouseOverview.warehouses.map((w) => (
+                        <option key={`journal-warehouse-${w.id}`} value={w.id}>
+                          {w.name} ({w.code})
+                        </option>
+                      ))}
+                    </select>
+                    <select
+                      value={warehouseJournalFilters.movementType}
+                      onChange={(e) => setWarehouseJournalFilters((prev) => ({ ...prev, movementType: e.target.value }))}
+                    >
+                      <option value="all">Все типы</option>
+                      <option value="receive">Приемка</option>
+                      <option value="writeoff">Списание</option>
+                      <option value="reserve">Резерв</option>
+                      <option value="release">Снятие резерва</option>
+                    </select>
+                    <input
+                      placeholder="Товар или ID товара"
+                      value={warehouseJournalFilters.product}
+                      onChange={(e) => setWarehouseJournalFilters((prev) => ({ ...prev, product: e.target.value }))}
+                    />
+                    <input
+                      type="datetime-local"
+                      value={warehouseJournalFilters.dateFrom}
+                      onChange={(e) => setWarehouseJournalFilters((prev) => ({ ...prev, dateFrom: e.target.value }))}
+                    />
+                    <input
+                      type="datetime-local"
+                      value={warehouseJournalFilters.dateTo}
+                      onChange={(e) => setWarehouseJournalFilters((prev) => ({ ...prev, dateTo: e.target.value }))}
+                    />
+                    <input
+                      type="number"
+                      min="50"
+                      max="1000"
+                      step="50"
+                      value={warehouseJournalFilters.limit}
+                      onChange={(e) => setWarehouseJournalFilters((prev) => ({ ...prev, limit: e.target.value }))}
+                    />
+                    <div className="inline-actions">
+                      <button type="submit" disabled={warehouseJournalLoading}>
+                        {warehouseJournalLoading ? 'Загружаем...' : 'Применить фильтры'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const nextFilters = {
+                            warehouseId: 0,
+                            movementType: 'all',
+                            product: '',
+                            dateFrom: '',
+                            dateTo: '',
+                            limit: '300'
+                          };
+                          setWarehouseJournalFilters(nextFilters);
+                          void loadWarehouseJournal(nextFilters);
+                        }}
+                      >
+                        Сброс
+                      </button>
+                      <button type="button" onClick={exportWarehouseJournalCsv}>
+                        Экспорт CSV
+                      </button>
+                    </div>
+                  </form>
+                  {warehouseJournal.length === 0 ? (
                     <div className="muted">Движений пока нет.</div>
                   ) : (
-                    warehouseOverview.movements.slice(0, 20).map((m) => (
-                      <div key={`movement-${m.id}`}>
-                        #{m.id} {m.movementType} | {m.productName} | {m.quantity} шт. | {m.warehouseName} | {new Date(m.createdAt).toLocaleString()}
+                    warehouseJournal.map((m) => (
+                      <div key={`movement-${m.id}`} className="row">
+                        <strong>
+                          #{m.id} | {stockMovementHumanLabel(m.movementType)} | {m.quantity} шт.
+                        </strong>
+                        <div>
+                          Склад: {m.warehouseName} (#{m.warehouseId}) | Товар: {m.productName} (#{m.productId})
+                        </div>
+                        <div className="muted">
+                          {new Date(m.createdAt).toLocaleString()} | Оператор: {m.createdBy || '-'}
+                          {m.reason ? ` | Причина: ${m.reason}` : ''}
+                        </div>
                       </div>
                     ))
                   )}
@@ -2350,7 +3772,9 @@ export default function App() {
                                 ...prev,
                                 permissions: e.target.checked
                                   ? Array.from(new Set([...prev.permissions, perm.key]))
-                                  : prev.permissions.filter((p) => p !== perm.key)
+                                  : prev.permissions.filter((p) => p !== perm.key),
+                                warehouseScopes:
+                                  perm.key === 'manage_warehouse' && !e.target.checked ? [] : prev.warehouseScopes
                               }));
                             }}
                           />
@@ -2358,6 +3782,31 @@ export default function App() {
                         </label>
                       ))}
                     </div>
+                    {staffCreateForm.permissions.includes('manage_warehouse') ? (
+                      <div className="row">
+                        <strong>Доступ к складам сотрудника</strong>
+                        <div className="muted">Выберите один или несколько складов. Если не выбирать, будет доступ ко всем складам.</div>
+                        <div className="inline-actions">
+                          {warehouseOverview.warehouses.map((w) => (
+                            <label key={`staff-warehouse-${w.id}`}>
+                              <input
+                                type="checkbox"
+                                checked={staffCreateForm.warehouseScopes.includes(w.id)}
+                                onChange={(e) =>
+                                  setStaffCreateForm((prev) => ({
+                                    ...prev,
+                                    warehouseScopes: e.target.checked
+                                      ? Array.from(new Set([...prev.warehouseScopes, w.id]))
+                                      : prev.warehouseScopes.filter((id) => id !== w.id)
+                                  }))
+                                }
+                              />
+                              {w.name}
+                            </label>
+                          ))}
+                        </div>
+                      </div>
+                    ) : null}
                     <button type="submit">Создать сотрудника</button>
                   </form>
                 ) : null}
@@ -2386,6 +3835,12 @@ export default function App() {
                     {u.role === 'admin' ? (
                       <div className="muted">
                         Права: {(u.permissions || []).length ? u.permissions.join(', ') : 'не назначены'}
+                        <br />
+                        Склады: {(u.warehouseScopes || []).length
+                          ? (u.warehouseScopes || [])
+                            .map((id) => warehouseOverview.warehouses.find((w) => w.id === id)?.name || `#${id}`)
+                            .join(', ')
+                          : 'все склады'}
                       </div>
                     ) : null}
                     <div className="inline-actions">
@@ -2424,11 +3879,36 @@ export default function App() {
                                     const next = e.target.checked
                                       ? Array.from(new Set([...current, perm.key]))
                                       : current.filter((p) => p !== perm.key);
+                                    if (perm.key === 'manage_warehouse' && !e.target.checked) {
+                                      setAdminUserWarehouseScopesDrafts((drafts) => ({ ...drafts, [u.id]: [] }));
+                                    }
                                     return { ...prev, [u.id]: next };
                                   })
                                 }
                               />
                               {perm.label}
+                            </label>
+                          ))}
+                        </div>
+                      ) : null}
+                      {isSystemAdmin && u.role === 'admin' && (adminUserPermissionsDrafts[u.id] || []).includes('manage_warehouse') ? (
+                        <div className="inline-actions">
+                          {warehouseOverview.warehouses.map((w) => (
+                            <label key={`user-${u.id}-warehouse-${w.id}`}>
+                              <input
+                                type="checkbox"
+                                checked={(adminUserWarehouseScopesDrafts[u.id] || []).includes(w.id)}
+                                disabled={isProtectedSystemAdmin}
+                                onChange={(e) =>
+                                  setAdminUserWarehouseScopesDrafts((prev) => ({
+                                    ...prev,
+                                    [u.id]: e.target.checked
+                                      ? Array.from(new Set([...(prev[u.id] || []), w.id]))
+                                      : (prev[u.id] || []).filter((id) => id !== w.id)
+                                  }))
+                                }
+                              />
+                              {w.name}
                             </label>
                           ))}
                         </div>
@@ -2567,6 +4047,29 @@ export default function App() {
           </section>
         )}
       </main>
+
+      {loggedIn ? (
+        <nav className="mobile-dock" aria-label="Мобильная навигация">
+          <button type="button" className={catalogOpen ? 'active' : ''} onClick={goToCatalog}>Товары</button>
+          {user?.role !== 'courier' ? (
+            <button type="button" className={profileOpen ? 'active' : ''} onClick={goToProfile}>Кабинет</button>
+          ) : null}
+          <button type="button" className={cartOpen ? 'active' : ''} onClick={goToCart}>
+            Корзина{cartItemsCount > 0 ? ` (${cartItemsCount})` : ''}
+          </button>
+          {user?.role !== 'courier' ? (
+            <button type="button" className={deliveryMapOpen ? 'active' : ''} onClick={goToMap}>Карта</button>
+          ) : null}
+        </nav>
+      ) : null}
+
+      <footer className="app-footer">
+        {loggedIn ? (
+          <button type="button" className="danger" onClick={logout}>Выйти</button>
+        ) : (
+          <span className="muted">Вы не авторизованы</span>
+        )}
+      </footer>
 
       {toast && <div className="toast">{toast}</div>}
     </>

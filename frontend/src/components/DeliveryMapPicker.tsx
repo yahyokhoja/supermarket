@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { DELIVERY_ZONE_DUSHANBE, WAREHOUSE_POINTS } from '../config/mapLayers';
 
 type LatLng = { lat: number; lng: number };
 
@@ -9,6 +10,12 @@ type SearchResult = {
   locality?: string | null;
   street?: string | null;
   houseNumber?: string | null;
+};
+type HouseSuggestion = {
+  house: string;
+  lat: number;
+  lng: number;
+  displayName: string;
 };
 
 type Props = {
@@ -22,7 +29,16 @@ type Props = {
   onLocationChange: (location: LatLng | null) => void;
 };
 
-const DEFAULT_CENTER: LatLng = { lat: 55.751244, lng: 37.618423 };
+const DEFAULT_CENTER: LatLng = { lat: 38.559772, lng: 68.787038 };
+const TAJIKISTAN_HINT = 'Таджикистан';
+const YANDEX_MAPS_API_KEY = (import.meta.env.VITE_YANDEX_MAPS_API_KEY as string | undefined)?.trim() || '';
+const MAP_PLATFORM_URL = (import.meta.env.VITE_MAP_PLATFORM_URL as string | undefined)?.trim() || 'http://localhost:8090';
+const TAJIK_CITY_PRESETS: Array<{ label: string; point: LatLng }> = [
+  { label: 'Душанбе', point: { lat: 38.559772, lng: 68.787038 } },
+  { label: 'Худжанд', point: { lat: 40.28256, lng: 69.62216 } },
+  { label: 'Бохтар', point: { lat: 37.8331, lng: 68.77905 } },
+  { label: 'Куляб', point: { lat: 37.91459, lng: 69.78454 } }
+];
 const MESSAGE_TYPE = 'delivery-map-click';
 const MESSAGE_SET_CENTER = 'delivery-map-set-center';
 
@@ -61,44 +77,220 @@ function extractStreet(displayName: string, locality?: string) {
   return filtered || '';
 }
 
-function mapFrameHtml() {
+function extractHouseFromDisplayName(displayName: string) {
+  const parts = displayName
+    .split(',')
+    .map((p) => p.trim())
+    .filter(Boolean);
+  const marker = parts.find((p) => /\b(дом|д\.|house|№)\b/iu.test(p));
+  const fromMarker = marker ? sanitizeHouseInput(marker) : '';
+  if (fromMarker) return fromMarker;
+  const shortNumericPart = parts.find((p) => {
+    const candidate = sanitizeHouseInput(p);
+    return Boolean(candidate) && candidate.length <= 5;
+  });
+  if (shortNumericPart) return sanitizeHouseInput(shortNumericPart);
+  return sanitizeHouseInput(displayName);
+}
+
+function pointScore(lat: number, lng: number, item: SearchResult) {
+  return Math.abs(item.lat - lat) + Math.abs(item.lng - lng);
+}
+
+function mapFrameHtml(yandexApiKey: string, mapPlatformUrl: string) {
+  const warehousesJson = JSON.stringify(WAREHOUSE_POINTS);
+  const zoneJson = JSON.stringify(DELIVERY_ZONE_DUSHANBE);
+  const centerJson = JSON.stringify([DEFAULT_CENTER.lat, DEFAULT_CENTER.lng]);
+  const apiKeyJson = JSON.stringify(yandexApiKey || '');
+  const mapPlatformUrlJson = JSON.stringify(mapPlatformUrl || '');
   return `<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <style>
     html, body, #map { margin: 0; width: 100%; height: 100%; }
   </style>
 </head>
 <body>
   <div id="map"></div>
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
-    const center = [${DEFAULT_CENTER.lat}, ${DEFAULT_CENTER.lng}];
-    const map = L.map('map').setView(center, 14);
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      attribution: '&copy; OpenStreetMap contributors'
-    }).addTo(map);
+    const center = ${centerJson};
+    const warehouses = ${warehousesJson};
+    const zonePoints = ${zoneJson};
+    const yandexApiKey = ${apiKeyJson};
+    const mapPlatformBase = (${mapPlatformUrlJson} || '').replace(/\\/+$/, '');
 
-    function publishCenter() {
-      const c = map.getCenter();
-      window.parent.postMessage({ type: '${MESSAGE_TYPE}', lat: c.lat, lng: c.lng }, '*');
+    function setupLeafletFallback() {
+      const css = document.createElement('link');
+      css.rel = 'stylesheet';
+      css.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
+      document.head.appendChild(css);
+
+      const script = document.createElement('script');
+      script.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
+      script.onload = function() {
+        const map = L.map('map').setView(center, 14);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+          attribution: '&copy; OpenStreetMap contributors'
+        }).addTo(map);
+
+        let staticOverlayAdded = false;
+        function addStaticOverlay() {
+          if (staticOverlayAdded) return;
+          staticOverlayAdded = true;
+          const deliveryZone = L.polygon(zonePoints, {
+            color: '#0f8f59',
+            fillColor: '#0f8f59',
+            fillOpacity: 0.12,
+            weight: 2
+          }).addTo(map);
+          deliveryZone.bindPopup('Зона доставки');
+
+          for (const item of warehouses) {
+            const marker = L.circleMarker([item.lat, item.lng], {
+              radius: 7,
+              color: '#122036',
+              fillColor: '#d83434',
+              fillOpacity: 0.95,
+              weight: 2
+            }).addTo(map);
+            marker.bindPopup(item.name);
+          }
+        }
+
+        function addMapPlatformVectorOverlay() {
+          if (!mapPlatformBase) {
+            addStaticOverlay();
+            return;
+          }
+
+          const vectorScript = document.createElement('script');
+          vectorScript.src = 'https://unpkg.com/leaflet.vectorgrid@1.3.0/dist/Leaflet.VectorGrid.bundled.js';
+          vectorScript.onload = function() {
+            try {
+              if (!L.vectorGrid || !L.vectorGrid.protobuf) {
+                addStaticOverlay();
+                return;
+              }
+
+              const vectorLayer = L.vectorGrid.protobuf(mapPlatformBase + '/maps/delivery/{z}/{x}/{y}.pbf', {
+                vectorTileLayerStyles: {
+                  delivery_zones: {
+                    fill: true,
+                    fillColor: '#0f8f59',
+                    fillOpacity: 0.12,
+                    color: '#0f8f59',
+                    weight: 2
+                  },
+                  warehouses: {
+                    radius: 7,
+                    fill: true,
+                    fillColor: '#d83434',
+                    fillOpacity: 0.95,
+                    color: '#122036',
+                    weight: 2
+                  }
+                },
+                interactive: true,
+                maxZoom: 22
+              }).addTo(map);
+
+              vectorLayer.on('tileerror', function() {
+                addStaticOverlay();
+              });
+            } catch (_error) {
+              addStaticOverlay();
+            }
+          };
+          vectorScript.onerror = addStaticOverlay;
+          document.body.appendChild(vectorScript);
+        }
+
+        addMapPlatformVectorOverlay();
+
+        function publishCenter() {
+          const c = map.getCenter();
+          window.parent.postMessage({ type: '${MESSAGE_TYPE}', lat: c.lat, lng: c.lng }, '*');
+        }
+
+        map.on('moveend', publishCenter);
+        setTimeout(publishCenter, 0);
+
+        window.addEventListener('message', function(event) {
+          const payload = event.data || {};
+          if (payload.type !== '${MESSAGE_SET_CENTER}') return;
+          if (typeof payload.lat !== 'number' || typeof payload.lng !== 'number') return;
+          map.setView([payload.lat, payload.lng], map.getZoom(), { animate: true });
+        });
+      };
+      document.body.appendChild(script);
     }
 
-    map.on('moveend', publishCenter);
-    setTimeout(publishCenter, 0);
+    function setupYandexMap() {
+      const script = document.createElement('script');
+      script.src = 'https://api-maps.yandex.ru/2.1/?apikey=' + encodeURIComponent(yandexApiKey) + '&lang=ru_RU';
+      script.onload = function() {
+        ymaps.ready(function() {
+          const map = new ymaps.Map('map', {
+            center: center,
+            zoom: 14,
+            controls: []
+          });
 
-    window.addEventListener('message', function(event) {
-      const payload = event.data || {};
-      if (payload.type !== '${MESSAGE_SET_CENTER}') return;
-      if (typeof payload.lat !== 'number' || typeof payload.lng !== 'number') return;
-      map.setView([payload.lat, payload.lng], map.getZoom(), { animate: true });
-    });
+          const zone = new ymaps.Polygon(
+            [zonePoints],
+            { hintContent: 'Зона доставки' },
+            {
+              fillColor: 'rgba(15,143,89,0.16)',
+              strokeColor: '#0f8f59',
+              strokeWidth: 2,
+              interactivityModel: 'default#transparent'
+            }
+          );
+          map.geoObjects.add(zone);
+
+          for (const item of warehouses) {
+            const placemark = new ymaps.Placemark(
+              [item.lat, item.lng],
+              { balloonContent: item.name, hintContent: item.name },
+              { preset: 'islands#redDotIcon' }
+            );
+            map.geoObjects.add(placemark);
+          }
+
+          function publishCenter() {
+            const c = map.getCenter();
+            window.parent.postMessage({ type: '${MESSAGE_TYPE}', lat: c[0], lng: c[1] }, '*');
+          }
+
+          map.events.add('boundschange', publishCenter);
+          setTimeout(publishCenter, 0);
+
+          window.addEventListener('message', function(event) {
+            const payload = event.data || {};
+            if (payload.type !== '${MESSAGE_SET_CENTER}') return;
+            if (typeof payload.lat !== 'number' || typeof payload.lng !== 'number') return;
+            map.setCenter([payload.lat, payload.lng], map.getZoom(), { duration: 250 });
+          });
+        });
+      };
+      script.onerror = setupLeafletFallback;
+      document.body.appendChild(script);
+    }
+
+    if (yandexApiKey) setupYandexMap();
+    else setupLeafletFallback();
   </script>
 </body>
 </html>`;
+}
+
+function withTajikistanHint(rawQuery: string) {
+  const q = rawQuery.trim();
+  if (!q) return '';
+  if (/(таджикистан|tajikistan)/iu.test(q)) return q;
+  return `${q}, ${TAJIKISTAN_HINT}`;
 }
 
 export default function DeliveryMapPicker({
@@ -115,6 +307,9 @@ export default function DeliveryMapPicker({
   const [results, setResults] = useState<SearchResult[]>([]);
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState('');
+  const [houseSuggestLoading, setHouseSuggestLoading] = useState(false);
+  const [houseSuggestions, setHouseSuggestions] = useState<HouseSuggestion[]>([]);
+  const [reverseLoading, setReverseLoading] = useState(false);
   const [locating, setLocating] = useState(false);
   const [preciseLocating, setPreciseLocating] = useState(false);
   const [geoError, setGeoError] = useState('');
@@ -122,15 +317,17 @@ export default function DeliveryMapPicker({
   const [geoAccuracy, setGeoAccuracy] = useState<number | null>(null);
   const [manualLat, setManualLat] = useState('');
   const [manualLng, setManualLng] = useState('');
+  const [detectedAddress, setDetectedAddress] = useState('');
   const [autoLocTried, setAutoLocTried] = useState(false);
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
   const reverseTimerRef = useRef<number | null>(null);
   const pendingCenterRef = useRef<LatLng | null>(null);
   const searchTimerRef = useRef<number | null>(null);
+  const houseSuggestTimerRef = useRef<number | null>(null);
   const autoCityCenterRef = useRef('');
 
   const center = location || DEFAULT_CENTER;
-  const frameHtml = useMemo(() => mapFrameHtml(), []);
+  const frameHtml = useMemo(() => mapFrameHtml(YANDEX_MAPS_API_KEY, MAP_PLATFORM_URL), []);
 
   useEffect(() => {
     function onMessage(event: MessageEvent) {
@@ -151,6 +348,9 @@ export default function DeliveryMapPicker({
       }
       if (searchTimerRef.current) {
         window.clearTimeout(searchTimerRef.current);
+      }
+      if (houseSuggestTimerRef.current) {
+        window.clearTimeout(houseSuggestTimerRef.current);
       }
     };
   }, []);
@@ -184,7 +384,10 @@ export default function DeliveryMapPicker({
     };
   }, []);
 
-  async function reverseGeocode(lat: number, lng: number) {
+  async function reverseGeocode(lat: number, lng: number, showLoading = false) {
+    if (showLoading) {
+      setReverseLoading(true);
+    }
     try {
       const params = new URLSearchParams({ lat: String(lat), lng: String(lng) });
       const res = await fetch(`/api/geocode/reverse?${params.toString()}`);
@@ -193,21 +396,44 @@ export default function DeliveryMapPicker({
       const item = data?.result;
       if (!item) return;
 
-      if (item.street) {
-        onAddressChange(item.street);
-      }
-      if (item.locality) {
-        onLocalityChange(item.locality);
-      } else if (item.displayName && !locality.trim()) {
-        const fallbackLocality = extractLocality(item.displayName);
-        if (fallbackLocality) onLocalityChange(fallbackLocality);
+      const nextLocality = (item.locality || '').trim() || extractLocality(item.displayName || '');
+      const nextStreet = (item.street || '').trim() || extractStreet(item.displayName || '', nextLocality || locality);
+      let nextHouse = sanitizeHouseInput(String(item.houseNumber || '')) || extractHouseFromDisplayName(item.displayName || '');
+
+      // Fallback: when reverse geocode has no house number, try nearest forward-search candidate on same street.
+      if (!nextHouse && nextStreet) {
+        const q = withTajikistanHint([nextLocality, nextStreet].filter(Boolean).join(', '));
+        const searchParams = new URLSearchParams({ q });
+        const searchRes = await fetch(`/api/geocode/search?${searchParams.toString()}`);
+        if (searchRes.ok) {
+          const searchData = await searchRes.json() as { results?: SearchResult[] };
+          const list = Array.isArray(searchData.results) ? searchData.results : [];
+          const byStreet = list.filter((r) => {
+            const street = (r.street || extractStreet(r.displayName || '', nextLocality)).toLowerCase();
+            return Boolean(street) && street.includes(nextStreet.toLowerCase());
+          });
+          const source = byStreet.length ? byStreet : list;
+          const nearest = source
+            .map((r) => ({ r, score: pointScore(lat, lng, r) }))
+            .sort((a, b) => a.score - b.score)[0]?.r;
+          if (nearest) {
+            nextHouse = sanitizeHouseInput(String(nearest.houseNumber || '')) || extractHouseFromDisplayName(nearest.displayName || '');
+          }
+        }
       }
 
-      if (item.houseNumber && !houseNumber.trim()) {
-        onHouseNumberChange(String(item.houseNumber));
-      }
+      if (nextLocality) onLocalityChange(nextLocality);
+      if (nextStreet) onAddressChange(nextStreet);
+      if (nextHouse) onHouseNumberChange(nextHouse);
+      if (item.displayName) setDetectedAddress(item.displayName);
     } catch {
-      // silent fallback: coordinates still set, user can fill address manually
+      if (showLoading) {
+        setGeoError('Не удалось обновить адрес. Попробуйте еще раз.');
+      }
+    } finally {
+      if (showLoading) {
+        setReverseLoading(false);
+      }
     }
   }
 
@@ -225,8 +451,8 @@ export default function DeliveryMapPicker({
   }
 
   async function searchAddress(customQuery?: string) {
-    const q = (customQuery ?? query).trim();
-    if (!q) return;
+    const q = withTajikistanHint(customQuery ?? query);
+    if (!q.trim()) return;
 
     setSearching(true);
     setSearchError('');
@@ -371,7 +597,7 @@ export default function DeliveryMapPicker({
 
     void (async () => {
       try {
-        const params = new URLSearchParams({ q: city });
+        const params = new URLSearchParams({ q: withTajikistanHint(city) });
         const res = await fetch(`/api/geocode/search?${params.toString()}`);
         if (!res.ok) return;
         const data = await res.json() as { results?: SearchResult[] };
@@ -399,6 +625,75 @@ export default function DeliveryMapPicker({
       searchAddress();
     }, 450);
   }, [query]);
+
+  useEffect(() => {
+    const city = locality.trim();
+    const street = address.trim();
+    if (houseSuggestTimerRef.current) {
+      window.clearTimeout(houseSuggestTimerRef.current);
+    }
+    if (city.length < 2 || street.length < 3) {
+      setHouseSuggestions([]);
+      setHouseSuggestLoading(false);
+      return;
+    }
+
+    houseSuggestTimerRef.current = window.setTimeout(() => {
+      void (async () => {
+        setHouseSuggestLoading(true);
+        try {
+          const params = new URLSearchParams({ q: withTajikistanHint(`${city}, ${street}`) });
+          const res = await fetch(`/api/geocode/search?${params.toString()}`);
+          if (!res.ok) {
+            setHouseSuggestions([]);
+            return;
+          }
+          const data = await res.json() as { results?: SearchResult[] };
+          const list = Array.isArray(data.results) ? data.results : [];
+          const seen = new Set<string>();
+          const suggestions: HouseSuggestion[] = [];
+          for (const item of list) {
+            const house = sanitizeHouseInput(String(item.houseNumber || '')) || extractHouseFromDisplayName(item.displayName || '');
+            if (!house) continue;
+            const key = house.toLowerCase();
+            if (seen.has(key)) continue;
+            seen.add(key);
+            suggestions.push({
+              house,
+              lat: item.lat,
+              lng: item.lng,
+              displayName: item.displayName || ''
+            });
+          }
+          const ranked = location
+            ? suggestions
+                .map((item) => ({
+                  item,
+                  score: Math.abs(item.lat - location.lat) + Math.abs(item.lng - location.lng)
+                }))
+                .sort((a, b) => a.score - b.score)
+                .map((entry) => entry.item)
+            : suggestions;
+          setHouseSuggestions(ranked.slice(0, 8));
+        } catch {
+          setHouseSuggestions([]);
+        } finally {
+          setHouseSuggestLoading(false);
+        }
+      })();
+    }, 420);
+  }, [locality, address, location]);
+
+  useEffect(() => {
+    if (houseNumber.trim()) return;
+    if (!houseSuggestions.length) return;
+    const nearest = houseSuggestions[0];
+    if (!nearest?.house) return;
+    onHouseNumberChange(nearest.house);
+    if (!detectedAddress && nearest.displayName) {
+      setDetectedAddress(nearest.displayName);
+    }
+  }, [houseSuggestions, houseNumber, detectedAddress, onHouseNumberChange]);
 
   useEffect(() => {
     const composed = buildSmartQuery();
@@ -467,6 +762,15 @@ export default function DeliveryMapPicker({
     detectMyLocation();
   }
 
+  function refreshAddressByPoint() {
+    if (!location) {
+      setGeoError('Сначала выберите точку на карте.');
+      return;
+    }
+    setGeoError('');
+    void reverseGeocode(location.lat, location.lng, true);
+  }
+
   function handleMapLoad() {
     if (!pendingCenterRef.current) return;
     const target = iframeRef.current?.contentWindow;
@@ -505,6 +809,24 @@ export default function DeliveryMapPicker({
           onChange={(e) => onHouseNumberChange(sanitizeHouseInput(e.target.value))}
         />
       </div>
+      {houseSuggestLoading ? <div className="muted">Ищем ближайшие номера домов...</div> : null}
+      {!houseSuggestLoading && houseSuggestions.length > 0 ? (
+        <div className="inline-actions house-suggestions">
+          {houseSuggestions.map((item) => (
+            <button
+              key={`${item.house}-${item.lat}-${item.lng}`}
+              type="button"
+              onClick={() => {
+                onHouseNumberChange(item.house);
+                if (item.displayName) setDetectedAddress(item.displayName);
+                choose(item.lat, item.lng, address.trim() || undefined);
+              }}
+            >
+              дом {item.house}
+            </button>
+          ))}
+        </div>
+      ) : null}
 
       <div className="checkout-search">
         <input
@@ -523,22 +845,17 @@ export default function DeliveryMapPicker({
         </button>
       </div>
 
-      <div className="checkout-search">
-        <button type="button" onClick={detectMyLocation} disabled={locating}>
-          {locating ? 'Определяем...' : 'Определить автоматически'}
+      <div className="map-tools">
+        <button type="button" onClick={allowGeolocation} disabled={locating}>
+          {locating ? 'Определяем...' : 'Определить местоположение'}
         </button>
         <button type="button" onClick={detectMyLocationPrecise} disabled={preciseLocating}>
-          {preciseLocating ? 'Уточняем...' : 'Уточнить точность'}
+          {preciseLocating ? 'Уточняем...' : 'Уточнить точку'}
+        </button>
+        <button type="button" onClick={refreshAddressByPoint} disabled={!location || reverseLoading}>
+          {reverseLoading ? 'Обновляем адрес...' : 'Обновить адрес по точке'}
         </button>
       </div>
-
-      {geoPermission !== 'granted' ? (
-        <div className="checkout-search">
-          <button type="button" onClick={allowGeolocation}>
-            Разрешить геолокацию
-          </button>
-        </div>
-      ) : null}
 
       {results.length > 0 && (
         <div className="search-results">
@@ -551,7 +868,10 @@ export default function DeliveryMapPicker({
                 const pickedStreet = item.street || extractStreet(item.displayName, locality);
                 if (item.locality) onLocalityChange(item.locality);
                 else if (!locality.trim() && item.displayName) onLocalityChange(extractLocality(item.displayName));
-                if (item.houseNumber) onHouseNumberChange(sanitizeHouseInput(String(item.houseNumber)));
+                const pickedHouse =
+                  sanitizeHouseInput(String(item.houseNumber || '')) || extractHouseFromDisplayName(item.displayName || '');
+                if (pickedHouse) onHouseNumberChange(pickedHouse);
+                if (item.displayName) setDetectedAddress(item.displayName);
                 choose(item.lat, item.lng, pickedStreet);
               }}
             >
@@ -560,7 +880,7 @@ export default function DeliveryMapPicker({
           ))}
         </div>
       )}
-      {searchError ? <div className="muted" style={{ color: '#d83434' }}>{searchError}</div> : null}
+      {searchError ? <div className="map-error">{searchError}</div> : null}
 
       <div className="map-frame-wrap">
         <iframe
@@ -573,29 +893,20 @@ export default function DeliveryMapPicker({
         <div className="map-center-pin" aria-hidden>+</div>
       </div>
 
-      <div className="muted map-hint">
-        Метка фиксирована в центре. Двигайте карту, чтобы выбрать точку. Точка доставки: {location ? `${location.lat.toFixed(6)}, ${location.lng.toFixed(6)}` : 'не выбрана'}.
-      </div>
-      {geoAccuracy !== null ? <div className="muted">Точность геолокации: около {Math.round(geoAccuracy)} м.</div> : null}
-      {!locality.trim() ? <div className="muted" style={{ color: '#d83434' }}>Укажите город или населенный пункт.</div> : null}
-      {!houseNumber.trim() ? <div className="muted" style={{ color: '#d83434' }}>Укажите номер дома для точного адреса.</div> : null}
-      {geoError ? <div className="muted" style={{ color: '#d83434' }}>{geoError}</div> : null}
-      <details style={{ marginTop: '10px' }}>
-        <summary className="muted">Расширенные настройки точки</summary>
-        <div className="checkout-search" style={{ marginTop: '8px' }}>
-          <input
-            placeholder="Широта"
-            value={manualLat}
-            onChange={(e) => setManualLat(e.target.value)}
-          />
-          <input
-            placeholder="Долгота"
-            value={manualLng}
-            onChange={(e) => setManualLng(e.target.value)}
-          />
-          <button type="button" onClick={applyManualPoint}>Применить</button>
+      <div className="map-status">
+        <div className="muted map-hint">
+          Карта ориентирована на Таджикистан. Метка фиксирована в центре: двигайте карту, чтобы выбрать точку.
         </div>
-      </details>
+        <div className="muted">
+          Координаты: {location ? `${location.lat.toFixed(6)}, ${location.lng.toFixed(6)}` : 'не выбраны'}
+          {geoAccuracy ? ` (точность ~${Math.round(geoAccuracy)} м)` : ''}
+        </div>
+        {detectedAddress ? <div className="muted">Определенный адрес: {detectedAddress}</div> : null}
+      </div>
+
+      {!locality.trim() ? <div className="map-error">Укажите город или населенный пункт.</div> : null}
+      {!houseNumber.trim() ? <div className="map-error">Укажите номер дома для точного адреса.</div> : null}
+      {geoError ? <div className="map-error">{geoError}</div> : null}
     </div>
   );
 }

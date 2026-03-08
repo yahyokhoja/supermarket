@@ -18,6 +18,7 @@ export interface DbUser {
   is_active: boolean;
   session_version: number;
   permissions: string[];
+  warehouse_scopes: number[] | null;
   created_at: string;
 }
 
@@ -30,6 +31,7 @@ export interface PublicUser {
   role: UserRole;
   isActive: boolean;
   permissions: string[];
+  warehouseScopes: number[] | null;
   createdAt: string;
 }
 
@@ -41,6 +43,14 @@ export interface DbOrder {
   delivery_address: string;
   delivery_lat: number | null;
   delivery_lng: number | null;
+  serviceable: boolean | null;
+  delivery_zone: string | null;
+  fulfillment_warehouse: string | null;
+  fulfillment_warehouse_code: string | null;
+  warehouse_distance_km: number | null;
+  route_distance_km: number | null;
+  delivery_eta_min: number | null;
+  delivery_fee: number | null;
   assigned_courier_id: number | null;
   created_at: string;
   updated_at: string;
@@ -54,6 +64,14 @@ export interface ApiOrder {
   deliveryAddress: string;
   deliveryLat: number | null;
   deliveryLng: number | null;
+  serviceable: boolean | null;
+  deliveryZone: string | null;
+  fulfillmentWarehouse: string | null;
+  fulfillmentWarehouseCode: string | null;
+  warehouseDistanceKm: number | null;
+  routeDistanceKm: number | null;
+  deliveryEtaMin: number | null;
+  deliveryFee: number | null;
   assignedCourierId: number | null;
   createdAt: string;
   updatedAt: string;

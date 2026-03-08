@@ -26,12 +26,17 @@ npm install
 cp .env.example .env
 ```
 
-Настройка точного геокодирования РФ (опционально, рекомендуется):
+Настройка более точного геокодирования (опционально, рекомендуется):
 
-- в `.env` оставьте `GEOCODER_PROVIDER=yandex`
-- добавьте `YANDEX_GEOCODER_API_KEY=<ваш_ключ>`
+- в `.env` укажите `GEOCODER_PROVIDER=2gis`
+- добавьте `DGIS_GEOCODER_API_KEY=<ваш_ключ>`
 
-Если ключа нет, поставьте `GEOCODER_PROVIDER=osm`.
+Альтернативы:
+- `GEOCODER_PROVIDER=yandex` + `YANDEX_GEOCODER_API_KEY=<ваш_ключ>`
+- если ключа нет, поставьте `GEOCODER_PROVIDER=osm`
+
+Для интеграции с отдельным map-platform:
+- в `.env` укажите `MAP_DATABASE_URL=postgresql://map:mappass@localhost:5434/mapdb`
 
 ## Dev запуск
 
@@ -48,6 +53,31 @@ npm run dev:web
 ```
 
 Открыть: `http://localhost:5173`
+
+## Локальный HTTPS (телефон/геолокация)
+
+Сгенерировать dev-сертификат:
+
+```bash
+npm run https:cert
+```
+
+Если нужен доступ по IP (например, телефон в одной Wi-Fi сети), добавьте IP в SAN:
+
+```bash
+DEV_HTTPS_IP=10.83.73.50 npm run https:cert
+```
+
+Запуск с HTTPS:
+
+```bash
+DEV_HTTPS_IP=<ваш-ip> npm run https:cert
+npm run dev:all:https
+```
+
+Открыть:
+- `https://localhost:5173`
+- или `https://<ваш-ip>:5173` (после подтверждения сертификата в браузере)
 
 ## Локальный PostgreSQL (подготовка)
 
@@ -103,6 +133,7 @@ npm start
 2. В настройках проекта задайте переменные окружения:
    - `JWT_SECRET`
    - `GEOCODER_PROVIDER`
+   - `DGIS_GEOCODER_API_KEY` (если используете `2gis`)
    - `YANDEX_GEOCODER_API_KEY` (если используете `yandex`)
 3. Deploy.
 
@@ -116,6 +147,14 @@ npm start
 Для подключения фронтенда Vercel к внешнему API укажи env в Vercel:
 
 `VITE_API_BASE_URL=https://your-api-domain-or-tunnel`
+
+Для карты Yandex во frontend также укажи:
+
+`VITE_YANDEX_MAPS_API_KEY=<ваш_ключ>`
+
+Для собственного сервера карты (map-platform):
+
+`VITE_MAP_PLATFORM_URL=http://localhost:8090`
 
 ## Тестовые аккаунты
 
@@ -145,3 +184,26 @@ npm start
 - `GET /api/couriers`
 - `GET /api/geocode/search?q=...`
 - `GET /api/geocode/reverse?lat=...&lng=...`
+- `POST /api/delivery/quote` (проверка зоны, подбор склада, ETA и стоимость)
+
+## Логика доставки (новое)
+
+- Проверка, входит ли точка доставки в `delivery_zones` (map-platform / PostGIS).
+- Тариф по зоне из `delivery_zone_tariffs` (base/per-km/min/max + ETA параметры).
+- Выбор склада с учетом:
+  - активного статуса склада,
+  - координат склада,
+  - достаточного остатка по всем товарам заказа.
+- В заказ сохраняются:
+  - зона доставки,
+  - выбранный склад,
+  - расстояние по прямой,
+  - оценка маршрута,
+  - ETA,
+  - стоимость доставки.
+
+Обновление точки склада через админку:
+- Админ-панель -> вкладка `Склад` -> блок `Точка склада на карте`.
+- После сохранения координаты обновляются сразу в:
+  - основной БД проекта (`warehouses.lat/lng`)
+  - map-platform PostGIS (`public.warehouses.geom`)
