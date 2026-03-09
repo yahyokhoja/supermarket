@@ -1135,6 +1135,22 @@ async function geocodeReverse(lat: number, lng: number) {
   return geocodeReverseOsm(lat, lng);
 }
 
+async function resolveCoordinatesFromAddress(address: string) {
+  const normalized = String(address || '').trim();
+  if (!normalized) return null as { lat: number; lng: number } | null;
+  try {
+    const results = await geocodeSearch(normalized);
+    if (!results.length) return null;
+    const withHouse = results.find((item) => Boolean(String(item.houseNumber || '').trim()));
+    const candidate = withHouse || results[0];
+    if (!candidate) return null;
+    if (!Number.isFinite(candidate.lat) || !Number.isFinite(candidate.lng)) return null;
+    return { lat: candidate.lat, lng: candidate.lng };
+  } catch {
+    return null;
+  }
+}
+
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true, service: 'universal-supermarket-delivery', now: new Date().toISOString() });
 });
@@ -1198,13 +1214,21 @@ app.post('/api/delivery/quote', authRequired(JWT_SECRET), async (req, res) => {
   const hasLng = body.deliveryLng !== undefined && body.deliveryLng !== null;
   if (hasLat !== hasLng) return res.status(400).json({ message: 'Координаты доставки должны быть переданы парой' });
 
-  const deliveryLat = hasLat ? Number(body.deliveryLat) : null;
-  const deliveryLng = hasLng ? Number(body.deliveryLng) : null;
+  let deliveryLat = hasLat ? Number(body.deliveryLat) : null;
+  let deliveryLng = hasLng ? Number(body.deliveryLng) : null;
   if (
     (deliveryLat !== null && (Number.isNaN(deliveryLat) || deliveryLat < -90 || deliveryLat > 90)) ||
     (deliveryLng !== null && (Number.isNaN(deliveryLng) || deliveryLng < -180 || deliveryLng > 180))
   ) {
     return res.status(400).json({ message: 'Некорректные координаты доставки' });
+  }
+
+  if (deliveryLat === null || deliveryLng === null) {
+    const resolved = await resolveCoordinatesFromAddress(address);
+    if (resolved) {
+      deliveryLat = resolved.lat;
+      deliveryLng = resolved.lng;
+    }
   }
 
   const demandByProduct = await getUserCartDemand(req.user!.id);
@@ -3320,8 +3344,8 @@ app.post('/api/orders', authRequired(JWT_SECRET), async (req, res) => {
   const hasLng = body.deliveryLng !== undefined && body.deliveryLng !== null;
   if (hasLat !== hasLng) return res.status(400).json({ message: 'Координаты доставки должны быть переданы парой' });
 
-  const deliveryLat = hasLat ? Number(body.deliveryLat) : null;
-  const deliveryLng = hasLng ? Number(body.deliveryLng) : null;
+  let deliveryLat = hasLat ? Number(body.deliveryLat) : null;
+  let deliveryLng = hasLng ? Number(body.deliveryLng) : null;
   if (
     (deliveryLat !== null && (Number.isNaN(deliveryLat) || deliveryLat < -90 || deliveryLat > 90)) ||
     (deliveryLng !== null && (Number.isNaN(deliveryLng) || deliveryLng < -180 || deliveryLng > 180))
@@ -3329,8 +3353,23 @@ app.post('/api/orders', authRequired(JWT_SECRET), async (req, res) => {
     return res.status(400).json({ message: 'Некорректные координаты доставки' });
   }
 
+  if (deliveryLat === null || deliveryLng === null) {
+    const resolved = await resolveCoordinatesFromAddress(address);
+    if (resolved) {
+      deliveryLat = resolved.lat;
+      deliveryLng = resolved.lng;
+    }
+  }
+
+  if (deliveryLat === null || deliveryLng === null) {
+    return res.status(409).json({ message: 'Не удалось определить координаты адреса. Укажите точку на карте.' });
+  }
+
   const demandByProduct = buildDemandFromRows(cartRows);
   const deliveryQuote = await buildDeliveryQuote(deliveryLat, deliveryLng, demandByProduct);
+  if (!deliveryQuote.warehouseCode && !deliveryQuote.warehouseName) {
+    return res.status(409).json({ message: 'Не удалось автоматически назначить склад сборки по расстоянию' });
+  }
   if (deliveryQuote.serviceable === false) {
     return res.status(409).json({ message: deliveryQuote.reason || 'Доставка по этому адресу недоступна' });
   }
@@ -3676,11 +3715,17 @@ app.patch('/api/orders/:orderId/edit', authRequired(JWT_SECRET), async (req, res
   if (!orderRow) return res.status(404).json({ message: 'Заказ не найден' });
   const order = normalizeOrderRow(orderRow);
 
-  if (req.user!.role !== 'customer' || order.user_id !== req.user!.id) {
-    return res.status(403).json({ message: 'Изменять можно только свой заказ' });
-  }
-  if (!CUSTOMER_EDITABLE_STATUSES.includes(order.status as OrderStatus)) {
-    return res.status(409).json({ message: 'Изменение доступно только на этапах "Собирается" или "Назначен курьер"' });
+  if (req.user!.role === 'customer') {
+    if (order.user_id !== req.user!.id) {
+      return res.status(403).json({ message: 'Изменять можно только свой заказ' });
+    }
+    if (!CUSTOMER_EDITABLE_STATUSES.includes(order.status as OrderStatus)) {
+      return res.status(409).json({ message: 'Изменение доступно только на этапах "Собирается" или "Назначен курьер"' });
+    }
+  } else if (req.user!.role === 'admin') {
+    if (!(await requireAdminPermission(req, res, 'view_orders'))) return;
+  } else {
+    return res.status(403).json({ message: 'Недостаточно прав для изменения заказа' });
   }
 
   const nextAddress = String(body.deliveryAddress || '').trim();
@@ -3693,13 +3738,25 @@ app.patch('/api/orders/:orderId/edit', authRequired(JWT_SECRET), async (req, res
   const hasLat = body.deliveryLat !== undefined && body.deliveryLat !== null;
   const hasLng = body.deliveryLng !== undefined && body.deliveryLng !== null;
   if (hasLat !== hasLng) return res.status(400).json({ message: 'Координаты доставки должны быть переданы парой' });
-  const deliveryLat = hasLat ? Number(body.deliveryLat) : null;
-  const deliveryLng = hasLng ? Number(body.deliveryLng) : null;
+  let deliveryLat = hasLat ? Number(body.deliveryLat) : null;
+  let deliveryLng = hasLng ? Number(body.deliveryLng) : null;
   if (
     (deliveryLat !== null && (Number.isNaN(deliveryLat) || deliveryLat < -90 || deliveryLat > 90)) ||
     (deliveryLng !== null && (Number.isNaN(deliveryLng) || deliveryLng < -180 || deliveryLng > 180))
   ) {
     return res.status(400).json({ message: 'Некорректные координаты доставки' });
+  }
+
+  if (deliveryLat === null || deliveryLng === null) {
+    const resolved = await resolveCoordinatesFromAddress(nextAddress);
+    if (resolved) {
+      deliveryLat = resolved.lat;
+      deliveryLng = resolved.lng;
+    }
+  }
+
+  if (deliveryLat === null || deliveryLng === null) {
+    return res.status(409).json({ message: 'Не удалось определить координаты адреса. Укажите точку на карте.' });
   }
 
   const orderItemRows = (await db.query(
@@ -3712,6 +3769,9 @@ app.patch('/api/orders/:orderId/edit', authRequired(JWT_SECRET), async (req, res
   )).rows as Array<{ product_id: number; quantity: number }>;
   const demandByProduct = buildDemandFromRows(orderItemRows);
   const deliveryQuote = await buildDeliveryQuote(deliveryLat, deliveryLng, demandByProduct);
+  if (!deliveryQuote.warehouseCode && !deliveryQuote.warehouseName) {
+    return res.status(409).json({ message: 'Не удалось автоматически назначить склад сборки по расстоянию' });
+  }
   if (deliveryQuote.serviceable === false) {
     return res.status(409).json({ message: deliveryQuote.reason || 'Доставка по этому адресу недоступна' });
   }
@@ -3750,7 +3810,12 @@ app.patch('/api/orders/:orderId/edit', authRequired(JWT_SECRET), async (req, res
   );
   await db.query(
     'INSERT INTO order_events (order_id, status, comment, created_by) VALUES ($1, $2, $3, $4)',
-    [orderId, order.status, 'Клиент изменил адрес заказа', req.user!.id]
+    [
+      orderId,
+      order.status,
+      req.user!.role === 'admin' ? 'Администратор изменил адрес заказа' : 'Клиент изменил адрес заказа',
+      req.user!.id
+    ]
   );
 
   const updatedRow = (await db.query('SELECT * FROM orders WHERE id = $1 LIMIT 1', [orderId])).rows[0];

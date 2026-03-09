@@ -242,6 +242,13 @@ type DeliveryQuote = {
   deliveryFee: number | null;
   reason: string | null;
 };
+type AdminOrderEditState = {
+  orderId: number;
+  locality: string;
+  address: string;
+  houseNumber: string;
+  location: { lat: number; lng: number } | null;
+};
 
 type AdminProduct = {
   id: number;
@@ -398,6 +405,25 @@ function normalizeStreetInput(streetRaw: string, localityRaw: string) {
   return normalized;
 }
 
+function parseOrderAddressForForm(rawAddress: string) {
+  const source = String(rawAddress || '').trim();
+  if (!source) return { locality: '', street: '', houseNumber: '' };
+  const parts = source
+    .split(',')
+    .map((p) => p.trim())
+    .filter(Boolean);
+  const locality = parts[0] || '';
+  const street = normalizeStreetInput(parts[1] || '', locality);
+  let houseNumber = normalizeHouseNumber(parts.slice(2).join(' '));
+
+  if (!houseNumber) {
+    const m = source.match(/(?:дом|д\.?)\s*([0-9A-Za-zА-Яа-я\-\/]{1,12})/iu);
+    if (m?.[1]) houseNumber = normalizeHouseNumber(m[1]);
+  }
+
+  return { locality, street, houseNumber };
+}
+
 function validateImageUpload(file: File, label: string) {
   if (!file.type.startsWith('image/')) {
     return `${label}: разрешены только изображения (JPG, PNG, WEBP).`;
@@ -497,6 +523,9 @@ export default function App() {
   const [editingOrderId, setEditingOrderId] = useState<number | null>(null);
   const [cancellingOrderId, setCancellingOrderId] = useState<number | null>(null);
   const [deletingOrderId, setDeletingOrderId] = useState<number | null>(null);
+  const [adminEditingOrderId, setAdminEditingOrderId] = useState<number | null>(null);
+  const [adminDeletingOrderId, setAdminDeletingOrderId] = useState<number | null>(null);
+  const [adminOrderEdit, setAdminOrderEdit] = useState<AdminOrderEditState | null>(null);
   const [courierOrders, setCourierOrders] = useState<Order[]>([]);
   const [openCourierOrders, setOpenCourierOrders] = useState<Order[]>([]);
   const [allOrders, setAllOrders] = useState<Order[]>([]);
@@ -1741,6 +1770,75 @@ export default function App() {
     }
   }
 
+  function toggleAdminOrderEditor(order: Order) {
+    if (adminOrderEdit?.orderId === order.id) {
+      setAdminOrderEdit(null);
+      return;
+    }
+    const parsed = parseOrderAddressForForm(order.deliveryAddress);
+    setAdminOrderEdit({
+      orderId: order.id,
+      locality: parsed.locality,
+      address: parsed.street,
+      houseNumber: parsed.houseNumber,
+      location: order.deliveryLat !== null && order.deliveryLng !== null ? { lat: order.deliveryLat, lng: order.deliveryLng } : null
+    });
+  }
+
+  async function saveAdminOrderEdit(orderId: number) {
+    if (!adminOrderEdit || adminOrderEdit.orderId !== orderId) return;
+    const normalizedLocality = adminOrderEdit.locality.trim();
+    const normalizedAddress = normalizeStreetInput(adminOrderEdit.address, normalizedLocality);
+    const normalizedHouse = normalizeHouseNumber(adminOrderEdit.houseNumber);
+    const fullAddress = `${normalizedLocality}, ${normalizedAddress}, дом ${normalizedHouse}`.trim();
+    if (!hasLocalityName(normalizedLocality)) {
+      notify('Укажите город или населенный пункт');
+      return;
+    }
+    if (!hasStreetName(normalizedAddress)) {
+      notify('Введите адрес с корректным названием улицы (например: ул. Ленина)');
+      return;
+    }
+    if (!isValidHouseNumber(normalizedHouse)) {
+      notify('Укажите номер дома в формате: 44, 44А, 12/1');
+      return;
+    }
+
+    setAdminEditingOrderId(orderId);
+    try {
+      await api(`/api/orders/${orderId}/edit`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          deliveryAddress: fullAddress,
+          deliveryLat: adminOrderEdit.location?.lat ?? null,
+          deliveryLng: adminOrderEdit.location?.lng ?? null
+        })
+      });
+      await loadAdminData();
+      setAdminOrderEdit(null);
+      notify('Заказ обновлен администратором');
+    } catch (err) {
+      notify((err as Error).message);
+    } finally {
+      setAdminEditingOrderId(null);
+    }
+  }
+
+  async function adminDeleteOrder(orderId: number) {
+    if (!window.confirm('Удалить заказ? Это действие необратимо.')) return;
+    setAdminDeletingOrderId(orderId);
+    try {
+      await api(`/api/orders/${orderId}`, { method: 'DELETE' });
+      if (adminOrderEdit?.orderId === orderId) setAdminOrderEdit(null);
+      await loadAdminData();
+      notify('Заказ удален администратором');
+    } catch (err) {
+      notify((err as Error).message);
+    } finally {
+      setAdminDeletingOrderId(null);
+    }
+  }
+
   async function uploadTechPassport(file: File) {
     const prepared = await prepareImageForUpload(file, 'Фото техпаспорта');
     if (!prepared.file) {
@@ -2728,6 +2826,9 @@ export default function App() {
                 <div className="row" key={order.id}>
                   <div><strong>Заказ #{order.id}</strong> <span className={`badge ${order.status}`}>{STATUS_LABELS[order.status]}</span></div>
                   <div>Сумма: ${order.total.toFixed(2)} | Адрес: {order.deliveryAddress}</div>
+                  <div className="muted">
+                    Склад сборки: {order.fulfillmentWarehouse || order.fulfillmentWarehouseCode || 'подбирается'}
+                  </div>
                   {order.fulfillmentWarehouse || order.deliveryEtaMin !== null || order.deliveryFee !== null ? (
                     <div className="muted">
                       {order.deliveryZone ? `Зона: ${order.deliveryZone}. ` : ''}
@@ -2876,15 +2977,16 @@ export default function App() {
             <h3>Свободные заказы</h3>
             {openCourierOrders.length === 0 && <p className="muted">Свободных заказов нет.</p>}
             {openCourierOrders.map((order) => (
-              <div className="row" key={`open-${order.id}`}>
-                <strong>Заказ #{order.id}</strong> <span className={`badge ${order.status}`}>{STATUS_LABELS[order.status]}</span>
-                <div>Сумма: ${order.total.toFixed(2)}</div>
-                <div>Адрес: {order.deliveryAddress}</div>
-                <div>Координаты: {order.deliveryLat !== null && order.deliveryLng !== null ? `${order.deliveryLat.toFixed(6)}, ${order.deliveryLng.toFixed(6)}` : 'не указаны'}</div>
-                <div className="inline-actions">
-                  <button type="button" onClick={() => claimOrder(order.id)}>Взять заказ</button>
+                <div className="row" key={`open-${order.id}`}>
+                  <strong>Заказ #{order.id}</strong> <span className={`badge ${order.status}`}>{STATUS_LABELS[order.status]}</span>
+                  <div>Сумма: ${order.total.toFixed(2)}</div>
+                  <div>Адрес: {order.deliveryAddress}</div>
+                  <div className="muted">Склад сборки: {order.fulfillmentWarehouse || order.fulfillmentWarehouseCode || 'подбирается'}</div>
+                  <div>Координаты: {order.deliveryLat !== null && order.deliveryLng !== null ? `${order.deliveryLat.toFixed(6)}, ${order.deliveryLng.toFixed(6)}` : 'не указаны'}</div>
+                  <div className="inline-actions">
+                    <button type="button" onClick={() => claimOrder(order.id)}>Взять заказ</button>
+                  </div>
                 </div>
-              </div>
             ))}
 
             <h3>Назначенные мне</h3>
@@ -2893,6 +2995,7 @@ export default function App() {
               <div className="row" key={order.id}>
                 <strong>Заказ #{order.id}</strong> <span className={`badge ${order.status}`}>{STATUS_LABELS[order.status]}</span>
                 <div>Адрес: {order.deliveryAddress}</div>
+                <div className="muted">Склад сборки: {order.fulfillmentWarehouse || order.fulfillmentWarehouseCode || 'подбирается'}</div>
                 <div>Координаты: {order.deliveryLat !== null && order.deliveryLng !== null ? `${order.deliveryLat.toFixed(6)}, ${order.deliveryLng.toFixed(6)}` : 'не указаны'}</div>
                 <div className="inline-actions">
                   {courierProfile?.isEligible ? (
@@ -2948,7 +3051,54 @@ export default function App() {
                     <strong>Заказ #{order.id}</strong> <span className={`badge ${order.status}`}>{STATUS_LABELS[order.status]}</span>
                     <div>Сумма: ${order.total.toFixed(2)} | Курьер: {order.assignedCourierId ?? '-'}</div>
                     <div>Адрес: {order.deliveryAddress}</div>
+                    <div className="muted">Склад сборки: {order.fulfillmentWarehouse || order.fulfillmentWarehouseCode || 'подбирается'}</div>
                     <div>Координаты: {order.deliveryLat !== null && order.deliveryLng !== null ? `${order.deliveryLat.toFixed(6)}, ${order.deliveryLng.toFixed(6)}` : 'не указаны'}</div>
+                    <div className="inline-actions">
+                      <button
+                        type="button"
+                        onClick={() => toggleAdminOrderEditor(order)}
+                        disabled={adminEditingOrderId === order.id}
+                      >
+                        {adminOrderEdit?.orderId === order.id ? 'Свернуть' : 'Редактировать'}
+                      </button>
+                      <button
+                        type="button"
+                        className="danger"
+                        onClick={() => adminDeleteOrder(order.id)}
+                        disabled={adminDeletingOrderId === order.id}
+                      >
+                        {adminDeletingOrderId === order.id ? 'Удаляем...' : 'Удалить'}
+                      </button>
+                    </div>
+                    {adminOrderEdit?.orderId === order.id ? (
+                      <div className="row">
+                        <strong>Редактирование заказа #{order.id}</strong>
+                        <div className="checkout">
+                          <DeliveryMapPicker
+                            locality={adminOrderEdit.locality}
+                            onLocalityChange={(value) => setAdminOrderEdit((prev) => (prev ? { ...prev, locality: value } : prev))}
+                            address={adminOrderEdit.address}
+                            onAddressChange={(value) => setAdminOrderEdit((prev) => (prev ? { ...prev, address: value } : prev))}
+                            houseNumber={adminOrderEdit.houseNumber}
+                            onHouseNumberChange={(value) => setAdminOrderEdit((prev) => (prev ? { ...prev, houseNumber: value } : prev))}
+                            location={adminOrderEdit.location}
+                            onLocationChange={(value) => setAdminOrderEdit((prev) => (prev ? { ...prev, location: value } : prev))}
+                          />
+                        </div>
+                        <div className="inline-actions">
+                          <button
+                            type="button"
+                            onClick={() => saveAdminOrderEdit(order.id)}
+                            disabled={adminEditingOrderId === order.id}
+                          >
+                            {adminEditingOrderId === order.id ? 'Сохраняем...' : 'Сохранить'}
+                          </button>
+                          <button type="button" onClick={() => setAdminOrderEdit(null)} disabled={adminEditingOrderId === order.id}>
+                            Отмена
+                          </button>
+                        </div>
+                      </div>
+                    ) : null}
                   </div>
                 ))}
               </div>
