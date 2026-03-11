@@ -754,21 +754,25 @@ export default function DeliveryMapPicker({
     }, timeoutMs + 1000);
   }
 
-  function allowGeolocation() {
+  function handleLocationButton() {
+    if (locating || preciseLocating || reverseLoading) return;
+    setGeoError('');
+
+    // Если точка уже выбрана – просто обновим адрес по этой точке.
+    if (location) {
+      void reverseGeocode(location.lat, location.lng, true);
+      return;
+    }
+
     if (geoPermission === 'denied') {
       setGeoError('Разрешите геолокацию в браузере: иконка замка у адреса сайта -> Местоположение -> Разрешить, затем обновите страницу.');
       return;
     }
-    detectMyLocation();
-  }
 
-  function refreshAddressByPoint() {
-    if (!location) {
-      setGeoError('Сначала выберите точку на карте.');
-      return;
-    }
-    setGeoError('');
-    void reverseGeocode(location.lat, location.lng, true);
+    // Сначала быстрая геолокация; если браузер решит точность низкая, fallback на точную.
+    detectMyLocation();
+    // Параллельно попробуем более точное позиционирование (не блокирует UI).
+    detectMyLocationPrecise();
   }
 
   function handleMapLoad() {
@@ -846,14 +850,12 @@ export default function DeliveryMapPicker({
       </div>
 
       <div className="map-tools">
-        <button type="button" onClick={allowGeolocation} disabled={locating}>
-          {locating ? 'Определяем...' : 'Определить местоположение'}
-        </button>
-        <button type="button" onClick={detectMyLocationPrecise} disabled={preciseLocating}>
-          {preciseLocating ? 'Уточняем...' : 'Уточнить точку'}
-        </button>
-        <button type="button" onClick={refreshAddressByPoint} disabled={!location || reverseLoading}>
-          {reverseLoading ? 'Обновляем адрес...' : 'Обновить адрес по точке'}
+        <button
+          type="button"
+          onClick={handleLocationButton}
+          disabled={locating || preciseLocating || reverseLoading}
+        >
+          {locating || preciseLocating || reverseLoading ? 'Определяем...' : 'Местоположение'}
         </button>
       </div>
 

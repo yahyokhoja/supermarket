@@ -197,7 +197,9 @@ function normalizeOrderRow(row: any): DbOrder {
     delivery_fee: row.delivery_fee === null ? null : Number(row.delivery_fee),
     assigned_courier_id: row.assigned_courier_id === null ? null : Number(row.assigned_courier_id),
     created_at: toDateString(row.created_at),
-    updated_at: toDateString(row.updated_at)
+    updated_at: toDateString(row.updated_at),
+    customer_full_name: row.customer_full_name === undefined ? null : row.customer_full_name,
+    customer_phone: row.customer_phone === undefined ? null : row.customer_phone
   };
 }
 
@@ -515,7 +517,9 @@ function orderView(order: DbOrder): ApiOrder {
     deliveryFee: order.delivery_fee,
     assignedCourierId: order.assigned_courier_id,
     createdAt: order.created_at,
-    updatedAt: order.updated_at
+    updatedAt: order.updated_at,
+    customerName: order.customer_full_name ?? null,
+    customerPhone: order.customer_phone ?? null
   };
 }
 
@@ -648,6 +652,7 @@ async function findBestWarehouseForDemand(deliveryLat: number, deliveryLng: numb
   if (!rows.length) return null;
 
   const need = Array.from(demandByProduct.entries());
+  const needCount = need.length;
   const scored: Array<{
     id: number;
     code: string;
@@ -656,6 +661,8 @@ async function findBestWarehouseForDemand(deliveryLat: number, deliveryLng: numb
     lng: number;
     straightDistanceKm: number;
     coversAllDemand: boolean;
+    coveredRatio: number;
+    minAvailabilityRatio: number;
   }> = [];
 
   for (const row of rows) {
@@ -667,23 +674,37 @@ async function findBestWarehouseForDemand(deliveryLat: number, deliveryLng: numb
     if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
 
     let coversAllDemand = true;
-    for (const [productId, requiredQty] of need) {
-      const stockRow = (await db.query(
-        `
-          SELECT quantity, reserved_quantity
-          FROM warehouse_stock
-          WHERE warehouse_id = $1
-            AND product_id = $2
-          LIMIT 1
-        `,
-        [warehouseId, productId]
-      )).rows[0];
-      const qty = Number(stockRow?.quantity || 0);
-      const reserved = Number(stockRow?.reserved_quantity || 0);
-      const available = Math.max(qty - reserved, 0);
-      if (available < requiredQty) {
-        coversAllDemand = false;
-        break;
+    let covered = 0;
+    let minAvailabilityRatio = 1;
+
+    if (needCount === 0) {
+      coversAllDemand = true;
+      covered = 0;
+      minAvailabilityRatio = 1;
+    } else {
+      for (const [productId, requiredQty] of need) {
+        const stockRow = (await db.query(
+          `
+            SELECT quantity, reserved_quantity
+            FROM warehouse_stock
+            WHERE warehouse_id = $1
+              AND product_id = $2
+            LIMIT 1
+          `,
+          [warehouseId, productId]
+        )).rows[0];
+        const qty = Number(stockRow?.quantity || 0);
+        const reserved = Number(stockRow?.reserved_quantity || 0);
+        const available = Math.max(qty - reserved, 0);
+        if (available >= requiredQty) {
+          covered += 1;
+          const ratio = requiredQty > 0 ? available / requiredQty : 1;
+          minAvailabilityRatio = Math.min(minAvailabilityRatio, ratio);
+        } else {
+          coversAllDemand = false;
+          const ratio = requiredQty > 0 ? available / requiredQty : 0;
+          minAvailabilityRatio = Math.min(minAvailabilityRatio, ratio);
+        }
       }
     }
 
@@ -695,13 +716,21 @@ async function findBestWarehouseForDemand(deliveryLat: number, deliveryLng: numb
       lat,
       lng,
       straightDistanceKm,
-      coversAllDemand
+      coversAllDemand,
+      coveredRatio: needCount === 0 ? 1 : covered / needCount,
+      minAvailabilityRatio
     });
   }
 
   if (!scored.length) return null;
   scored.sort((a, b) => {
+    // 1) Полное покрытие лучше частичного
     if (a.coversAllDemand !== b.coversAllDemand) return a.coversAllDemand ? -1 : 1;
+    // 2) Больше покрытие товаров
+    if (a.coveredRatio !== b.coveredRatio) return b.coveredRatio - a.coveredRatio;
+    // 3) Лучшая минимальная обеспеченность
+    if (a.minAvailabilityRatio !== b.minAvailabilityRatio) return b.minAvailabilityRatio - a.minAvailabilityRatio;
+    // 4) Ближе к клиенту
     return a.straightDistanceKm - b.straightDistanceKm;
   });
   return scored[0] || null;
@@ -774,6 +803,26 @@ async function buildDeliveryQuote(
     const zoneResult = await getZoneTariffForPoint(deliveryLat, deliveryLng);
     const inDeliveryZone = zoneResult.inZone;
     if (!inDeliveryZone) {
+      // Fallback: если зона не настроена, но есть склад с координатами – обслуживаем ближайшим складом.
+      const fallbackWarehouse = await findBestWarehouseForDemand(deliveryLat, deliveryLng, demandByProduct);
+      if (fallbackWarehouse) {
+        const straightKm = Math.max(fallbackWarehouse.straightDistanceKm, 0);
+        const routeKm = estimateRouteDistanceKm(straightKm);
+        return {
+          hasCoordinates: true,
+          inDeliveryZone: false,
+          serviceable: true,
+          zoneName: 'Вне зоны (ближайший склад)',
+          warehouseCode: fallbackWarehouse.code,
+          warehouseName: fallbackWarehouse.name,
+          warehouseDistanceKm: Number(straightKm.toFixed(3)),
+          routeDistanceKm: Number(routeKm.toFixed(3)),
+          etaMin: null,
+          deliveryFee: null,
+          reason: null
+        };
+      }
+
       return {
         hasCoordinates: true,
         inDeliveryZone: false,
@@ -2866,6 +2915,7 @@ app.post('/api/admin/staff', authRequired(JWT_SECRET), roleRequired('admin'), as
     address?: string;
     permissions?: string[];
     warehouseScopes?: number[] | null;
+    role?: UserRole;
   };
   const fullName = String(body.fullName || '').trim();
   const email = String(body.email || '').trim().toLowerCase();
@@ -2879,14 +2929,15 @@ app.post('/api/admin/staff', authRequired(JWT_SECRET), roleRequired('admin'), as
 
   const permissions = normalizePermissions(body.permissions);
   const warehouseScopes = permissions.includes('manage_warehouse') ? await sanitizeWarehouseScopes(body.warehouseScopes) : null;
+  const role: UserRole = body.role && ['admin', 'courier', 'picker'].includes(body.role) ? (body.role as UserRole) : 'admin';
   const hash = bcrypt.hashSync(password, 10);
   const createdRow = (await db.query(
     `
       INSERT INTO users (full_name, email, phone, address, password_hash, role, permissions, warehouse_scopes)
-      VALUES ($1, $2, $3, $4, $5, 'admin', $6, $7)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
       RETURNING *
     `,
-    [fullName, email, body.phone?.trim() || null, body.address?.trim() || null, hash, permissions, warehouseScopes]
+    [fullName, email, body.phone?.trim() || null, body.address?.trim() || null, hash, role, permissions, warehouseScopes]
   )).rows[0];
   const created = normalizeUserRow(createdRow);
 
@@ -3592,7 +3643,17 @@ app.post('/api/orders/:orderId/claim', authRequired(JWT_SECRET), roleRequired('c
 
 app.get('/api/orders/all', authRequired(JWT_SECRET), roleRequired('admin'), async (_req, res) => {
   if (!(await requireAdminPermission(_req, res, 'view_orders'))) return;
-  const rows = (await db.query('SELECT * FROM orders ORDER BY id DESC LIMIT 200')).rows;
+  const rows = (
+    await db.query(
+      `
+        SELECT o.*, u.full_name AS customer_full_name, u.phone AS customer_phone
+        FROM orders o
+        LEFT JOIN users u ON u.id = o.user_id
+        ORDER BY o.id DESC
+        LIMIT 200
+      `
+    )
+  ).rows;
   return res.json({ orders: rows.map((row: any) => orderView(normalizeOrderRow(row))) });
 });
 

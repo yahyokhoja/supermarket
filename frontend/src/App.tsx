@@ -2,7 +2,7 @@ import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
 import DeliveryMapPicker from './components/DeliveryMapPicker';
 import AdminWarehouseLocationMap from './components/AdminWarehouseLocationMap';
 
-type Role = 'customer' | 'courier' | 'admin';
+type Role = 'customer' | 'courier' | 'admin' | 'picker';
 type Status =
   | 'assembling'
   | 'courier_assigned'
@@ -62,6 +62,8 @@ type Order = {
   deliveryFee: number | null;
   assignedCourierId: number | null;
   createdAt: string;
+  customerName?: string | null;
+  customerPhone?: string | null;
   items?: OrderItem[];
 };
 type OrderItem = {
@@ -332,7 +334,8 @@ const STATUS_ACTION_LABELS: Record<Status, string> = {
 const ROLE_LABELS: Record<Role, string> = {
   customer: 'Покупатель',
   courier: 'Курьер',
-  admin: 'Администратор'
+  admin: 'Администратор',
+  picker: 'Сборщик'
 };
 
 const COURIER_STATUS_LABELS: Record<string, string> = {
@@ -660,6 +663,7 @@ export default function App() {
     password: '',
     phone: '',
     address: '',
+    role: 'picker' as Role,
     permissions: [] as string[],
     warehouseScopes: [] as number[]
   });
@@ -1303,6 +1307,22 @@ export default function App() {
   }, [token]);
 
   useEffect(() => {
+    if (!token) return;
+    const interval = window.setInterval(() => {
+      if (user?.role === 'customer') {
+        loadOrders().catch(() => undefined);
+      }
+      if (user?.role === 'courier') {
+        Promise.all([loadCourierOrders(), loadOpenCourierOrders()]).catch(() => undefined);
+      }
+      if (user?.role === 'admin') {
+        loadAdminData().catch(() => undefined);
+      }
+    }, 20000);
+    return () => window.clearInterval(interval);
+  }, [token, user?.role]);
+
+  useEffect(() => {
     if (!user) return;
     loadCourierOrders().catch(() => undefined);
     loadOpenCourierOrders().catch(() => undefined);
@@ -1830,7 +1850,7 @@ export default function App() {
     try {
       await api(`/api/orders/${orderId}`, { method: 'DELETE' });
       if (adminOrderEdit?.orderId === orderId) setAdminOrderEdit(null);
-      await loadAdminData();
+      await Promise.all([loadAdminData(), loadOrders(), loadCourierOrders(), loadOpenCourierOrders()]);
       notify('Заказ удален администратором');
     } catch (err) {
       notify((err as Error).message);
@@ -1978,6 +1998,7 @@ export default function App() {
         password: '',
         phone: '',
         address: '',
+        role: 'picker',
         permissions: [],
         warehouseScopes: []
       });
@@ -3053,6 +3074,7 @@ export default function App() {
                     <div>Адрес: {order.deliveryAddress}</div>
                     <div className="muted">Склад сборки: {order.fulfillmentWarehouse || order.fulfillmentWarehouseCode || 'подбирается'}</div>
                     <div>Координаты: {order.deliveryLat !== null && order.deliveryLng !== null ? `${order.deliveryLat.toFixed(6)}, ${order.deliveryLng.toFixed(6)}` : 'не указаны'}</div>
+                    <div>Покупатель: {order.customerName || '—'} | Телефон: {order.customerPhone || '—'}</div>
                     <div className="inline-actions">
                       <button
                         type="button"
@@ -3906,14 +3928,22 @@ export default function App() {
                       value={staffCreateForm.phone}
                       onChange={(e) => setStaffCreateForm((prev) => ({ ...prev, phone: e.target.value }))}
                     />
-                    <input
-                      placeholder="Адрес (опц.)"
-                      value={staffCreateForm.address}
-                      onChange={(e) => setStaffCreateForm((prev) => ({ ...prev, address: e.target.value }))}
-                    />
-                    <div className="inline-actions">
-                      {ADMIN_PERMISSION_OPTIONS.map((perm) => (
-                        <label key={`staff-perm-${perm.key}`}>
+                  <input
+                    placeholder="Адрес (опц.)"
+                    value={staffCreateForm.address}
+                    onChange={(e) => setStaffCreateForm((prev) => ({ ...prev, address: e.target.value }))}
+                  />
+                  <select
+                    value={staffCreateForm.role}
+                    onChange={(e) => setStaffCreateForm((prev) => ({ ...prev, role: e.target.value as Role }))}
+                  >
+                    <option value="admin">Администратор</option>
+                    <option value="picker">Сборщик</option>
+                    <option value="courier">Курьер</option>
+                  </select>
+                  <div className="inline-actions">
+                    {ADMIN_PERMISSION_OPTIONS.map((perm) => (
+                      <label key={`staff-perm-${perm.key}`}>
                           <input
                             type="checkbox"
                             checked={staffCreateForm.permissions.includes(perm.key)}
@@ -4002,6 +4032,7 @@ export default function App() {
                           <option value="customer">Покупатель</option>
                           <option value="courier">Курьер</option>
                           <option value="admin">Администратор</option>
+                          <option value="picker">Сборщик</option>
                         </select>
                         <select
                           value={(adminUserActiveDrafts[u.id] ?? u.isActive) ? 'active' : 'blocked'}
