@@ -56,6 +56,9 @@ export interface DbOrder {
   updated_at: string;
   customer_full_name?: string | null;
   customer_phone?: string | null;
+  pick_task_status?: string | null;
+  picker_id?: number | null;
+  picker_name?: string | null;
 }
 
 export interface ApiOrder {
@@ -79,4 +82,7 @@ export interface ApiOrder {
   updatedAt: string;
   customerName?: string | null;
   customerPhone?: string | null;
+  pickTaskStatus?: string | null;
+  pickerId?: number | null;
+  pickerName?: string | null;
 }

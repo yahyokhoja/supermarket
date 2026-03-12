@@ -64,6 +64,9 @@ type Order = {
   createdAt: string;
   customerName?: string | null;
   customerPhone?: string | null;
+  pickTaskStatus?: string | null;
+  pickerId?: number | null;
+  pickerName?: string | null;
   items?: OrderItem[];
 };
 type OrderItem = {
@@ -189,9 +192,11 @@ type PickTask = {
   orderId: number;
   warehouseId: number;
   warehouseName: string;
-  status: 'new' | 'in_progress' | 'done' | 'cancelled';
+  status: 'new' | 'in_progress' | 'done' | 'handed_to_courier' | 'cancelled';
   assignedTo: number | null;
   assignedToName: string | null;
+  pickTaskStatus?: string | null;
+  pickerName?: string | null;
   createdBy: number | null;
   createdByName: string | null;
   startedAt: string | null;
@@ -329,6 +334,13 @@ const STATUS_ACTION_LABELS: Record<Status, string> = {
   received: 'Получен',
   paid: 'Оплачен',
   cancelled: 'Отменить'
+};
+const PICK_TASK_STATUS_LABELS: Record<string, string> = {
+  new: 'Новая',
+  in_progress: 'В работе',
+  done: 'Собрана',
+  handed_to_courier: 'Отдана курьеру',
+  cancelled: 'Отменена'
 };
 
 const ROLE_LABELS: Record<Role, string> = {
@@ -1221,6 +1233,13 @@ export default function App() {
     );
   }
 
+  async function loadPickTasksForPicker() {
+    if (user?.role !== 'picker') return;
+    const data = await api<PickTasksResponse>('/api/admin/pick-tasks');
+    setPickTasks(data.tasks);
+    setPickTaskStatusDrafts(Object.fromEntries(data.tasks.map((task) => [task.id, task.status])) as Record<number, PickTask['status']>);
+  }
+
   async function loadWarehouseData() {
     if (user?.role !== 'admin') return;
     if (!hasAdminPermission('manage_warehouse')) return;
@@ -1299,7 +1318,7 @@ export default function App() {
     sessionExpiredHandledRef.current = false;
 
     loadMe()
-      .then(() => Promise.all([loadCart(), loadOrders()]))
+      .then(() => Promise.all([loadCart(), loadOrders(), loadPickTasksForPicker()]))
       .catch(() => {
         setToken(null);
         localStorage.removeItem('token');
@@ -1317,6 +1336,9 @@ export default function App() {
       }
       if (user?.role === 'admin') {
         loadAdminData().catch(() => undefined);
+      }
+      if (user?.role === 'picker') {
+        loadPickTasksForPicker().catch(() => undefined);
       }
     }, 20000);
     return () => window.clearInterval(interval);
@@ -2609,8 +2631,21 @@ export default function App() {
         method: 'PATCH',
         body: JSON.stringify({ status })
       });
-      await Promise.all([loadWarehouseData(), loadProducts(), loadAdminData()]);
+      await Promise.all([loadWarehouseData(), loadProducts(), loadAdminData(), loadPickTasksForPicker()]);
       notify('Статус задачи сборки обновлен');
+    } catch (err) {
+      notify((err as Error).message);
+    }
+  }
+
+  async function updatePickTask(taskId: number, status: PickTask['status']) {
+    try {
+      await api(`/api/admin/pick-tasks/${taskId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ status, assignedTo: user?.id ?? null })
+      });
+      await loadPickTasksForPicker();
+      notify('Задача обновлена');
     } catch (err) {
       notify((err as Error).message);
     }
@@ -2850,6 +2885,9 @@ export default function App() {
                   <div className="muted">
                     Склад сборки: {order.fulfillmentWarehouse || order.fulfillmentWarehouseCode || 'подбирается'}
                   </div>
+                  <div className="muted">
+                    Сборщик: {order.pickerName || (order.pickerId ? `#${order.pickerId}` : '—')}; Статус сборки: {order.pickTaskStatus ? PICK_TASK_STATUS_LABELS[order.pickTaskStatus] || order.pickTaskStatus : '—'}
+                  </div>
                   {order.fulfillmentWarehouse || order.deliveryEtaMin !== null || order.deliveryFee !== null ? (
                     <div className="muted">
                       {order.deliveryZone ? `Зона: ${order.deliveryZone}. ` : ''}
@@ -2997,17 +3035,20 @@ export default function App() {
 
             <h3>Свободные заказы</h3>
             {openCourierOrders.length === 0 && <p className="muted">Свободных заказов нет.</p>}
-            {openCourierOrders.map((order) => (
-                <div className="row" key={`open-${order.id}`}>
-                  <strong>Заказ #{order.id}</strong> <span className={`badge ${order.status}`}>{STATUS_LABELS[order.status]}</span>
-                  <div>Сумма: ${order.total.toFixed(2)}</div>
-                  <div>Адрес: {order.deliveryAddress}</div>
-                  <div className="muted">Склад сборки: {order.fulfillmentWarehouse || order.fulfillmentWarehouseCode || 'подбирается'}</div>
-                  <div>Координаты: {order.deliveryLat !== null && order.deliveryLng !== null ? `${order.deliveryLat.toFixed(6)}, ${order.deliveryLng.toFixed(6)}` : 'не указаны'}</div>
-                  <div className="inline-actions">
-                    <button type="button" onClick={() => claimOrder(order.id)}>Взять заказ</button>
-                  </div>
-                </div>
+                {openCourierOrders.map((order) => (
+                    <div className="row" key={`open-${order.id}`}>
+                      <strong>Заказ #{order.id}</strong> <span className={`badge ${order.status}`}>{STATUS_LABELS[order.status]}</span>
+                      <div>Сумма: ${order.total.toFixed(2)}</div>
+                      <div>Адрес: {order.deliveryAddress}</div>
+                      <div className="muted">Склад сборки: {order.fulfillmentWarehouse || order.fulfillmentWarehouseCode || 'подбирается'}</div>
+                      <div className="muted">
+                        Сборщик: {order.pickerName || (order.pickerId ? `#${order.pickerId}` : '—')}; Статус сборки: {order.pickTaskStatus ? PICK_TASK_STATUS_LABELS[order.pickTaskStatus] || order.pickTaskStatus : '—'}
+                      </div>
+                      <div>Координаты: {order.deliveryLat !== null && order.deliveryLng !== null ? `${order.deliveryLat.toFixed(6)}, ${order.deliveryLng.toFixed(6)}` : 'не указаны'}</div>
+                      <div className="inline-actions">
+                        <button type="button" onClick={() => claimOrder(order.id)}>Взять заказ</button>
+                      </div>
+                    </div>
             ))}
 
             <h3>Назначенные мне</h3>
@@ -3027,6 +3068,60 @@ export default function App() {
                     <span className="muted">Смена статуса доступна после верификации</span>
                   )}
                 </div>
+              </div>
+            ))}
+          </section>
+        )}
+
+        {user?.role === 'picker' && (
+          <section className="panel">
+            <h2>Задачи сборки</h2>
+            {pickTasks.length === 0 && <p className="muted">Нет задач доступных для сборки.</p>}
+            {pickTasks.map((task) => (
+              <div className="row" key={`pick-${task.id}`}>
+                <strong>Задача #{task.id}</strong> <span className={`badge ${task.status}`}>{task.status}</span>
+                <div>Заказ: #{task.orderId} | Склад: {task.warehouseName}</div>
+                <div>Назначен: {task.assignedToName || (task.assignedTo ? `#${task.assignedTo}` : 'никому')}</div>
+                <div className="muted">Статус: {PICK_TASK_STATUS_LABELS[task.status] || task.status}</div>
+                <div className="muted">
+                  Товары: {task.items.map((i) => `${i.productName} x${i.requestedQty}`).join(' | ')}
+                </div>
+                <div className="inline-actions">
+                  {task.assignedTo === null ? (
+                    <button onClick={() => updatePickTask(task.id, 'in_progress')}>Взять в работу</button>
+                  ) : null}
+                  {task.assignedTo === user?.id && task.status === 'new' ? (
+                    <button onClick={() => updatePickTask(task.id, 'in_progress')}>Начать</button>
+                  ) : null}
+                  {task.assignedTo === user?.id && task.status === 'in_progress' ? (
+                    <>
+                      <button onClick={() => updatePickTask(task.id, 'done')}>Завершить</button>
+                      <button className="danger" onClick={() => updatePickTask(task.id, 'cancelled')}>Отменить</button>
+                    </>
+                  ) : null}
+                  {task.assignedTo === user?.id && task.status === 'done' ? (
+                    <button onClick={() => updatePickTask(task.id, 'handed_to_courier')}>Отдан курьеру</button>
+                  ) : null}
+                </div>
+                {task.assignedTo === user?.id ? (
+                  <div className="inline-actions">
+                    <select
+                      value={pickTaskStatusDrafts[task.id] || task.status}
+                      onChange={(e) =>
+                        setPickTaskStatusDrafts((prev) => ({ ...prev, [task.id]: e.target.value as PickTask['status'] }))
+                      }
+                    >
+                      <option value="new">Новая</option>
+                      <option value="in_progress">В работе</option>
+                      <option value="done">Собрана</option>
+                      <option value="handed_to_courier">Отдана курьеру</option>
+                      <option value="cancelled">Отменена</option>
+                    </select>
+                    <button onClick={() => updatePickTask(task.id, (pickTaskStatusDrafts[task.id] || task.status) as PickTask['status'])}>
+                      Сменить статус
+                    </button>
+                  </div>
+                ) : null}
               </div>
             ))}
           </section>
@@ -3073,6 +3168,9 @@ export default function App() {
                     <div>Сумма: ${order.total.toFixed(2)} | Курьер: {order.assignedCourierId ?? '-'}</div>
                     <div>Адрес: {order.deliveryAddress}</div>
                     <div className="muted">Склад сборки: {order.fulfillmentWarehouse || order.fulfillmentWarehouseCode || 'подбирается'}</div>
+                    <div className="muted">
+                      Сборщик: {order.pickerName || (order.pickerId ? `#${order.pickerId}` : '—')}; Статус сборки: {order.pickTaskStatus ? PICK_TASK_STATUS_LABELS[order.pickTaskStatus] || order.pickTaskStatus : '—'}
+                    </div>
                     <div>Координаты: {order.deliveryLat !== null && order.deliveryLng !== null ? `${order.deliveryLat.toFixed(6)}, ${order.deliveryLng.toFixed(6)}` : 'не указаны'}</div>
                     <div>Покупатель: {order.customerName || '—'} | Телефон: {order.customerPhone || '—'}</div>
                     <div className="inline-actions">
@@ -3622,7 +3720,7 @@ export default function App() {
                       <strong>Задача #{task.id}</strong>
                       <div>Заказ #{task.orderId} | Склад: {task.warehouseName}</div>
                       <div>
-                        Статус: {task.status} | Создал: {task.createdByName || '-'} | Обновлено: {new Date(task.updatedAt).toLocaleString()}
+                        Статус: {PICK_TASK_STATUS_LABELS[task.status] || task.status} | Создал: {task.createdByName || '-'} | Обновлено: {new Date(task.updatedAt).toLocaleString()}
                       </div>
                       <div className="muted">
                         {task.items.map((item) => `${item.productName}: ${item.pickedQty}/${item.requestedQty}`).join(' | ')}
@@ -3637,6 +3735,7 @@ export default function App() {
                           <option value="new">new</option>
                           <option value="in_progress">in_progress</option>
                           <option value="done">done</option>
+                          <option value="handed_to_courier">handed_to_courier</option>
                           <option value="cancelled">cancelled</option>
                         </select>
                         <button type="button" onClick={() => savePickTaskStatus(task.id)}>

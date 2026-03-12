@@ -199,7 +199,10 @@ function normalizeOrderRow(row: any): DbOrder {
     created_at: toDateString(row.created_at),
     updated_at: toDateString(row.updated_at),
     customer_full_name: row.customer_full_name === undefined ? null : row.customer_full_name,
-    customer_phone: row.customer_phone === undefined ? null : row.customer_phone
+    customer_phone: row.customer_phone === undefined ? null : row.customer_phone,
+    pick_task_status: row.pick_task_status === undefined ? null : row.pick_task_status,
+    picker_id: row.picker_id === undefined || row.picker_id === null ? null : toNumber(row.picker_id),
+    picker_name: row.picker_name === undefined ? null : row.picker_name
   };
 }
 
@@ -213,6 +216,135 @@ async function getUserById(id: number) {
   const result = await db.query('SELECT * FROM users WHERE id = $1 LIMIT 1', [id]);
   if (!result.rows[0]) return undefined;
   return normalizeUserRow(result.rows[0]);
+}
+
+async function getWarehouseIdByCode(client: Pool | PoolClient, code: string | null | undefined) {
+  const safe = String(code || '').trim();
+  if (!safe) return null;
+  const row = (await client.query('SELECT id FROM warehouses WHERE lower(code) = lower($1) LIMIT 1', [safe])).rows[0];
+  return row ? toNumber(row.id) : null;
+}
+
+async function findAvailablePickerId(client: Pool | PoolClient, warehouseId: number | null) {
+  // Выбираем активного сборщика с наименьшим числом активных задач
+  const rows = (
+    await client.query(
+      `
+        SELECT u.id,
+               COALESCE(active_tasks.count, 0) AS active_count
+        FROM users u
+        LEFT JOIN (
+          SELECT assigned_to AS picker_id, COUNT(*) AS count
+          FROM pick_tasks
+          WHERE status IN ('new','in_progress')
+          GROUP BY assigned_to
+        ) active_tasks ON active_tasks.picker_id = u.id
+        WHERE u.role = 'picker' AND u.is_active = TRUE
+        ORDER BY active_tasks.count ASC, u.id ASC
+        LIMIT 1
+      `
+    )
+  ).rows;
+  if (!rows.length) return null;
+  return toNumber(rows[0].id);
+}
+
+async function createPickTaskInternal(
+  client: PoolClient,
+  orderId: number,
+  warehouseId: number,
+  creatorUserId: number,
+  assignedTo: number | null
+) {
+  const activeTask = (
+    await client.query(
+      `
+        SELECT id
+        FROM pick_tasks
+        WHERE order_id = $1
+          AND status IN ('new', 'in_progress')
+        LIMIT 1
+      `,
+      [orderId]
+    )
+  ).rows[0];
+  if (activeTask) {
+    return toNumber(activeTask.id);
+  }
+
+  const items = (
+    await client.query(
+      `
+        SELECT product_id, product_name, quantity
+        FROM order_items
+        WHERE order_id = $1
+        ORDER BY id ASC
+      `,
+      [orderId]
+    )
+  ).rows;
+  if (!items.length) {
+    throw new Error('У заказа нет позиций для сборки');
+  }
+
+  const taskRow = (
+    await client.query(
+      `
+        INSERT INTO pick_tasks (order_id, warehouse_id, status, assigned_to, created_by)
+        VALUES ($1, $2, 'new', $3, $4)
+        RETURNING id
+      `,
+      [orderId, warehouseId, assignedTo, creatorUserId]
+    )
+  ).rows[0];
+  const taskId = toNumber(taskRow.id);
+
+  for (const item of items) {
+    const productId = toNumber(item.product_id);
+    const requestedQty = toNumber(item.quantity);
+    await ensureWarehouseStockRow(client, warehouseId, productId);
+    const stock = (
+      await client.query(
+        `
+          SELECT quantity, reserved_quantity
+          FROM warehouse_stock
+          WHERE warehouse_id = $1 AND product_id = $2
+          FOR UPDATE
+        `,
+        [warehouseId, productId]
+      )
+    ).rows[0];
+    const available = Math.max(toNumber(stock?.quantity ?? 0) - toNumber(stock?.reserved_quantity ?? 0), 0);
+    if (available < requestedQty) {
+      throw new Error(`Недостаточно остатка для товара "${String(item.product_name)}". Нужно: ${requestedQty}, доступно: ${available}`);
+    }
+
+    await client.query(
+      `
+        UPDATE warehouse_stock
+        SET reserved_quantity = reserved_quantity + $1, updated_at = NOW()
+        WHERE warehouse_id = $2 AND product_id = $3
+      `,
+      [requestedQty, warehouseId, productId]
+    );
+    await client.query(
+      `
+        INSERT INTO pick_task_items (pick_task_id, product_id, product_name, requested_qty, picked_qty)
+        VALUES ($1, $2, $3, $4, 0)
+      `,
+      [taskId, productId, String(item.product_name), requestedQty]
+    );
+    await client.query(
+      `
+        INSERT INTO stock_movements (warehouse_id, product_id, movement_type, quantity, reason, reference_type, reference_id, created_by)
+        VALUES ($1, $2, 'reserve', $3, $4, 'pick_task', $5, $6)
+      `,
+      [warehouseId, productId, requestedQty, `Резерв под задачу сборки #${taskId}`, taskId, creatorUserId]
+    );
+    await syncProductAvailabilityFromWarehouse(client, productId);
+  }
+
+  return taskId;
 }
 
 setAuthUserResolver(async (userId) => {
@@ -519,7 +651,10 @@ function orderView(order: DbOrder): ApiOrder {
     createdAt: order.created_at,
     updatedAt: order.updated_at,
     customerName: order.customer_full_name ?? null,
-    customerPhone: order.customer_phone ?? null
+    customerPhone: order.customer_phone ?? null,
+    pickTaskStatus: order.pick_task_status ?? null,
+    pickerId: order.picker_id ?? null,
+    pickerName: order.picker_name ?? null
   };
 }
 
@@ -2087,13 +2222,21 @@ app.delete('/api/admin/warehouses/:warehouseId/location', authRequired(JWT_SECRE
   }
 });
 
-app.get('/api/admin/pick-tasks', authRequired(JWT_SECRET), roleRequired('admin'), async (req, res) => {
-  if (!(await requireAdminPermission(req, res, 'manage_warehouse'))) return;
-  const allowedWarehouseIds = await getAdminWarehouseScopeIds(req.user!.id);
-  const params: any[] = [];
-  const where: string[] = [];
-  applyWarehouseScopeToQuery(where, params, allowedWarehouseIds, 'pt.warehouse_id');
-  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+app.get('/api/admin/pick-tasks', authRequired(JWT_SECRET), roleRequired('admin', 'picker'), async (req, res) => {
+  let whereSql = '';
+  let params: any[] = [];
+
+  if (req.user!.role === 'admin') {
+    if (!(await requireAdminPermission(req, res, 'manage_warehouse'))) return;
+    const allowedWarehouseIds = await getAdminWarehouseScopeIds(req.user!.id);
+    const where: string[] = [];
+    applyWarehouseScopeToQuery(where, params, allowedWarehouseIds, 'pt.warehouse_id');
+    whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  } else {
+    // picker: видит новые и свои задачи (new/in_progress/done) чтобы можно было отдать курьеру
+    whereSql = `WHERE (pt.assigned_to IS NULL OR pt.assigned_to = $1) AND pt.status IN ('new','in_progress','done')`;
+    params = [req.user!.id];
+  }
 
   const taskRows = (await db.query(
     `
@@ -2372,76 +2515,13 @@ app.post('/api/admin/pick-tasks/from-order', authRequired(JWT_SECRET), roleRequi
       return res.status(409).json({ message: `Задача сборки уже существует: #${toNumber(activeTask.id)}` });
     }
 
-    const items = (await client.query(
-      `
-        SELECT product_id, product_name, quantity
-        FROM order_items
-        WHERE order_id = $1
-        ORDER BY id ASC
-      `,
-      [orderId]
-    )).rows;
-    if (!items.length) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ message: 'У заказа нет позиций для сборки' });
-    }
-
-    const taskRow = (await client.query(
-      `
-        INSERT INTO pick_tasks (order_id, warehouse_id, status, assigned_to, created_by)
-        VALUES ($1, $2, 'new', $3, $4)
-        RETURNING id
-      `,
-      [orderId, warehouseId, body.assignedTo ? Number(body.assignedTo) : null, req.user!.id]
-    )).rows[0];
-    const taskId = toNumber(taskRow.id);
-
-    for (const item of items) {
-      const productId = toNumber(item.product_id);
-      const requestedQty = toNumber(item.quantity);
-      await ensureWarehouseStockRow(client, warehouseId, productId);
-      const stock = (await client.query(
-        `
-          SELECT quantity, reserved_quantity
-          FROM warehouse_stock
-          WHERE warehouse_id = $1 AND product_id = $2
-          FOR UPDATE
-        `,
-        [warehouseId, productId]
-      )).rows[0];
-      const available = Math.max(toNumber(stock?.quantity ?? 0) - toNumber(stock?.reserved_quantity ?? 0), 0);
-      if (available < requestedQty) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({
-          message: `Недостаточно остатка для товара "${String(item.product_name)}". Нужно: ${requestedQty}, доступно: ${available}`
-        });
-      }
-
-      await client.query(
-        `
-          UPDATE warehouse_stock
-          SET reserved_quantity = reserved_quantity + $1, updated_at = NOW()
-          WHERE warehouse_id = $2 AND product_id = $3
-        `,
-        [requestedQty, warehouseId, productId]
-      );
-      await client.query(
-        `
-          INSERT INTO pick_task_items (pick_task_id, product_id, product_name, requested_qty, picked_qty)
-          VALUES ($1, $2, $3, $4, 0)
-        `,
-        [taskId, productId, String(item.product_name), requestedQty]
-      );
-      await client.query(
-        `
-          INSERT INTO stock_movements (warehouse_id, product_id, movement_type, quantity, reason, reference_type, reference_id, created_by)
-          VALUES ($1, $2, 'reserve', $3, $4, 'pick_task', $5, $6)
-        `,
-        [warehouseId, productId, requestedQty, `Резерв под задачу сборки #${taskId}`, taskId, req.user!.id]
-      );
-      await syncProductAvailabilityFromWarehouse(client, productId);
-    }
-
+    const taskId = await createPickTaskInternal(
+      client,
+      orderId,
+      warehouseId,
+      req.user!.id,
+      body.assignedTo ? Number(body.assignedTo) : null
+    );
     await client.query('COMMIT');
     return res.status(201).json({ message: 'Задача сборки создана', taskId });
   } catch (error) {
@@ -2452,13 +2532,15 @@ app.post('/api/admin/pick-tasks/from-order', authRequired(JWT_SECRET), roleRequi
   }
 });
 
-app.patch('/api/admin/pick-tasks/:taskId', authRequired(JWT_SECRET), roleRequired('admin'), async (req, res) => {
-  if (!(await requireAdminPermission(req, res, 'manage_warehouse'))) return;
+app.patch('/api/admin/pick-tasks/:taskId', authRequired(JWT_SECRET), roleRequired('admin', 'picker'), async (req, res) => {
+  if (req.user!.role === 'admin') {
+    if (!(await requireAdminPermission(req, res, 'manage_warehouse'))) return;
+  }
   const taskId = Number(req.params.taskId);
   if (!taskId) return res.status(400).json({ message: 'Некорректный taskId' });
-  const body = req.body as { status?: 'new' | 'in_progress' | 'done' | 'cancelled'; assignedTo?: number | null };
+  const body = req.body as { status?: 'new' | 'in_progress' | 'done' | 'handed_to_courier' | 'cancelled'; assignedTo?: number | null };
   const status = String(body.status || '').trim();
-  if (!['new', 'in_progress', 'done', 'cancelled'].includes(status)) {
+  if (!['new', 'in_progress', 'done', 'handed_to_courier', 'cancelled'].includes(status)) {
     return res.status(400).json({ message: 'Некорректный статус задачи сборки' });
   }
 
@@ -2478,13 +2560,23 @@ app.patch('/api/admin/pick-tasks/:taskId', authRequired(JWT_SECRET), roleRequire
       await client.query('ROLLBACK');
       return res.status(404).json({ message: 'Задача сборки не найдена' });
     }
-    if (!(await assertWarehouseAccess(req, res, toNumber(task.warehouse_id)))) {
-      await client.query('ROLLBACK');
-      return;
+    if (req.user!.role === 'admin') {
+      if (!(await assertWarehouseAccess(req, res, toNumber(task.warehouse_id)))) {
+        await client.query('ROLLBACK');
+        return;
+      }
+    } else {
+      // picker: может менять только свои или свободные задачи
+      if (task.assigned_to !== null && toNumber(task.assigned_to) !== req.user!.id) {
+        await client.query('ROLLBACK');
+        return res.status(403).json({ message: 'Задача уже назначена другому сборщику' });
+      }
+      // назначение всегда на себя
+      body.assignedTo = req.user!.id;
     }
 
     const currentStatus = String(task.status);
-    if (['done', 'cancelled'].includes(currentStatus) && currentStatus !== status) {
+    if (['cancelled', 'handed_to_courier'].includes(currentStatus) && currentStatus !== status) {
       await client.query('ROLLBACK');
       return res.status(400).json({ message: 'Финальную задачу нельзя перевести в другой статус' });
     }
@@ -2503,6 +2595,10 @@ app.patch('/api/admin/pick-tasks/:taskId', authRequired(JWT_SECRET), roleRequire
     if (status === 'done' && !['new', 'in_progress', 'done'].includes(currentStatus)) {
       await client.query('ROLLBACK');
       return res.status(400).json({ message: 'Задачу можно завершить только из статусов new/in_progress' });
+    }
+    if (status === 'handed_to_courier' && !['done', 'handed_to_courier'].includes(currentStatus)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ message: 'Отдать курьеру можно только после завершения сборки' });
     }
     if (status === 'cancelled' && !['new', 'in_progress', 'cancelled'].includes(currentStatus)) {
       await client.query('ROLLBACK');
@@ -2792,7 +2888,7 @@ app.patch('/api/admin/users/:userId', authRequired(JWT_SECRET), roleRequired('ad
   if (!userId) return res.status(400).json({ message: 'Некорректный userId' });
 
   const body = req.body as { role?: UserRole; isActive?: boolean; permissions?: string[]; warehouseScopes?: number[] | null };
-  const allowedRoles: UserRole[] = ['customer', 'courier', 'admin'];
+  const allowedRoles: UserRole[] = ['customer', 'courier', 'admin', 'picker'];
   if (body.role !== undefined && !allowedRoles.includes(body.role)) {
     return res.status(400).json({ message: 'Недопустимая роль пользователя' });
   }
@@ -3478,6 +3574,18 @@ app.post('/api/orders', authRequired(JWT_SECRET), async (req, res) => {
       [orderId, ORDER_STATUS.assembling, 'Заказ создан', user.id]
     );
 
+    // Автосоздание задачи сборки
+    try {
+      const warehouseId =
+        (await getWarehouseIdByCode(client, deliveryQuote.warehouseCode)) ??
+        (await getDefaultWarehouseId(client));
+      const pickerId = await findAvailablePickerId(client, warehouseId);
+      await createPickTaskInternal(client, orderId, warehouseId, req.user!.id, pickerId);
+    } catch (taskErr) {
+      console.warn('Auto pick-task creation failed:', taskErr);
+      // Не прерываем создание заказа
+    }
+
     await client.query('COMMIT');
 
     const orderRow = (await db.query('SELECT * FROM orders WHERE id = $1 LIMIT 1', [orderId])).rows[0];
@@ -3530,7 +3638,33 @@ async function fetchOrderEvents(orderId: number) {
 }
 
 app.get('/api/orders/my', authRequired(JWT_SECRET), async (req, res) => {
-  const rows = (await db.query('SELECT * FROM orders WHERE user_id = $1 ORDER BY id DESC', [req.user!.id])).rows;
+  const rows = (
+    await db.query(
+      `
+        SELECT o.*,
+               u.full_name AS customer_full_name,
+               u.phone AS customer_phone,
+               pts.pick_task_status,
+               pts.picker_id,
+               pts.picker_name
+        FROM orders o
+        LEFT JOIN users u ON u.id = o.user_id
+        LEFT JOIN LATERAL (
+          SELECT pt.status AS pick_task_status,
+                 pt.assigned_to AS picker_id,
+                 pu.full_name AS picker_name
+          FROM pick_tasks pt
+          LEFT JOIN users pu ON pu.id = pt.assigned_to
+          WHERE pt.order_id = o.id
+          ORDER BY pt.id DESC
+          LIMIT 1
+        ) pts ON TRUE
+        WHERE o.user_id = $1
+        ORDER BY o.id DESC
+      `,
+      [req.user!.id]
+    )
+  ).rows;
   const orders = rows.map((row: any) => orderView(normalizeOrderRow(row)));
   if (!orders.length) return res.json({ orders: [] });
 
@@ -3571,11 +3705,27 @@ app.get('/api/orders/assigned', authRequired(JWT_SECRET), roleRequired('courier'
 
   const rows = (await db.query(
     `
-      SELECT *
-      FROM orders
-      WHERE assigned_courier_id = $1
-        AND status IN ('courier_assigned', 'courier_picked', 'on_the_way', 'arrived')
-      ORDER BY id DESC
+      SELECT o.*,
+             u.full_name AS customer_full_name,
+             u.phone AS customer_phone,
+             pts.pick_task_status,
+             pts.picker_id,
+             pts.picker_name
+      FROM orders o
+      LEFT JOIN users u ON u.id = o.user_id
+      LEFT JOIN LATERAL (
+        SELECT pt.status AS pick_task_status,
+               pt.assigned_to AS picker_id,
+               pu.full_name AS picker_name
+        FROM pick_tasks pt
+        LEFT JOIN users pu ON pu.id = pt.assigned_to
+        WHERE pt.order_id = o.id
+        ORDER BY pt.id DESC
+        LIMIT 1
+      ) pts ON TRUE
+      WHERE o.assigned_courier_id = $1
+        AND o.status IN ('courier_assigned', 'courier_picked', 'on_the_way', 'arrived')
+      ORDER BY o.id DESC
     `,
     [toNumber(courier.id)]
   )).rows;
@@ -3589,11 +3739,27 @@ app.get('/api/orders/open', authRequired(JWT_SECRET), roleRequired('courier'), a
 
   const rows = (await db.query(
     `
-      SELECT *
-      FROM orders
-      WHERE status = 'assembling'
-        AND assigned_courier_id IS NULL
-      ORDER BY id ASC
+      SELECT o.*,
+             u.full_name AS customer_full_name,
+             u.phone AS customer_phone,
+             pts.pick_task_status,
+             pts.picker_id,
+             pts.picker_name
+      FROM orders o
+      LEFT JOIN users u ON u.id = o.user_id
+      LEFT JOIN LATERAL (
+        SELECT pt.status AS pick_task_status,
+               pt.assigned_to AS picker_id,
+               pu.full_name AS picker_name
+        FROM pick_tasks pt
+        LEFT JOIN users pu ON pu.id = pt.assigned_to
+        WHERE pt.order_id = o.id
+        ORDER BY pt.id DESC
+        LIMIT 1
+      ) pts ON TRUE
+      WHERE o.status = 'assembling'
+        AND o.assigned_courier_id IS NULL
+      ORDER BY o.id ASC
       LIMIT 100
     `
   )).rows;
@@ -3646,9 +3812,24 @@ app.get('/api/orders/all', authRequired(JWT_SECRET), roleRequired('admin'), asyn
   const rows = (
     await db.query(
       `
-        SELECT o.*, u.full_name AS customer_full_name, u.phone AS customer_phone
+        SELECT o.*,
+               u.full_name AS customer_full_name,
+               u.phone AS customer_phone,
+               pts.pick_task_status,
+               pts.picker_id,
+               pts.picker_name
         FROM orders o
         LEFT JOIN users u ON u.id = o.user_id
+        LEFT JOIN LATERAL (
+          SELECT pt.status AS pick_task_status,
+                 pt.assigned_to AS picker_id,
+                 pu.full_name AS picker_name
+          FROM pick_tasks pt
+          LEFT JOIN users pu ON pu.id = pt.assigned_to
+          WHERE pt.order_id = o.id
+          ORDER BY pt.id DESC
+          LIMIT 1
+        ) pts ON TRUE
         ORDER BY o.id DESC
         LIMIT 200
       `
