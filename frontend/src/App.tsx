@@ -33,6 +33,7 @@ type Product = {
   category?: string | null;
   inStock?: boolean;
   stockQuantity?: number;
+  homeWarehouseId?: number | null;
 };
 
 type CartItem = {
@@ -52,6 +53,7 @@ type Order = {
   deliveryAddress: string;
   deliveryLat: number | null;
   deliveryLng: number | null;
+  routeUrl?: string | null;
   serviceable: boolean | null;
   deliveryZone: string | null;
   fulfillmentWarehouse: string | null;
@@ -60,6 +62,8 @@ type Order = {
   routeDistanceKm: number | null;
   deliveryEtaMin: number | null;
   deliveryFee: number | null;
+  courierFee: number | null;
+  paymentMethod: string | null;
   assignedCourierId: number | null;
   createdAt: string;
   customerName?: string | null;
@@ -81,6 +85,8 @@ type Courier = {
   fullName: string;
   email: string;
   status: string;
+  isOnline?: boolean;
+  lastSeenAt?: string | null;
   vehicleType: string;
   verificationStatus?: string;
   transportLicense?: string | null;
@@ -227,6 +233,8 @@ type CourierProfile = {
   verificationReviewedBy?: string | null;
   verifiedAt?: string | null;
   isEligible: boolean;
+  isOnline: boolean;
+  lastSeenAt: string | null;
 };
 
 type SavedDelivery = {
@@ -266,6 +274,7 @@ type AdminProduct = {
   imageUrl: string | null;
   inStock: boolean;
   stockQuantity: number;
+  homeWarehouseId: number | null;
 };
 type AdminCategoryItem = {
   name: string;
@@ -462,26 +471,34 @@ function loadImageElement(file: File) {
   });
 }
 
-function canvasToBlob(canvas: HTMLCanvasElement, quality: number) {
+function canvasToBlob(canvas: HTMLCanvasElement, quality: number, mime: string) {
   return new Promise<Blob>((resolve, reject) => {
-    canvas.toBlob((blob) => {
-      if (!blob) {
-        reject(new Error('Не удалось обработать изображение'));
-        return;
-      }
-      resolve(blob);
-    }, 'image/jpeg', quality);
+    canvas.toBlob(
+      (blob) => {
+        if (!blob) {
+          reject(new Error('Не удалось обработать изображение'));
+          return;
+        }
+        resolve(blob);
+      },
+      mime,
+      quality
+    );
   });
 }
 
-async function prepareImageForUpload(file: File, label: string): Promise<{ file: File | null; error: string }> {
+async function prepareImageForUpload(
+  file: File,
+  label: string,
+  opts: { targetMime?: 'image/webp' | 'image/jpeg'; maxSide?: number } = {}
+): Promise<{ file: File | null; error: string }> {
   const invalidReason = validateImageUpload(file, label);
   if (invalidReason) return { file: null, error: invalidReason };
   if (file.size <= MAX_UPLOAD_FILE_SIZE_BYTES) return { file, error: '' };
 
   try {
     const image = await loadImageElement(file);
-    const maxSide = 1920;
+    const maxSide = opts.maxSide || 1920;
     const scale = Math.min(1, maxSide / Math.max(image.width || 1, image.height || 1));
     const targetWidth = Math.max(1, Math.round(image.width * scale));
     const targetHeight = Math.max(1, Math.round(image.height * scale));
@@ -493,10 +510,11 @@ async function prepareImageForUpload(file: File, label: string): Promise<{ file:
     if (!ctx) return { file: null, error: `${label}: не удалось подготовить изображение.` };
     ctx.drawImage(image, 0, 0, targetWidth, targetHeight);
 
-    const qualities = [0.86, 0.76, 0.66, 0.56, 0.46];
+    const qualities = [0.78, 0.68, 0.58, 0.48, 0.38];
     let bestBlob: Blob | null = null;
+    const targetMime = opts.targetMime || 'image/jpeg';
     for (const quality of qualities) {
-      const blob = await canvasToBlob(canvas, quality);
+      const blob = await canvasToBlob(canvas, quality, targetMime);
       if (!bestBlob || blob.size < bestBlob.size) bestBlob = blob;
       if (blob.size <= MAX_UPLOAD_FILE_SIZE_BYTES) {
         bestBlob = blob;
@@ -505,7 +523,12 @@ async function prepareImageForUpload(file: File, label: string): Promise<{ file:
     }
 
     if (!bestBlob) {
+      if (file.size <= MAX_UPLOAD_FILE_SIZE_BYTES) return { file, error: '' };
       return { file: null, error: `${label}: не удалось обработать фото.` };
+    }
+
+    if (bestBlob.size > MAX_UPLOAD_FILE_SIZE_BYTES && maxSide > 900) {
+      return prepareImageForUpload(file, label, { targetMime: 'image/jpeg', maxSide: 900 });
     }
     if (bestBlob.size > MAX_UPLOAD_FILE_SIZE_BYTES) {
       return {
@@ -514,16 +537,23 @@ async function prepareImageForUpload(file: File, label: string): Promise<{ file:
       };
     }
 
-    const prepared = new File(
-      [bestBlob],
-      `${file.name.replace(/\.[^.]+$/, '') || 'photo'}-compressed.jpg`,
-      { type: 'image/jpeg' }
-    );
+    const ext = targetMime === 'image/webp' ? 'webp' : 'jpg';
+    const prepared = new File([bestBlob], `${file.name.replace(/\.[^.]+$/, '') || 'photo'}-compressed.${ext}`, {
+      type: targetMime
+    });
     return { file: prepared, error: '' };
   } catch {
+    if (file.size <= MAX_UPLOAD_FILE_SIZE_BYTES) return { file, error: '' };
+    if (file.size <= MAX_UPLOAD_FILE_SIZE_BYTES * 1.5) {
+      // последний шанс: ужать до 900px JPEG без доп. попыток
+      if (opts.maxSide && opts.maxSide <= 900) {
+        return { file: null, error: `${label}: не удалось обработать фото. Сделайте снимок меньшего размера.` };
+      }
+      return prepareImageForUpload(file, label, { targetMime: 'image/jpeg', maxSide: 900 });
+    }
     return {
       file: null,
-      error: `${label}: не удалось завершить обработку фото. На устройстве может не хватать памяти. Закройте лишние приложения и попробуйте снова.`
+      error: `${label}: не удалось завершить обработку фото. На устройстве может не хватать памяти. Сделайте снимок меньшего размера (до ~5 МБ).`
     };
   }
 }
@@ -543,6 +573,7 @@ export default function App() {
   const [adminOrderEdit, setAdminOrderEdit] = useState<AdminOrderEditState | null>(null);
   const [courierOrders, setCourierOrders] = useState<Order[]>([]);
   const [openCourierOrders, setOpenCourierOrders] = useState<Order[]>([]);
+  const [courierHistory, setCourierHistory] = useState<Order[]>([]);
   const [allOrders, setAllOrders] = useState<Order[]>([]);
   const [couriers, setCouriers] = useState<Courier[]>([]);
   const [adminUsers, setAdminUsers] = useState<AdminUser[]>([]);
@@ -614,6 +645,7 @@ export default function App() {
     vehicleRegistrationNumber: '',
     techPassportImageUrl: ''
   });
+  const heartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [verificationSaving, setVerificationSaving] = useState(false);
   const [techPassportUploading, setTechPassportUploading] = useState(false);
   const [adminResetUserId, setAdminResetUserId] = useState(0);
@@ -687,7 +719,8 @@ export default function App() {
     category: '',
     imageUrl: '',
     inStock: true,
-    stockQuantity: '0'
+    stockQuantity: '0',
+    warehouseId: ''
   });
   const [productFormCategory, setProductFormCategory] = useState('');
   const [productFormSubcategory, setProductFormSubcategory] = useState('');
@@ -800,6 +833,14 @@ export default function App() {
     }
     return Array.from(adminCategoryMap.get(selected) || []).sort((a, b) => a.localeCompare(b, 'ru'));
   }, [adminCategoryMap, productFormCategory]);
+  const adminDeliveredOrders = useMemo(() => allOrders.filter((o) => o.status === 'paid' || o.status === 'received'), [allOrders]);
+  const warehouseNameById = useMemo(() => {
+    const map = new Map<number, string>();
+    for (const w of warehouseOverview.warehouses) {
+      map.set(w.id, w.name);
+    }
+    return map;
+  }, [warehouseOverview.warehouses]);
 
   const warehouseProductOptions = useMemo(() => {
     const selectedWarehouse = Number(stockActionForm.warehouseId || 0);
@@ -1186,6 +1227,34 @@ export default function App() {
     setOpenCourierOrders(data.orders);
   }
 
+  async function loadCourierHistory() {
+    if (user?.role !== 'courier') return;
+    const data = await api<{ orders: Order[] }>('/api/orders/history');
+    setCourierHistory(data.orders);
+  }
+
+  async function sendCourierHeartbeat(busy?: boolean) {
+    if (user?.role !== 'courier') return;
+    try {
+      const data = await api<{ status: string; isOnline: boolean; lastSeenAt: string | null }>('/api/couriers/me/heartbeat', {
+        method: 'POST',
+        body: JSON.stringify({ busy: Boolean(busy) })
+      });
+      setCourierProfile((prev) =>
+        prev
+          ? {
+              ...prev,
+              status: data.status,
+              isOnline: data.isOnline,
+              lastSeenAt: data.lastSeenAt
+            }
+          : prev
+      );
+    } catch {
+      /* без шума */
+    }
+  }
+
   async function loadAdminData() {
     if (user?.role !== 'admin') return;
     const [ordersRes, analyticsRes, couriersRes, productsRes, categoriesRes, usersRes, logsRes] = await Promise.all([
@@ -1332,7 +1401,7 @@ export default function App() {
         loadOrders().catch(() => undefined);
       }
       if (user?.role === 'courier') {
-        Promise.all([loadCourierOrders(), loadOpenCourierOrders()]).catch(() => undefined);
+        Promise.all([loadCourierOrders(), loadOpenCourierOrders(), loadCourierHistory()]).catch(() => undefined);
       }
       if (user?.role === 'admin') {
         loadAdminData().catch(() => undefined);
@@ -1348,10 +1417,30 @@ export default function App() {
     if (!user) return;
     loadCourierOrders().catch(() => undefined);
     loadOpenCourierOrders().catch(() => undefined);
+    loadCourierHistory().catch(() => undefined);
     loadCourierProfile().catch(() => undefined);
     loadAdminData().catch(() => undefined);
     loadWarehouseData().catch(() => undefined);
   }, [user]);
+
+  useEffect(() => {
+    if (user?.role !== 'courier') {
+      if (heartbeatRef.current) {
+        clearInterval(heartbeatRef.current);
+        heartbeatRef.current = null;
+      }
+      return;
+    }
+    const tick = () => void sendCourierHeartbeat(courierProfile?.status === 'busy');
+    tick();
+    heartbeatRef.current = setInterval(tick, 60_000);
+    return () => {
+      if (heartbeatRef.current) {
+        clearInterval(heartbeatRef.current);
+        heartbeatRef.current = null;
+      }
+    };
+  }, [user?.role, courierProfile?.status]);
 
   useEffect(() => {
     if (user?.role !== 'admin') return;
@@ -1882,7 +1971,7 @@ export default function App() {
   }
 
   async function uploadTechPassport(file: File) {
-    const prepared = await prepareImageForUpload(file, 'Фото техпаспорта');
+    const prepared = await prepareImageForUpload(file, 'Фото техпаспорта', { targetMime: 'image/jpeg', maxSide: 1600 });
     if (!prepared.file) {
       notify(prepared.error);
       return;
@@ -2123,8 +2212,13 @@ export default function App() {
         category: combinedCategory,
         imageUrl: productForm.imageUrl,
         inStock: productForm.inStock,
-        stockQuantity: Number(productForm.stockQuantity)
+        stockQuantity: Number(productForm.stockQuantity),
+        warehouseId: Number(productForm.warehouseId)
       };
+      if (!payload.warehouseId || !Number.isFinite(payload.warehouseId)) {
+        notify('Выберите склад для товара');
+        return;
+      }
 
       if (productForm.id) {
         await api(`/api/admin/products/${productForm.id}`, {
@@ -2140,7 +2234,7 @@ export default function App() {
         notify('Товар добавлен');
       }
 
-      setProductForm({ id: 0, name: '', description: '', price: '', category: '', imageUrl: '', inStock: true, stockQuantity: '0' });
+      setProductForm({ id: 0, name: '', description: '', price: '', category: '', imageUrl: '', inStock: true, stockQuantity: '0', warehouseId: '' });
       setProductFormCategory('');
       setProductFormSubcategory('');
       await Promise.all([loadAdminData(), loadProducts()]);
@@ -2150,11 +2244,8 @@ export default function App() {
   }
 
   async function uploadProductImage(file: File) {
-    const prepared = await prepareImageForUpload(file, 'Фото товара');
-    if (!prepared.file) {
-      notify(prepared.error);
-      return;
-    }
+    // Временно грузим оригинал без сжатия, чтобы избежать ошибок памяти на телефонах.
+    const prepared = { file, error: '' };
     setImageUploading(true);
     try {
       const formData = new FormData();
@@ -2228,7 +2319,8 @@ export default function App() {
       category: product.category || '',
       imageUrl: product.imageUrl || '',
       inStock: product.inStock,
-      stockQuantity: String(product.stockQuantity ?? 0)
+      stockQuantity: String(product.stockQuantity ?? 0),
+      warehouseId: product.homeWarehouseId ? String(product.homeWarehouseId) : ''
     });
     setProductFormCategory(parts[0] || '');
     setProductFormSubcategory(parts[1] || '');
@@ -2243,7 +2335,7 @@ export default function App() {
     try {
       await api(`/api/admin/products/${productId}`, { method: 'DELETE' });
       if (productForm.id === productId) {
-        setProductForm({ id: 0, name: '', description: '', price: '', category: '', imageUrl: '', inStock: true, stockQuantity: '0' });
+      setProductForm({ id: 0, name: '', description: '', price: '', category: '', imageUrl: '', inStock: true, stockQuantity: '0', warehouseId: '' });
         setProductFormCategory('');
         setProductFormSubcategory('');
       }
@@ -3028,7 +3120,6 @@ export default function App() {
               <select value={courierState.status} onChange={(e) => setCourierState({ ...courierState, status: e.target.value })}>
                 <option value="available">Свободен</option>
                 <option value="busy">Занят</option>
-                <option value="offline">Оффлайн</option>
               </select>
               <button type="submit" disabled={courierState.status === 'available' && !courierProfile?.isEligible}>Подключиться</button>
             </form>
@@ -3061,13 +3152,59 @@ export default function App() {
                 <div>Координаты: {order.deliveryLat !== null && order.deliveryLng !== null ? `${order.deliveryLat.toFixed(6)}, ${order.deliveryLng.toFixed(6)}` : 'не указаны'}</div>
                 <div className="inline-actions">
                   {courierProfile?.isEligible ? (
-                    (['courier_picked', 'on_the_way', 'arrived', 'received'] as Status[]).map((status) => (
-                      <button key={status} onClick={() => setOrderStatus(order.id, status)}>{STATUS_ACTION_LABELS[status]}</button>
-                    ))
+                    (['courier_picked', 'on_the_way', 'arrived', 'received'] as Status[]).map((status) => {
+                      const current = order.status;
+                      const deps: Record<Status, Status[]> = {
+                        courier_picked: ['courier_assigned'],
+                        on_the_way: ['courier_picked'],
+                        arrived: ['on_the_way'],
+                        received: ['arrived'],
+                        assembling: [],
+                        courier_assigned: [],
+                        cancelled: [],
+                        paid: []
+                      };
+                      const hasPickHanded = order.pickTaskStatus === 'handed_to_courier';
+                      const allowed = deps[status].includes(current);
+                      const disabled =
+                        !allowed ||
+                        (status === 'courier_picked' && !hasPickHanded) ||
+                        (status === 'on_the_way' && current !== 'courier_picked') ||
+                        (status === 'arrived' && current !== 'on_the_way') ||
+                        (status === 'received' && current !== 'arrived');
+                      return (
+                        <button key={status} onClick={() => setOrderStatus(order.id, status)} disabled={disabled}>
+                          {STATUS_ACTION_LABELS[status]}
+                        </button>
+                      );
+                    })
                   ) : (
                     <span className="muted">Смена статуса доступна после верификации</span>
                   )}
                 </div>
+                {order.routeUrl ? (
+                  <div className="muted">
+                    <a href={order.routeUrl} target="_blank" rel="noreferrer">Маршрут</a>
+                  </div>
+                ) : null}
+              </div>
+            ))}
+
+            <h3>История доставок</h3>
+            {courierHistory.length === 0 && <p className="muted">Пока нет доставленных заказов.</p>}
+            {courierHistory.map((order) => (
+              <div className="row" key={`hist-${order.id}`}>
+                <strong>Заказ #{order.id}</strong> <span className={`badge ${order.status}`}>{STATUS_LABELS[order.status]}</span>
+                <div>Адрес: {order.deliveryAddress}</div>
+                <div>Сумма: ${order.total.toFixed(2)}</div>
+                <div className="muted">Оплата: {order.paymentMethod === 'wallet' ? 'Кошелёк' : 'Наличные'}; Оплата курьеру: {order.courierFee ? `$${order.courierFee.toFixed(2)}` : '—'}</div>
+                <div className="muted">Маршрут: {order.routeDistanceKm ? `${order.routeDistanceKm.toFixed(2)} км` : '—'}</div>
+                <div className="muted">Обновлён: {new Date(order.updatedAt).toLocaleString()}</div>
+                {order.routeUrl ? (
+                  <div className="muted">
+                    <a href={order.routeUrl} target="_blank" rel="noreferrer">Маршрут</a>
+                  </div>
+                ) : null}
               </div>
             ))}
           </section>
@@ -3189,6 +3326,11 @@ export default function App() {
                       >
                         {adminDeletingOrderId === order.id ? 'Удаляем...' : 'Удалить'}
                       </button>
+                      {order.routeUrl ? (
+                        <a className="button ghost" href={order.routeUrl} target="_blank" rel="noreferrer">
+                          Маршрут
+                        </a>
+                      ) : null}
                     </div>
                     {adminOrderEdit?.orderId === order.id ? (
                       <div className="row">
@@ -3218,6 +3360,25 @@ export default function App() {
                           </button>
                         </div>
                       </div>
+                    ) : null}
+                  </div>
+                ))}
+
+                <h3>История доставленных</h3>
+                {adminDeliveredOrders.length === 0 && <p className="muted">Пока нет доставленных заказов.</p>}
+                {adminDeliveredOrders.map((order) => (
+                  <div className="row" key={`delivered-${order.id}`}>
+                    <strong>Заказ #{order.id}</strong> <span className={`badge ${order.status}`}>{STATUS_LABELS[order.status]}</span>
+                    <div>Сумма: ${order.total.toFixed(2)}</div>
+                    <div>Адрес: {order.deliveryAddress}</div>
+                    <div className="muted">Оплата: {order.paymentMethod === 'wallet' ? 'Кошелёк' : 'Наличные'}; Оплата курьеру: {order.courierFee ? `$${order.courierFee.toFixed(2)}` : '—'}</div>
+                    <div className="muted">Маршрут: {order.routeDistanceKm ? `${order.routeDistanceKm.toFixed(2)} км` : '—'}</div>
+                    <div>Координаты: {order.deliveryLat !== null && order.deliveryLng !== null ? `${order.deliveryLat.toFixed(6)}, ${order.deliveryLng.toFixed(6)}` : '—'}</div>
+                    <div>Покупатель: {order.customerName || '—'} | Телефон: {order.customerPhone || '—'}</div>
+                    {order.routeUrl ? (
+                      <a className="button ghost" href={order.routeUrl} target="_blank" rel="noreferrer">
+                        Маршрут
+                      </a>
                     ) : null}
                   </div>
                 ))}
@@ -3407,7 +3568,19 @@ export default function App() {
                       </option>
                     ))}
                   </select>
-                  <input placeholder="URL изображения" value={productForm.imageUrl} onChange={(e) => setProductForm({ ...productForm, imageUrl: e.target.value })} />
+                  <select value={productForm.warehouseId} onChange={(e) => setProductForm({ ...productForm, warehouseId: e.target.value })} required>
+                    <option value="">Выберите склад</option>
+                    {warehouseOverview.warehouses.map((w) => (
+                      <option key={`wh-${w.id}`} value={w.id}>
+                        {w.name} ({w.code})
+                      </option>
+                    ))}
+                  </select>
+                  <input
+                    placeholder="URL изображения"
+                    value={productForm.imageUrl}
+                    onChange={(e) => setProductForm({ ...productForm, imageUrl: toSecureUrl(e.target.value) })}
+                  />
                   <label>
                     Фото товара (с камеры или из галереи)
                     <input
@@ -3424,7 +3597,9 @@ export default function App() {
                     />
                   </label>
                   {imageUploading ? <div className="muted">Загрузка фото...</div> : null}
-                  {productForm.imageUrl ? <img src={productForm.imageUrl} alt="Предпросмотр товара" style={{ width: '140px', borderRadius: '8px' }} /> : null}
+                  {productForm.imageUrl ? (
+                    <img src={toSecureUrl(productForm.imageUrl)} alt="Предпросмотр товара" style={{ width: '140px', borderRadius: '8px' }} />
+                  ) : null}
                   <button
                     type="button"
                     onClick={smartDetectProductByImage}
@@ -3447,7 +3622,7 @@ export default function App() {
                       <button
                         type="button"
                         onClick={() => {
-                          setProductForm({ id: 0, name: '', description: '', price: '', category: '', imageUrl: '', inStock: true, stockQuantity: '0' });
+        setProductForm({ id: 0, name: '', description: '', price: '', category: '', imageUrl: '', inStock: true, stockQuantity: '0', warehouseId: '' });
                           setProductFormCategory('');
                           setProductFormSubcategory('');
                         }}
@@ -3465,6 +3640,9 @@ export default function App() {
                         <>
                     <strong>{product.name}</strong>
                     <div>Цена: ${product.price.toFixed(2)} | Остаток: {product.stockQuantity ?? 0} шт. | {effectiveInStock ? 'В наличии' : 'Скрыт'}</div>
+                    <div className="muted">
+                      Склад: {product.homeWarehouseId ? warehouseNameById.get(product.homeWarehouseId) || `#${product.homeWarehouseId}` : '—'}
+                    </div>
                     <div className="muted">{product.category || 'Без категории'}</div>
                     <div className="inline-actions">
                       <button type="button" onClick={() => editProduct(product)}>Редактировать</button>
@@ -3640,15 +3818,15 @@ export default function App() {
                       <button type="button" onClick={() => setStockActionForm((prev) => ({ ...prev, quantity: '10' }))}>10 шт</button>
                       <button type="button" onClick={() => setStockActionForm((prev) => ({ ...prev, quantity: '20' }))}>20 шт</button>
                     </div>
-                    {selectedStockItem ? (
-                      <div className="card">
-                        {selectedStockItem.imageUrl ? (
-                          <img
-                            src={selectedStockItem.imageUrl}
-                            alt={selectedStockItem.productName}
-                            style={{ height: '130px', objectFit: 'cover' }}
-                          />
-                        ) : null}
+                        {selectedStockItem ? (
+                          <div className="card">
+                            {selectedStockItem.imageUrl ? (
+                              <img
+                                src={toSecureUrl(selectedStockItem.imageUrl)}
+                                alt={selectedStockItem.productName}
+                                style={{ height: '130px', objectFit: 'cover' }}
+                              />
+                            ) : null}
                         <div className="card-content">
                           <h3>
                             #{selectedStockItem.productId} {selectedStockItem.productName}
@@ -3834,18 +4012,18 @@ export default function App() {
                       {bulkStockSubmitting ? 'Выполняем...' : 'Выполнить для выбранных'}
                     </button>
                   </div>
-                  {filteredWarehouseStock.length === 0 ? (
-                    <div className="muted">Данных по складу пока нет.</div>
-                  ) : (
-                    filteredWarehouseStock.map((item) => (
-                      <div key={`stock-row-${item.warehouseId}-${item.productId}`} className="row">
-                        {item.imageUrl ? (
-                          <img
-                            src={item.imageUrl}
-                            alt={item.productName}
-                            style={{ width: '88px', height: '88px', objectFit: 'cover', borderRadius: '10px', marginBottom: '8px' }}
-                          />
-                        ) : null}
+                        {filteredWarehouseStock.length === 0 ? (
+                          <div className="muted">Данных по складу пока нет.</div>
+                        ) : (
+                          filteredWarehouseStock.map((item) => (
+                            <div key={`stock-row-${item.warehouseId}-${item.productId}`} className="row">
+                              {item.imageUrl ? (
+                                <img
+                                  src={toSecureUrl(item.imageUrl)}
+                                  alt={item.productName}
+                                  style={{ width: '88px', height: '88px', objectFit: 'cover', borderRadius: '10px', marginBottom: '8px' }}
+                                />
+                              ) : null}
                         <strong>{item.warehouseName} | #{item.productId} {item.productName}</strong>
                         <div>Всего {item.quantity} шт., резерв {item.reservedQuantity} шт., доступно {item.availableQuantity} шт.</div>
                         <label>
@@ -4354,4 +4532,23 @@ export default function App() {
       {toast && <div className="toast">{toast}</div>}
     </>
   );
+}
+function toSecureUrl(url: string) {
+  const value = String(url || '').trim();
+  if (!value) return '';
+  // Нормализуем локальные ссылки на uploads к относительному пути (уйдёт через прокси Vite, без mixed-content).
+  const origins = [
+    'http://localhost:4000',
+    'https://localhost:4000',
+    'http://127.0.0.1:4000',
+    'https://127.0.0.1:4000'
+  ];
+  for (const origin of origins) {
+    if (value.startsWith(origin)) {
+      return value.replace(origin, '');
+    }
+  }
+  if (value.startsWith('//localhost:4000')) return value.replace('//localhost:4000', '');
+  if (value.startsWith('//127.0.0.1:4000')) return value.replace('//127.0.0.1:4000', '');
+  return value;
 }

@@ -33,6 +33,7 @@ const YANDEX_GEOCODER_API_KEY = process.env.YANDEX_GEOCODER_API_KEY || '';
 const DGIS_GEOCODER_API_KEY = process.env.DGIS_GEOCODER_API_KEY || '';
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 const OPENAI_VISION_MODEL = process.env.OPENAI_VISION_MODEL || 'gpt-4.1-mini';
+const COURIER_ONLINE_TTL_MS = 5 * 60 * 1000; // 5 минут считаем онлайн
 const ORDER_STATUS = {
   assembling: 'assembling',
   courierAssigned: 'courier_assigned',
@@ -45,7 +46,7 @@ const ORDER_STATUS = {
 } as const;
 type OrderStatus = (typeof ORDER_STATUS)[keyof typeof ORDER_STATUS];
 const CUSTOMER_EDITABLE_STATUSES: OrderStatus[] = [ORDER_STATUS.assembling, ORDER_STATUS.courierAssigned];
-const MAX_UPLOAD_FILE_SIZE_BYTES = 6 * 1024 * 1024;
+const MAX_UPLOAD_FILE_SIZE_BYTES = 12 * 1024 * 1024; // увеличили лимит до 12 МБ для мобильных фото
 
 const app = express();
 const db: Pool = connectDb(DATABASE_URL);
@@ -479,8 +480,8 @@ async function getOrCreateCourierForUser(userId: number) {
   if (!row) {
     await db.query(
       `
-        INSERT INTO couriers (user_id, vehicle_type, status, verification_status, max_active_orders)
-        VALUES ($1, 'bike', 'offline', 'pending', 5)
+        INSERT INTO couriers (user_id, vehicle_type, status, verification_status, max_active_orders, last_seen_at)
+        VALUES ($1, 'bike', 'offline', 'pending', 5, NOW())
         ON CONFLICT (user_id) DO NOTHING
       `,
       [userId]
@@ -499,6 +500,7 @@ async function getOrCreateCourierForUser(userId: number) {
     verification_requested_at: row.verification_requested_at ? toDateString(row.verification_requested_at) : null,
     verification_reviewed_by: row.verification_reviewed_by === null ? null : toNumber(row.verification_reviewed_by),
     verified_at: row.verified_at ? toDateString(row.verified_at) : null,
+    last_seen_at: row.last_seen_at ? new Date(row.last_seen_at).toISOString() : null,
     max_active_orders: toNumber(row.max_active_orders)
   };
 }
@@ -515,6 +517,13 @@ function courierEligible(courier: {
     Boolean(courier.vehicle_registration_number) &&
     Boolean(courier.tech_passport_image_url)
   );
+}
+
+function courierIsOnline(courier: { last_seen_at?: any }) {
+  if (!courier?.last_seen_at) return false;
+  const lastSeen = new Date(courier.last_seen_at).getTime();
+  if (!Number.isFinite(lastSeen)) return false;
+  return Date.now() - lastSeen <= COURIER_ONLINE_TTL_MS;
 }
 
 async function getActiveOrderCountForCourier(courierId: number) {
@@ -536,6 +545,8 @@ async function assignCourierIfPossible(orderId: number) {
       SELECT id, max_active_orders
       FROM couriers
       WHERE status = 'available'
+        AND last_seen_at IS NOT NULL
+        AND last_seen_at >= NOW() - INTERVAL '5 minutes'
     `
   )).rows;
 
@@ -631,6 +642,8 @@ async function syncProductAvailabilityFromWarehouse(client: Pool | PoolClient, p
 }
 
 function orderView(order: DbOrder): ApiOrder {
+  const hasCoords = order.delivery_lat !== null && order.delivery_lat !== undefined && order.delivery_lng !== null && order.delivery_lng !== undefined;
+  const routeUrl = hasCoords ? `https://www.google.com/maps/dir/?api=1&destination=${order.delivery_lat},${order.delivery_lng}` : null;
   return {
     id: order.id,
     userId: order.user_id,
@@ -647,6 +660,8 @@ function orderView(order: DbOrder): ApiOrder {
     routeDistanceKm: order.route_distance_km,
     deliveryEtaMin: order.delivery_eta_min,
     deliveryFee: order.delivery_fee,
+    courierFee: order.courier_fee,
+    paymentMethod: order.payment_method,
     assignedCourierId: order.assigned_courier_id,
     createdAt: order.created_at,
     updatedAt: order.updated_at,
@@ -654,7 +669,8 @@ function orderView(order: DbOrder): ApiOrder {
     customerPhone: order.customer_phone ?? null,
     pickTaskStatus: order.pick_task_status ?? null,
     pickerId: order.picker_id ?? null,
-    pickerName: order.picker_name ?? null
+    pickerName: order.picker_name ?? null,
+    routeUrl
   };
 }
 
@@ -667,7 +683,8 @@ function normalizeProductRow(row: any) {
     category: row.category,
     imageUrl: row.image_url,
     inStock: Boolean(row.in_stock),
-    stockQuantity: Math.max(0, toNumber(row.stock_quantity ?? 0))
+    stockQuantity: Math.max(0, toNumber(row.stock_quantity ?? 0)),
+    homeWarehouseId: row.home_warehouse_id === null || row.home_warehouse_id === undefined ? null : toNumber(row.home_warehouse_id)
   };
 }
 
@@ -1490,7 +1507,20 @@ app.get('/api/products', async (_req, res) => {
 
 app.get('/api/admin/products', authRequired(JWT_SECRET), roleRequired('admin'), async (_req, res) => {
   if (!(await requireAdminPermission(_req, res, 'manage_products'))) return;
-  const rows = (await db.query('SELECT * FROM products ORDER BY id DESC')).rows;
+  const allowedWarehouseIds = await getAdminWarehouseScopeIds(_req.user!.id);
+  const rows =
+    allowedWarehouseIds === null
+      ? (await db.query('SELECT * FROM products ORDER BY id DESC')).rows
+      : (
+          await db.query(
+            `
+              SELECT * FROM products
+              WHERE home_warehouse_id = ANY($1)
+              ORDER BY id DESC
+            `,
+            [allowedWarehouseIds.length ? allowedWarehouseIds : [-1]]
+          )
+        ).rows;
   res.json({ products: rows.map((row: any) => normalizeProductRow(row)) });
 });
 
@@ -1739,6 +1769,7 @@ app.post('/api/admin/products', authRequired(JWT_SECRET), roleRequired('admin'),
     imageUrl?: string;
     inStock?: boolean;
     stockQuantity?: number;
+    warehouseId?: number;
   };
 
   const name = String(body.name || '').trim();
@@ -1757,11 +1788,14 @@ app.post('/api/admin/products', authRequired(JWT_SECRET), roleRequired('admin'),
   if (categoryPath && !(await categoryExists(categoryPath))) {
     return res.status(400).json({ message: 'Категория/подкатегория не найдена в справочнике' });
   }
+  const warehouseId = Number(body.warehouseId);
+  if (!Number.isFinite(warehouseId) || warehouseId <= 0) return res.status(400).json({ message: 'Выберите склад для товара' });
+  if (!(await assertWarehouseAccess(req, res, warehouseId))) return;
 
   const created = await db.query(
     `
-      INSERT INTO products (name, description, price, category, image_url, in_stock, stock_quantity)
-      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      INSERT INTO products (name, description, price, category, image_url, in_stock, stock_quantity, home_warehouse_id)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
       RETURNING *
     `,
     [
@@ -1771,20 +1805,20 @@ app.post('/api/admin/products', authRequired(JWT_SECRET), roleRequired('admin'),
       categoryPath || null,
       body.imageUrl?.trim() || null,
       stockQuantity > 0 && (body.inStock !== undefined ? Boolean(body.inStock) : true),
-      stockQuantity
+      stockQuantity,
+      warehouseId
     ]
   );
 
   const createdProduct = normalizeProductRow(created.rows[0]);
-  const defaultWarehouseId = await getDefaultWarehouseId(db);
-  await ensureWarehouseStockRow(db, defaultWarehouseId, createdProduct.id);
+  await ensureWarehouseStockRow(db, warehouseId, createdProduct.id);
   await db.query(
     `
       UPDATE warehouse_stock
       SET quantity = $1, reserved_quantity = 0, updated_at = NOW()
       WHERE warehouse_id = $2 AND product_id = $3
     `,
-    [stockQuantity, defaultWarehouseId, createdProduct.id]
+    [stockQuantity, warehouseId, createdProduct.id]
   );
   await syncProductAvailabilityFromWarehouse(db, createdProduct.id);
 
@@ -1808,6 +1842,7 @@ app.put('/api/admin/products/:productId', authRequired(JWT_SECRET), roleRequired
     imageUrl?: string;
     inStock?: boolean;
     stockQuantity?: number;
+    warehouseId?: number;
   };
 
   const nextName = body.name !== undefined ? String(body.name).trim() : existingRow.name;
@@ -1829,11 +1864,21 @@ app.put('/api/admin/products/:productId', authRequired(JWT_SECRET), roleRequired
     return res.status(400).json({ message: 'Количество в наличии должно быть целым числом 0 или больше' });
   }
 
+  const existingWarehouseId = existingRow.home_warehouse_id ? toNumber(existingRow.home_warehouse_id) : null;
+  const nextWarehouseIdRaw = body.warehouseId !== undefined ? Number(body.warehouseId) : existingWarehouseId;
+  if (!nextWarehouseIdRaw) return res.status(400).json({ message: 'У товара должен быть склад' });
+  const nextWarehouseId = nextWarehouseIdRaw;
+  // запрет смены склада без доступа
+  if (!(await assertWarehouseAccess(req, res, nextWarehouseId))) return;
+  if (existingWarehouseId && existingWarehouseId !== nextWarehouseId) {
+    return res.status(400).json({ message: 'Товар закреплен за складом и не может быть перенесен' });
+  }
+
   const updated = await db.query(
     `
       UPDATE products
-      SET name = $1, description = $2, price = $3, category = $4, image_url = $5, in_stock = $6, stock_quantity = $7
-      WHERE id = $8
+      SET name = $1, description = $2, price = $3, category = $4, image_url = $5, in_stock = $6, stock_quantity = $7, home_warehouse_id = $8
+      WHERE id = $9
       RETURNING *
     `,
     [
@@ -1844,20 +1889,20 @@ app.put('/api/admin/products/:productId', authRequired(JWT_SECRET), roleRequired
       body.imageUrl !== undefined ? body.imageUrl?.trim() || null : existingRow.image_url,
       nextStockQuantity > 0 && (body.inStock !== undefined ? Boolean(body.inStock) : Boolean(existingRow.in_stock)),
       nextStockQuantity,
+      nextWarehouseId,
       productId
     ]
   );
 
   if (body.stockQuantity !== undefined) {
-    const defaultWarehouseId = await getDefaultWarehouseId(db);
-    await ensureWarehouseStockRow(db, defaultWarehouseId, productId);
+    await ensureWarehouseStockRow(db, nextWarehouseId, productId);
     await db.query(
       `
         UPDATE warehouse_stock
         SET quantity = $1 + reserved_quantity, updated_at = NOW()
         WHERE warehouse_id = $2 AND product_id = $3
       `,
-      [nextStockQuantity, defaultWarehouseId, productId]
+      [nextStockQuantity, nextWarehouseId, productId]
     );
     await syncProductAvailabilityFromWarehouse(db, productId);
   }
@@ -2549,7 +2594,7 @@ app.patch('/api/admin/pick-tasks/:taskId', authRequired(JWT_SECRET), roleRequire
     await client.query('BEGIN');
     const task = (await client.query(
       `
-        SELECT id, warehouse_id, status, assigned_to
+        SELECT id, warehouse_id, order_id, status, assigned_to
         FROM pick_tasks
         WHERE id = $1
         FOR UPDATE
@@ -2620,9 +2665,27 @@ app.patch('/api/admin/pick-tasks/:taskId', authRequired(JWT_SECRET), roleRequire
         )).rows[0];
         const quantity = toNumber(stock?.quantity ?? 0);
         const reserved = toNumber(stock?.reserved_quantity ?? 0);
-        if (quantity < qty || reserved < qty) {
+        if (quantity < qty) {
           await client.query('ROLLBACK');
-          return res.status(400).json({ message: `Недостаточно резерва для productId=${productId}` });
+          return res.status(400).json({ message: `Недостаточно остатка для productId=${productId}` });
+        }
+
+        // Если резерв уменьшился (например, ручное снятие), дозарезервируем из доступного остатка
+        if (reserved < qty) {
+          const missingReserve = qty - reserved;
+          const available = quantity - reserved;
+          if (available < missingReserve) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ message: `Недостаточно резерва для productId=${productId}` });
+          }
+          await client.query(
+            `
+              UPDATE warehouse_stock
+              SET reserved_quantity = reserved_quantity + $1, updated_at = NOW()
+              WHERE warehouse_id = $2 AND product_id = $3
+            `,
+            [missingReserve, toNumber(task.warehouse_id), productId]
+          );
         }
         await client.query(
           `
@@ -2770,8 +2833,40 @@ app.get('/api/couriers/me', authRequired(JWT_SECRET), roleRequired('courier', 'a
       verificationRequestedAt: courierRow.verification_requested_at ? toDateString(courierRow.verification_requested_at) : null,
       verificationReviewedBy: courierRow.reviewed_by_name || null,
       verifiedAt: courierRow.verified_at ? toDateString(courierRow.verified_at) : null,
-      isEligible: courierEligible(courierRow)
+      isEligible: courierEligible(courierRow),
+      lastSeenAt: courierRow.last_seen_at ? new Date(courierRow.last_seen_at).toISOString() : null,
+      isOnline: courierIsOnline(courierRow)
     }
+  });
+});
+
+app.post('/api/couriers/me/heartbeat', authRequired(JWT_SECRET), roleRequired('courier'), async (req, res) => {
+  const body = req.body as { busy?: boolean };
+  const courierRow = (await db.query('SELECT * FROM couriers WHERE user_id = $1 LIMIT 1', [req.user!.id])).rows[0];
+  if (!courierRow) return res.status(404).json({ message: 'Профиль курьера не найден' });
+
+  const nextStatus = body.busy ? 'busy' : 'available';
+  if (nextStatus === 'available' && !courierEligible(courierRow)) {
+    return res.status(403).json({ message: 'Сначала пройдите верификацию курьера' });
+  }
+
+  const updated = (
+    await db.query(
+      `
+        UPDATE couriers
+        SET status = $1,
+            last_seen_at = NOW()
+        WHERE id = $2
+        RETURNING *
+      `,
+      [nextStatus, toNumber(courierRow.id)]
+    )
+  ).rows[0];
+
+  return res.json({
+    status: nextStatus,
+    isOnline: courierIsOnline(updated),
+    lastSeenAt: updated.last_seen_at ? new Date(updated.last_seen_at).toISOString() : null
   });
 });
 
@@ -3149,7 +3244,7 @@ app.get('/api/admin/search', authRequired(JWT_SECRET), roleRequired('admin'), as
     ),
     db.query(
       `
-        SELECT c.id, c.user_id, c.vehicle_type, c.status, c.verification_status, u.full_name, u.email
+        SELECT c.id, c.user_id, c.vehicle_type, c.status, c.verification_status, c.last_seen_at, u.full_name, u.email
         FROM couriers c
         JOIN users u ON u.id = c.user_id
         WHERE COALESCE(c.vehicle_type, '') ILIKE $1
@@ -3226,6 +3321,8 @@ app.get('/api/admin/search', authRequired(JWT_SECRET), roleRequired('admin'), as
         email: String(row.email),
         vehicleType: row.vehicle_type ?? null,
         status: String(row.status),
+        isOnline: courierIsOnline(row),
+        lastSeenAt: row.last_seen_at ? new Date(row.last_seen_at).toISOString() : null,
         verificationStatus: String(row.verification_status)
       }))
     }
@@ -3458,7 +3555,7 @@ app.delete('/api/cart/items/:itemId', authRequired(JWT_SECRET), async (req, res)
 });
 
 app.post('/api/orders', authRequired(JWT_SECRET), async (req, res) => {
-  const body = req.body as { deliveryAddress?: string; deliveryLat?: number; deliveryLng?: number };
+  const body = req.body as { deliveryAddress?: string; deliveryLat?: number; deliveryLng?: number; paymentMethod?: string };
   const user = await getUserById(req.user!.id);
   if (!user) return res.status(404).json({ message: 'Пользователь не найден' });
 
@@ -3524,6 +3621,10 @@ app.post('/api/orders', authRequired(JWT_SECRET), async (req, res) => {
   const total = Number(
     cartRows.reduce((sum: number, row: any) => sum + Number(row.quantity) * Number(row.price), 0).toFixed(2)
   );
+  const paymentMethod = ['cash', 'wallet'].includes(String(body.paymentMethod || '').toLowerCase())
+    ? String(body.paymentMethod).toLowerCase()
+    : 'cash';
+  const courierFee = deliveryQuote.deliveryFee ?? null;
 
   const client: PoolClient = await db.connect();
   try {
@@ -3534,9 +3635,10 @@ app.post('/api/orders', authRequired(JWT_SECRET), async (req, res) => {
         INSERT INTO orders (
           user_id, status, total, delivery_address, delivery_lat, delivery_lng,
           serviceable, delivery_zone, fulfillment_warehouse, fulfillment_warehouse_code,
-          warehouse_distance_km, route_distance_km, delivery_eta_min, delivery_fee
+          warehouse_distance_km, route_distance_km, delivery_eta_min, delivery_fee,
+          courier_fee, payment_method
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
         RETURNING *
       `,
       [
@@ -3553,7 +3655,9 @@ app.post('/api/orders', authRequired(JWT_SECRET), async (req, res) => {
         deliveryQuote.warehouseDistanceKm,
         deliveryQuote.routeDistanceKm,
         deliveryQuote.etaMin,
-        deliveryQuote.deliveryFee
+        deliveryQuote.deliveryFee,
+        courierFee,
+        paymentMethod
       ]
     );
     const orderId = toNumber(orderInsert.rows[0].id);
@@ -3767,6 +3871,63 @@ app.get('/api/orders/open', authRequired(JWT_SECRET), roleRequired('courier'), a
   return res.json({ orders: rows.map((row: any) => orderView(normalizeOrderRow(row))) });
 });
 
+app.get('/api/orders/history', authRequired(JWT_SECRET), roleRequired('courier', 'admin'), async (req, res) => {
+  const delivered = [ORDER_STATUS.received, ORDER_STATUS.paid];
+
+  const baseSelect = `
+      SELECT o.*,
+             u.full_name AS customer_full_name,
+             u.phone AS customer_phone,
+             pts.pick_task_status,
+             pts.picker_id,
+             pts.picker_name
+      FROM orders o
+      LEFT JOIN users u ON u.id = o.user_id
+      LEFT JOIN LATERAL (
+        SELECT pt.status AS pick_task_status,
+               pt.assigned_to AS picker_id,
+               pu.full_name AS picker_name
+        FROM pick_tasks pt
+        LEFT JOIN users pu ON pu.id = pt.assigned_to
+        WHERE pt.order_id = o.id
+        ORDER BY pt.id DESC
+        LIMIT 1
+      ) pts ON TRUE
+  `;
+
+  let rows: any[] = [];
+  if (req.user!.role === 'courier') {
+    const courier = (await db.query('SELECT * FROM couriers WHERE user_id = $1 LIMIT 1', [req.user!.id])).rows[0];
+    if (!courier) return res.json({ orders: [] });
+    rows = (
+      await db.query(
+        `
+          ${baseSelect}
+          WHERE o.assigned_courier_id = $1
+            AND o.status = ANY($2)
+          ORDER BY o.updated_at DESC
+          LIMIT 200
+        `,
+        [toNumber(courier.id), delivered]
+      )
+    ).rows;
+  } else {
+    rows = (
+      await db.query(
+        `
+          ${baseSelect}
+          WHERE o.status = ANY($1)
+          ORDER BY o.updated_at DESC
+          LIMIT 500
+        `,
+        [delivered]
+      )
+    ).rows;
+  }
+
+  return res.json({ orders: rows.map((row: any) => orderView(normalizeOrderRow(row))) });
+});
+
 app.post('/api/orders/:orderId/claim', authRequired(JWT_SECRET), roleRequired('courier'), async (req, res) => {
   const orderId = Number(req.params.orderId);
   if (!orderId) return res.status(400).json({ message: 'Некорректный orderId' });
@@ -3776,6 +3937,7 @@ app.post('/api/orders/:orderId/claim', authRequired(JWT_SECRET), roleRequired('c
   if (!courierEligible(courierRow)) {
     return res.status(403).json({ message: 'Курьер не верифицирован. Добавьте данные транспорта и фото техпаспорта.' });
   }
+  await db.query('UPDATE couriers SET last_seen_at = NOW() WHERE id = $1', [toNumber(courierRow.id)]);
   const courierId = toNumber(courierRow.id);
   const maxActive = toNumber(courierRow.max_active_orders);
   const activeCount = await getActiveOrderCountForCourier(courierId);
@@ -3919,6 +4081,23 @@ app.patch('/api/orders/:orderId/status', authRequired(JWT_SECRET), async (req, r
     if (!courierEligible(courier)) {
       return res.status(403).json({ message: 'Курьер не верифицирован. Смена статуса недоступна.' });
     }
+    if (nextStatus === ORDER_STATUS.courierPicked) {
+      const pickTask = (
+        await db.query(
+          `
+            SELECT status
+            FROM pick_tasks
+            WHERE order_id = $1
+            ORDER BY id DESC
+            LIMIT 1
+          `,
+          [orderId]
+        )
+      ).rows[0];
+      if (!pickTask || pickTask.status !== 'handed_to_courier') {
+        return res.status(409).json({ message: 'Сборщик ещё не передал заказ курьеру' });
+      }
+    }
   }
 
   const statusFlow: Partial<Record<OrderStatus, OrderStatus[]>> = {
@@ -3939,6 +4118,21 @@ app.patch('/api/orders/:orderId/status', authRequired(JWT_SECRET), async (req, r
     'INSERT INTO order_events (order_id, status, comment, created_by) VALUES ($1, $2, $3, $4)',
     [orderId, nextStatus, comment || null, req.user!.id]
   );
+
+  // Если сборщик уже передал заказ курьеру, а курьер нажал «принял»,
+  // автоматически переводим заказ в «в пути»
+  if (nextStatus === ORDER_STATUS.courierPicked) {
+    const pickTask = (
+      await db.query('SELECT status FROM pick_tasks WHERE order_id = $1 LIMIT 1', [orderId])
+    ).rows[0];
+    if (pickTask?.status === 'handed_to_courier') {
+      await db.query('UPDATE orders SET status = $1 WHERE id = $2', [ORDER_STATUS.onTheWay, orderId]);
+      await db.query(
+        'INSERT INTO order_events (order_id, status, comment, created_by) VALUES ($1, $2, $3, $4)',
+        [orderId, ORDER_STATUS.onTheWay, 'Курьер принял заказ от сборщика', req.user!.id]
+      );
+    }
+  }
 
   if (nextStatus === ORDER_STATUS.paid || nextStatus === ORDER_STATUS.cancelled) {
     await tryAssignOldestPendingOrder();
@@ -4104,12 +4298,24 @@ app.post('/api/couriers/connect', authRequired(JWT_SECRET), roleRequired('custom
   }
 
   const courier = await getOrCreateCourierForUser(targetUser.id);
-  const nextStatus = ['offline', 'available', 'busy'].includes(body.status || '') ? body.status! : 'available';
+  const nextStatus = body.status === 'busy' ? 'busy' : 'available';
   if (nextStatus === 'available' && !courierEligible(courier)) {
     return res.status(403).json({ message: 'Сначала пройдите верификацию курьера: транспорт, права и фото техпаспорта' });
   }
 
-  await db.query('UPDATE couriers SET vehicle_type = $1, status = $2 WHERE id = $3', [body.vehicleType || courier.vehicle_type || 'bike', nextStatus, courier.id]);
+  const updatedRow = (
+    await db.query(
+      `
+        UPDATE couriers
+        SET vehicle_type = $1,
+            status = $2,
+            last_seen_at = NOW()
+        WHERE id = $3
+        RETURNING *
+      `,
+      [body.vehicleType || courier.vehicle_type || 'bike', nextStatus, courier.id]
+    )
+  ).rows[0];
   if (nextStatus === 'available') {
     await tryAssignOldestPendingOrder();
   }
@@ -4120,6 +4326,8 @@ app.post('/api/couriers/connect', authRequired(JWT_SECRET), roleRequired('custom
     message: 'Курьер подключен',
     courierId: courier.id,
     status: nextStatus,
+    isOnline: courierIsOnline(updatedRow),
+    lastSeenAt: updatedRow.last_seen_at ? new Date(updatedRow.last_seen_at).toISOString() : null,
     ...(isSelfUpdate && updatedUser ? { token: buildToken(updatedUser, JWT_SECRET), user: publicUser(updatedUser) } : {})
   });
 });
@@ -4145,6 +4353,8 @@ app.get('/api/couriers', authRequired(JWT_SECRET), roleRequired('admin'), async 
       phone: row.phone,
       vehicleType: row.vehicle_type,
       status: row.status,
+      isOnline: courierIsOnline(row),
+      lastSeenAt: row.last_seen_at ? new Date(row.last_seen_at).toISOString() : null,
       verificationStatus: row.verification_status,
       transportLicense: row.transport_license,
       vehicleRegistrationNumber: row.vehicle_registration_number,
@@ -4162,8 +4372,11 @@ app.get('/api/couriers', authRequired(JWT_SECRET), roleRequired('admin'), async 
   return res.json({ couriers });
 });
 
-app.use((error: any, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+app.use((error: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
   if (res.headersSent) return next(error);
+
+  // Логируем все необработанные ошибки в консоль сервера
+  console.error('[ERROR]', req.method, req.originalUrl, '-', error?.message || error, error?.stack || '');
 
   if (error instanceof multer.MulterError) {
     if (error.code === 'LIMIT_FILE_SIZE') {

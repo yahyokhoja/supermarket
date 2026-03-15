@@ -31,6 +31,7 @@ export async function initDb(pool: Pool) {
       image_url TEXT,
       in_stock BOOLEAN NOT NULL DEFAULT TRUE,
       stock_quantity INTEGER NOT NULL DEFAULT 0,
+      home_warehouse_id BIGINT REFERENCES warehouses(id) ON DELETE SET NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
@@ -55,6 +56,7 @@ export async function initDb(pool: Pool) {
       user_id BIGINT UNIQUE NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       vehicle_type TEXT,
       status TEXT NOT NULL DEFAULT 'offline',
+      last_seen_at TIMESTAMPTZ,
       verification_status TEXT NOT NULL DEFAULT 'pending',
       transport_license TEXT,
       vehicle_registration_number TEXT,
@@ -83,6 +85,8 @@ export async function initDb(pool: Pool) {
       route_distance_km NUMERIC(10,3),
       delivery_eta_min INTEGER,
       delivery_fee NUMERIC(12,2),
+      courier_fee NUMERIC(12,2),
+      payment_method TEXT DEFAULT 'cash',
       assigned_courier_id BIGINT REFERENCES couriers(id) ON DELETE SET NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -211,6 +215,7 @@ export async function initDb(pool: Pool) {
 
   await pool.query(`
     ALTER TABLE couriers
+      ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS verification_status TEXT NOT NULL DEFAULT 'pending',
       ADD COLUMN IF NOT EXISTS transport_license TEXT,
       ADD COLUMN IF NOT EXISTS vehicle_registration_number TEXT,
@@ -227,7 +232,8 @@ export async function initDb(pool: Pool) {
 
   await pool.query(`
     ALTER TABLE products
-      ADD COLUMN IF NOT EXISTS stock_quantity INTEGER NOT NULL DEFAULT 0;
+      ADD COLUMN IF NOT EXISTS stock_quantity INTEGER NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS home_warehouse_id BIGINT REFERENCES warehouses(id) ON DELETE SET NULL;
   `);
 
   await pool.query(`
@@ -239,7 +245,9 @@ export async function initDb(pool: Pool) {
       ADD COLUMN IF NOT EXISTS warehouse_distance_km NUMERIC(10,3),
       ADD COLUMN IF NOT EXISTS route_distance_km NUMERIC(10,3),
       ADD COLUMN IF NOT EXISTS delivery_eta_min INTEGER,
-      ADD COLUMN IF NOT EXISTS delivery_fee NUMERIC(12,2);
+      ADD COLUMN IF NOT EXISTS delivery_fee NUMERIC(12,2),
+      ADD COLUMN IF NOT EXISTS courier_fee NUMERIC(12,2),
+      ADD COLUMN IF NOT EXISTS payment_method TEXT DEFAULT 'cash';
   `);
 
   await pool.query(`

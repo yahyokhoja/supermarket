@@ -77,6 +77,8 @@ export interface ApiOrder {
   routeDistanceKm: number | null;
   deliveryEtaMin: number | null;
   deliveryFee: number | null;
+  courierFee: number | null;
+  paymentMethod: string | null;
   assignedCourierId: number | null;
   createdAt: string;
   updatedAt: string;
@@ -85,4 +87,5 @@ export interface ApiOrder {
   pickTaskStatus?: string | null;
   pickerId?: number | null;
   pickerName?: string | null;
+  routeUrl?: string | null;
 }
