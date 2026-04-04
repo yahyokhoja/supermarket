@@ -21,8 +21,16 @@ export default defineConfig({
     port: 5173,
     ...(httpsConfig ? { https: httpsConfig } : {}),
     proxy: {
-      '/api': 'http://localhost:4000',
-      '/uploads': 'http://localhost:4000'
+      '/api': {
+        target: 'https://localhost:4000',
+        changeOrigin: true,
+        secure: false
+      },
+      '/uploads': {
+        target: 'https://localhost:4000',
+        changeOrigin: true,
+        secure: false
+      }
     }
   },
   build: {

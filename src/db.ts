@@ -22,6 +22,17 @@ export async function initDb(pool: Pool) {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
+    CREATE TABLE IF NOT EXISTS warehouses (
+      id BIGSERIAL PRIMARY KEY,
+      code TEXT UNIQUE NOT NULL,
+      name TEXT NOT NULL,
+      lat DOUBLE PRECISION,
+      lng DOUBLE PRECISION,
+      created_by_admin_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
+      is_active BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
     CREATE TABLE IF NOT EXISTS products (
       id BIGSERIAL PRIMARY KEY,
       name TEXT NOT NULL,
@@ -120,16 +131,6 @@ export async function initDb(pool: Pool) {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
-    CREATE TABLE IF NOT EXISTS warehouses (
-      id BIGSERIAL PRIMARY KEY,
-      code TEXT UNIQUE NOT NULL,
-      name TEXT NOT NULL,
-      lat DOUBLE PRECISION,
-      lng DOUBLE PRECISION,
-      is_active BOOLEAN NOT NULL DEFAULT TRUE,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-
     CREATE TABLE IF NOT EXISTS warehouse_stock (
       id BIGSERIAL PRIMARY KEY,
       warehouse_id BIGINT NOT NULL REFERENCES warehouses(id) ON DELETE CASCADE,
@@ -176,11 +177,118 @@ export async function initDb(pool: Pool) {
       requested_qty INTEGER NOT NULL CHECK(requested_qty > 0),
       picked_qty INTEGER NOT NULL DEFAULT 0 CHECK(picked_qty >= 0)
     );
+
+    CREATE TABLE IF NOT EXISTS payment_transactions (
+      id BIGSERIAL PRIMARY KEY,
+      order_id BIGINT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+      user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      amount NUMERIC(12,2) NOT NULL,
+      currency TEXT NOT NULL DEFAULT 'USD',
+      provider TEXT NOT NULL DEFAULT 'mockpay',
+      provider_payment_id TEXT UNIQUE NOT NULL,
+      idempotency_key TEXT UNIQUE,
+      status TEXT NOT NULL DEFAULT 'pending',
+      failure_reason TEXT,
+      provider_payload JSONB,
+      paid_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS merchant_stores (
+      id BIGSERIAL PRIMARY KEY,
+      owner_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      logo_url TEXT,
+      phone TEXT NOT NULL,
+      description TEXT,
+      lat DOUBLE PRECISION,
+      lng DOUBLE PRECISION,
+      status TEXT NOT NULL DEFAULT 'pending',
+      approved_by_admin_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
+      approved_at TIMESTAMPTZ,
+      rejection_reason TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(owner_user_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS merchant_products (
+      id BIGSERIAL PRIMARY KEY,
+      store_id BIGINT NOT NULL REFERENCES merchant_stores(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      description TEXT,
+      price NUMERIC(12,2) NOT NULL,
+      image_url TEXT,
+      in_stock BOOLEAN NOT NULL DEFAULT TRUE,
+      stock_quantity INTEGER NOT NULL DEFAULT 0 CHECK(stock_quantity >= 0),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS merchant_store_courier_links (
+      id BIGSERIAL PRIMARY KEY,
+      store_id BIGINT NOT NULL REFERENCES merchant_stores(id) ON DELETE CASCADE,
+      courier_id BIGINT NOT NULL REFERENCES couriers(id) ON DELETE CASCADE,
+      requested_by_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      status TEXT NOT NULL DEFAULT 'pending',
+      approved_by_admin_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
+      approved_at TIMESTAMPTZ,
+      rejection_reason TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(store_id, courier_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS tenant_db_routing (
+      id BIGSERIAL PRIMARY KEY,
+      store_id BIGINT NOT NULL UNIQUE REFERENCES merchant_stores(id) ON DELETE CASCADE,
+      mode TEXT NOT NULL DEFAULT 'shared' CHECK (mode IN ('shared', 'dedicated')),
+      dsn_key TEXT,
+      dedicated_database_url TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
   `);
 
   await pool.query(`
     CREATE UNIQUE INDEX IF NOT EXISTS ux_product_categories_name
     ON product_categories ((lower(category_name)), (lower(COALESCE(subcategory_name, ''))));
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS ix_payment_transactions_order_created
+    ON payment_transactions (order_id, created_at DESC);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS ix_payment_transactions_status
+    ON payment_transactions (status);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS ix_merchant_stores_status
+    ON merchant_stores (status);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS ix_merchant_products_store
+    ON merchant_products (store_id);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS ix_merchant_store_courier_links_store
+    ON merchant_store_courier_links (store_id);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS ix_merchant_store_courier_links_status
+    ON merchant_store_courier_links (status);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS ix_tenant_db_routing_mode
+    ON tenant_db_routing (mode);
   `);
 
   await pool.query(`
@@ -252,6 +360,11 @@ export async function initDb(pool: Pool) {
 
   await pool.query(`
     ALTER TABLE warehouses
+      ADD COLUMN IF NOT EXISTS created_by_admin_id BIGINT REFERENCES users(id) ON DELETE SET NULL;
+  `);
+
+  await pool.query(`
+    ALTER TABLE warehouses
       ADD COLUMN IF NOT EXISTS lat DOUBLE PRECISION,
       ADD COLUMN IF NOT EXISTS lng DOUBLE PRECISION;
   `);
@@ -306,6 +419,87 @@ export async function initDb(pool: Pool) {
       ELSE status
     END
     WHERE status IN ('pending', 'assigned', 'picked_up', 'delivered');
+  `);
+
+  await pool.query(`
+    CREATE OR REPLACE FUNCTION set_merchant_store_updated_at()
+    RETURNS TRIGGER AS $$
+    BEGIN
+      NEW.updated_at = NOW();
+      RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+  `);
+
+  await pool.query(`
+    DROP TRIGGER IF EXISTS trg_merchant_stores_updated_at ON merchant_stores;
+    CREATE TRIGGER trg_merchant_stores_updated_at
+    BEFORE UPDATE ON merchant_stores
+    FOR EACH ROW
+    EXECUTE FUNCTION set_merchant_store_updated_at();
+  `);
+
+  await pool.query(`
+    CREATE OR REPLACE FUNCTION set_merchant_product_updated_at()
+    RETURNS TRIGGER AS $$
+    BEGIN
+      NEW.updated_at = NOW();
+      RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+  `);
+
+  await pool.query(`
+    DROP TRIGGER IF EXISTS trg_merchant_products_updated_at ON merchant_products;
+    CREATE TRIGGER trg_merchant_products_updated_at
+    BEFORE UPDATE ON merchant_products
+    FOR EACH ROW
+    EXECUTE FUNCTION set_merchant_product_updated_at();
+  `);
+
+  await pool.query(`
+    CREATE OR REPLACE FUNCTION set_merchant_store_courier_link_updated_at()
+    RETURNS TRIGGER AS $$
+    BEGIN
+      NEW.updated_at = NOW();
+      RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+  `);
+
+  await pool.query(`
+    DROP TRIGGER IF EXISTS trg_merchant_store_courier_links_updated_at ON merchant_store_courier_links;
+    CREATE TRIGGER trg_merchant_store_courier_links_updated_at
+    BEFORE UPDATE ON merchant_store_courier_links
+    FOR EACH ROW
+    EXECUTE FUNCTION set_merchant_store_courier_link_updated_at();
+  `);
+
+  await pool.query(`
+    CREATE OR REPLACE FUNCTION set_tenant_db_routing_updated_at()
+    RETURNS TRIGGER AS $$
+    BEGIN
+      NEW.updated_at = NOW();
+      RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+  `);
+
+  await pool.query(`
+    DROP TRIGGER IF EXISTS trg_tenant_db_routing_updated_at ON tenant_db_routing;
+    CREATE TRIGGER trg_tenant_db_routing_updated_at
+    BEFORE UPDATE ON tenant_db_routing
+    FOR EACH ROW
+    EXECUTE FUNCTION set_tenant_db_routing_updated_at();
+  `);
+
+  await pool.query(`
+    INSERT INTO tenant_db_routing (store_id, mode)
+    SELECT s.id, 'shared'
+    FROM merchant_stores s
+    LEFT JOIN tenant_db_routing r ON r.store_id = s.id
+    WHERE r.store_id IS NULL
+    ON CONFLICT (store_id) DO NOTHING;
   `);
 }
 

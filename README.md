@@ -40,6 +40,40 @@ cp .env.example .env
 
 ## Dev запуск
 
+Запуск всего проекта одной командой:
+
+```bash
+npm run start:all
+```
+
+Остановка всего проекта:
+
+```bash
+npm run stop:all
+```
+
+Перезапуск всего проекта:
+
+```bash
+npm run restart:all
+```
+
+Статус контейнеров и портов:
+
+```bash
+npm run status:all
+```
+
+Полная диагностика (env, docker, порты, health):
+
+```bash
+npm run doctor:all
+```
+
+Открыть: `https://localhost:5173`
+
+Если нужен ручной режим по отдельности:
+
 Терминал 1 (API):
 
 ```bash
@@ -51,8 +85,6 @@ npm run dev:api
 ```bash
 npm run dev:web
 ```
-
-Открыть: `http://localhost:5173`
 
 ## Локальный HTTPS (телефон/геолокация)
 
@@ -103,7 +135,10 @@ npm run db:down
 
 Важно:
 - backend уже работает через PostgreSQL (`DATABASE_URL`);
+- для локальной разработки используется порт `55432`:
+  `postgresql://supermarket:supermarket_dev_password@localhost:55432/supermarket`;
 - для локальной разработки используйте `docker-compose.postgres.yml`.
+- readiness API: `GET /api/health/ready` (проверяет app + postgres + map db + bootstrap).
 
 ## Production запуск
 
@@ -175,16 +210,89 @@ npm start
 - `PUT /api/cart/items/:itemId`
 - `DELETE /api/cart/items/:itemId`
 - `POST /api/orders`
+- `POST /api/orders/:orderId/pay` (создать платеж / payment intent)
 - `GET /api/orders/my`
 - `GET /api/orders/:orderId`
 - `PATCH /api/orders/:orderId/status`
+- `POST /api/payments/webhook` (подтверждение оплаты от провайдера, подпись `x-webhook-signature`)
 - `GET /api/orders/assigned` (courier)
 - `GET /api/orders/all` (admin)
 - `POST /api/couriers/connect`
+- `POST /api/couriers/revert-to-customer` (для курьера: вернуть роль покупателя, если курьер не верифицирован и точка продавца не одобрена)
 - `GET /api/couriers`
 - `GET /api/geocode/search?q=...`
 - `GET /api/geocode/reverse?lat=...&lng=...`
 - `POST /api/delivery/quote` (проверка зоны, подбор склада, ETA и стоимость)
+
+## Оплата (новое)
+
+- Для онлайн-оплаты используйте способ оплаты `wallet` при оформлении заказа.
+- После статуса заказа `received` клиент вызывает `POST /api/orders/:orderId/pay`.
+- API вернет `webhookTest` payload/signature для локального mock-подтверждения.
+- Подтверждение оплаты выполняется вызовом `POST /api/payments/webhook`.
+- Статус `paid` больше не выставляется вручную через `/api/orders/:orderId/status`.
+
+## Точки продавцов (новое)
+
+Обычный пользователь (`customer`) может создать свою точку магазина с отдельным каталогом товаров (изолированные таблицы `merchant_stores` + `merchant_products`), телефоном, логотипом и геолокацией.
+
+Важно:
+- Точка и карточки товаров активны только после одобрения главным администратором (`admin@universal.local`).
+- Подключение курьеров к точке тоже требует одобрения главного администратора.
+
+Основные endpoint’ы:
+- `POST /api/stores/uploads/logo` (загрузка логотипа точки)
+- `GET /api/stores/my`
+- `POST /api/stores/my`
+- `PATCH /api/stores/my`
+- `GET /api/stores/my/products`
+- `POST /api/stores/my/products`
+- `PUT /api/stores/my/products/:productId`
+- `DELETE /api/stores/my/products/:productId`
+- `GET /api/stores/couriers` (список доступных курьеров)
+- `GET /api/stores/my/courier-links`
+- `POST /api/stores/my/courier-links` (заявка на подключение курьера)
+
+Одобрение главным админом:
+- `GET /api/admin/stores?status=pending`
+- `PATCH /api/admin/stores/:storeId/review` (`approved|rejected`)
+- `GET /api/admin/stores/:storeId/courier-links`
+- `PATCH /api/admin/stores/:storeId/courier-links/:linkId/review` (`approved|rejected`)
+- `GET /api/admin/stores/:storeId/tenant-routing`
+- `PATCH /api/admin/stores/:storeId/tenant-routing` (`mode=shared|dedicated`, `dsnKey`, `dedicatedDatabaseUrl`)
+- `POST /api/admin/stores/:storeId/migrate-products` (`stage=all|copy|verify|cutover`, `dryRun`, `dsnKey`)
+- UI: админ-панель (`admin@universal.local`) -> вкладка `Точки продавцов` для модерации точек и заявок на курьеров.
+  - В каждой точке есть кнопки `Dry run` и `Мигрировать товары`.
+
+### Tenant routing (shared -> dedicated)
+
+- Добавлена таблица `tenant_db_routing` и `TenantDbResolver`.
+- По умолчанию все точки работают в `shared` режиме (общая Postgres).
+- В dedicated режиме маршрутизируется каталог точки (`merchant_products`).
+- Метаданные точки и связи с курьерами остаются в shared БД.
+- Для выделенной БД переключайте точку в `mode=dedicated` и задавайте `dsnKey`.
+- DSN можно передать:
+  - в БД полем `dedicatedDatabaseUrl`, или
+  - через env `TENANT_DB_URL_<DSN_KEY>` (например `TENANT_DB_URL_STORE_42=postgresql://...`).
+
+Мигратор `shared -> dedicated` для каталога точки (`merchant_products`):
+
+```bash
+# Полный прогон: copy + verify + cutover
+npm run migrate:merchant-products -- --store-id 42 --dsn-key STORE_42
+
+# Только копирование
+npm run migrate:merchant-products -- --store-id 42 --dsn-key STORE_42 --stage copy
+
+# Только проверка
+npm run migrate:merchant-products -- --store-id 42 --dsn-key STORE_42 --stage verify
+
+# Только cutover
+npm run migrate:merchant-products -- --store-id 42 --dsn-key STORE_42 --stage cutover
+
+# Проверка плана без изменений
+npm run migrate:merchant-products -- --store-id 42 --dsn-key STORE_42 --dry-run
+```
 
 ## Логика доставки (новое)
 

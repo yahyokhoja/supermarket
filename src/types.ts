@@ -51,6 +51,8 @@ export interface DbOrder {
   route_distance_km: number | null;
   delivery_eta_min: number | null;
   delivery_fee: number | null;
+  courier_fee: number | null;
+  payment_method: string | null;
   assigned_courier_id: number | null;
   created_at: string;
   updated_at: string;

@@ -177,7 +177,15 @@ type WarehouseItem = {
   updatedAt: string;
 };
 type LowStockItem = WarehouseItem & { orderSuggestion: number };
-type WarehouseInfo = { id: number; code: string; name: string; lat: number | null; lng: number | null; isActive: boolean };
+type WarehouseInfo = {
+  id: number;
+  code: string;
+  name: string;
+  lat: number | null;
+  lng: number | null;
+  isActive: boolean;
+  createdByAdminId?: number | null;
+};
 type StockMovement = {
   id: number;
   warehouseId: number;
@@ -235,6 +243,9 @@ type CourierProfile = {
   isEligible: boolean;
   isOnline: boolean;
   lastSeenAt: string | null;
+  merchantStoreStatus?: 'pending' | 'approved' | 'rejected' | null;
+  canRevertToCustomer?: boolean;
+  revertToCustomerReason?: string | null;
 };
 
 type SavedDelivery = {
@@ -288,8 +299,74 @@ type SmartProductSuggestion = {
     description: string;
   };
 };
+type MerchantStore = {
+  id: number;
+  ownerUserId: number;
+  name: string;
+  logoUrl: string | null;
+  phone: string;
+  description: string | null;
+  lat: number | null;
+  lng: number | null;
+  status: 'pending' | 'approved' | 'rejected';
+  approvedByAdminId: number | null;
+  approvedAt: string | null;
+  rejectionReason: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+type MerchantStoreProduct = {
+  id: number;
+  storeId: number;
+  name: string;
+  description: string | null;
+  price: number;
+  imageUrl: string | null;
+  inStock: boolean;
+  stockQuantity: number;
+  createdAt: string;
+  updatedAt: string;
+};
+type StoreCourierCandidate = {
+  id: number;
+  fullName: string;
+  email: string;
+  phone: string | null;
+  vehicleType: string | null;
+  status: string;
+  isOnline: boolean;
+};
+type StoreCourierLink = {
+  id: number;
+  storeId: number;
+  courierId: number;
+  requestedByUserId: number;
+  status: 'pending' | 'approved' | 'rejected';
+  approvedByAdminId: number | null;
+  approvedAt: string | null;
+  rejectionReason: string | null;
+  courierName: string | null;
+  courierEmail: string | null;
+  courierPhone: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+type AdminMerchantStore = MerchantStore & {
+  ownerName: string | null;
+  ownerEmail: string | null;
+};
+type MerchantProductsMigrationResult = {
+  storeId: number;
+  dsnKey: string;
+  stage: 'all' | 'copy' | 'verify' | 'cutover';
+  dryRun: boolean;
+  dedicatedUrlSet: boolean;
+  copiedRows: number;
+  verifiedRows: number;
+  cutoverApplied: boolean;
+};
 type HeaderSection = 'catalog' | 'profile' | 'cart' | 'map';
-type AdminTab = 'orders' | 'analytics' | 'products' | 'warehouse' | 'users' | 'couriers' | 'audit' | 'search';
+type AdminTab = 'orders' | 'analytics' | 'products' | 'warehouse' | 'users' | 'couriers' | 'audit' | 'search' | 'merchants';
 type StockMovementType = 'receive' | 'writeoff' | 'reserve';
 
 function stockRowKey(warehouseId: number, productId: number) {
@@ -378,7 +455,8 @@ const ADMIN_TAB_LABELS: Record<AdminTab, string> = {
   users: 'Пользователи',
   couriers: 'Курьеры',
   search: 'Поиск',
-  audit: 'Аудит-лог'
+  audit: 'Аудит-лог',
+  merchants: 'Точки продавцов'
 };
 const DELIVERY_DRAFT_KEY = 'delivery_draft_v1';
 const LAST_DELIVERY_KEY = 'last_delivery_v1';
@@ -567,6 +645,7 @@ export default function App() {
   const [repeatingOrderId, setRepeatingOrderId] = useState<number | null>(null);
   const [editingOrderId, setEditingOrderId] = useState<number | null>(null);
   const [cancellingOrderId, setCancellingOrderId] = useState<number | null>(null);
+  const [payingOrderId, setPayingOrderId] = useState<number | null>(null);
   const [deletingOrderId, setDeletingOrderId] = useState<number | null>(null);
   const [adminEditingOrderId, setAdminEditingOrderId] = useState<number | null>(null);
   const [adminDeletingOrderId, setAdminDeletingOrderId] = useState<number | null>(null);
@@ -618,9 +697,39 @@ export default function App() {
   const [deliveryLocality, setDeliveryLocality] = useState('');
   const [deliveryAddress, setDeliveryAddress] = useState('');
   const [deliveryHouseNumber, setDeliveryHouseNumber] = useState('');
+  const [checkoutPaymentMethod, setCheckoutPaymentMethod] = useState<'cash' | 'wallet'>('wallet');
   const [deliveryLocation, setDeliveryLocation] = useState<{ lat: number; lng: number } | null>(null);
   const [deliveryQuote, setDeliveryQuote] = useState<DeliveryQuote | null>(null);
   const [deliveryQuoteLoading, setDeliveryQuoteLoading] = useState(false);
+  const [myStore, setMyStore] = useState<MerchantStore | null>(null);
+  const [myStoreProducts, setMyStoreProducts] = useState<MerchantStoreProduct[]>([]);
+  const [storeCouriers, setStoreCouriers] = useState<StoreCourierCandidate[]>([]);
+  const [myStoreCourierLinks, setMyStoreCourierLinks] = useState<StoreCourierLink[]>([]);
+  const [adminMerchantStatus, setAdminMerchantStatus] = useState<'pending' | 'approved' | 'rejected'>('pending');
+  const [adminMerchantStores, setAdminMerchantStores] = useState<AdminMerchantStore[]>([]);
+  const [adminStoreReviewNotes, setAdminStoreReviewNotes] = useState<Record<number, string>>({});
+  const [adminCourierReviewNotes, setAdminCourierReviewNotes] = useState<Record<string, string>>({});
+  const [adminStoreLinksByStoreId, setAdminStoreLinksByStoreId] = useState<Record<number, StoreCourierLink[]>>({});
+  const [adminStoreDsnDrafts, setAdminStoreDsnDrafts] = useState<Record<number, string>>({});
+  const [adminStoreMigrateLoading, setAdminStoreMigrateLoading] = useState<Record<number, boolean>>({});
+  const [storeForm, setStoreForm] = useState({
+    name: '',
+    logoUrl: '',
+    phone: '',
+    description: '',
+    lat: '',
+    lng: ''
+  });
+  const [storeProductForm, setStoreProductForm] = useState({
+    name: '',
+    description: '',
+    price: '',
+    imageUrl: '',
+    stockQuantity: '0'
+  });
+  const [storeFormSubmitting, setStoreFormSubmitting] = useState(false);
+  const [storeProductSubmitting, setStoreProductSubmitting] = useState(false);
+  const [storeCourierIdDraft, setStoreCourierIdDraft] = useState(0);
   const [lastDelivery, setLastDelivery] = useState<SavedDelivery | null>(() => {
     try {
       const raw = localStorage.getItem(LAST_DELIVERY_KEY);
@@ -695,6 +804,13 @@ export default function App() {
     lat: '',
     lng: ''
   });
+  const [warehouseCreateForm, setWarehouseCreateForm] = useState({
+    code: '',
+    name: '',
+    lat: '',
+    lng: ''
+  });
+  const [warehouseCreateSubmitting, setWarehouseCreateSubmitting] = useState(false);
   const [warehousePointLocating, setWarehousePointLocating] = useState(false);
   const [pickTaskStatusDrafts, setPickTaskStatusDrafts] = useState<Record<number, PickTask['status']>>({});
   const [adminUserRoleDrafts, setAdminUserRoleDrafts] = useState<Record<number, Role>>({});
@@ -734,6 +850,7 @@ export default function App() {
   const [imageUploading, setImageUploading] = useState(false);
   const [smartDetecting, setSmartDetecting] = useState(false);
   const [becomingCourier, setBecomingCourier] = useState(false);
+  const [revertingToCustomer, setRevertingToCustomer] = useState(false);
   const [catalogOpen, setCatalogOpen] = useState(false);
   const [selectedCategory, setSelectedCategory] = useState('all');
   const [selectedSubcategory, setSelectedSubcategory] = useState('all');
@@ -977,6 +1094,7 @@ export default function App() {
     if (hasAdminPermission('manage_couriers')) allowedTabs.push('couriers');
     if (hasAdminPermission('search_db')) allowedTabs.push('search');
     if (hasAdminPermission('view_audit')) allowedTabs.push('audit');
+    if (isSystemAdmin) allowedTabs.push('merchants');
     return allowedTabs;
   }, [user?.role, user?.permissions, isSystemAdmin]);
 
@@ -1300,6 +1418,10 @@ export default function App() {
     setAdminUserWarehouseScopesDrafts(
       Object.fromEntries(usersRes.users.map((u) => [u.id, Array.isArray(u.warehouseScopes) ? u.warehouseScopes : []])) as Record<number, number[]>
     );
+    if (isSystemAdmin) {
+      const storesRes = await api<{ stores: AdminMerchantStore[] }>(`/api/admin/stores?status=${encodeURIComponent(adminMerchantStatus)}`);
+      setAdminMerchantStores(storesRes.stores || []);
+    }
   }
 
   async function loadPickTasksForPicker() {
@@ -1350,6 +1472,113 @@ export default function App() {
     }));
   }
 
+  async function loadMyStoreData() {
+    if (user?.role !== 'customer') return;
+    const myStoreRes = await api<{ store: MerchantStore | null }>('/api/stores/my');
+    setMyStore(myStoreRes.store);
+    if (!myStoreRes.store) {
+      setMyStoreProducts([]);
+      setStoreCouriers([]);
+      setMyStoreCourierLinks([]);
+      return;
+    }
+
+    setStoreForm({
+      name: myStoreRes.store.name || '',
+      logoUrl: myStoreRes.store.logoUrl || '',
+      phone: myStoreRes.store.phone || '',
+      description: myStoreRes.store.description || '',
+      lat: myStoreRes.store.lat === null ? '' : String(myStoreRes.store.lat),
+      lng: myStoreRes.store.lng === null ? '' : String(myStoreRes.store.lng)
+    });
+
+    if (myStoreRes.store.status !== 'approved') {
+      setMyStoreProducts([]);
+      setStoreCouriers([]);
+      setMyStoreCourierLinks([]);
+      return;
+    }
+
+    const [productsRes, couriersRes, linksRes] = await Promise.all([
+      api<{ products: MerchantStoreProduct[] }>('/api/stores/my/products'),
+      api<{ couriers: StoreCourierCandidate[] }>('/api/stores/couriers'),
+      api<{ links: StoreCourierLink[] }>('/api/stores/my/courier-links')
+    ]);
+    setMyStoreProducts(productsRes.products || []);
+    setStoreCouriers(couriersRes.couriers || []);
+    setMyStoreCourierLinks(linksRes.links || []);
+  }
+
+  async function loadAdminMerchantStores() {
+    if (user?.role !== 'admin' || !isSystemAdmin) return;
+    const data = await api<{ stores: AdminMerchantStore[] }>(`/api/admin/stores?status=${encodeURIComponent(adminMerchantStatus)}`);
+    const stores = data.stores || [];
+    setAdminMerchantStores(stores);
+    setAdminStoreDsnDrafts((prev) => {
+      const next = { ...prev };
+      for (const store of stores) {
+        if (!next[store.id]) next[store.id] = `STORE_${store.id}`;
+      }
+      return next;
+    });
+  }
+
+  async function reviewAdminMerchantStore(storeId: number, decision: 'approved' | 'rejected') {
+    const reason = (adminStoreReviewNotes[storeId] || '').trim();
+    await api(`/api/admin/stores/${storeId}/review`, {
+      method: 'PATCH',
+      body: JSON.stringify({ decision, reason: reason || null })
+    });
+    notify(decision === 'approved' ? 'Точка одобрена' : 'Точка отклонена');
+    await loadAdminMerchantStores();
+  }
+
+  async function loadAdminStoreCourierLinks(storeId: number) {
+    if (user?.role !== 'admin' || !isSystemAdmin) return;
+    const data = await api<{ links: StoreCourierLink[] }>(`/api/admin/stores/${storeId}/courier-links`);
+    setAdminStoreLinksByStoreId((prev) => ({ ...prev, [storeId]: data.links || [] }));
+  }
+
+  async function reviewAdminStoreCourierLink(storeId: number, linkId: number, decision: 'approved' | 'rejected') {
+    const noteKey = `${storeId}:${linkId}`;
+    const reason = (adminCourierReviewNotes[noteKey] || '').trim();
+    await api(`/api/admin/stores/${storeId}/courier-links/${linkId}/review`, {
+      method: 'PATCH',
+      body: JSON.stringify({ decision, reason: reason || null })
+    });
+    notify(decision === 'approved' ? 'Курьер подключен к точке' : 'Заявка курьера отклонена');
+    await loadAdminStoreCourierLinks(storeId);
+  }
+
+  async function migrateAdminStoreProducts(storeId: number, dryRun: boolean) {
+    const dsnKey = String(adminStoreDsnDrafts[storeId] || `STORE_${storeId}`).trim();
+    if (!dsnKey) {
+      notify('Укажите dsnKey перед миграцией');
+      return;
+    }
+    setAdminStoreMigrateLoading((prev) => ({ ...prev, [storeId]: true }));
+    try {
+      const data = await api<{ result: MerchantProductsMigrationResult }>(`/api/admin/stores/${storeId}/migrate-products`, {
+        method: 'POST',
+        body: JSON.stringify({
+          dsnKey,
+          stage: 'all',
+          dryRun
+        })
+      });
+      const r = data.result;
+      notify(
+        dryRun
+          ? `Dry-run OK: store=${r.storeId}, stage=${r.stage}, dsn=${r.dsnKey}`
+          : `Миграция OK: copy=${r.copiedRows}, verify=${r.verifiedRows}, cutover=${r.cutoverApplied ? 'yes' : 'no'}`
+      );
+    } catch (err) {
+      notify((err as Error).message);
+    } finally {
+      setAdminStoreMigrateLoading((prev) => ({ ...prev, [storeId]: false }));
+    }
+  }
+
   async function runAdminSearch(query: string) {
     const normalized = query.trim();
     if (normalized.length < 2) {
@@ -1381,6 +1610,14 @@ export default function App() {
       setOrders([]);
       setCart({ items: [], total: 0 });
       setOpenCourierOrders([]);
+      setMyStore(null);
+      setMyStoreProducts([]);
+      setStoreCouriers([]);
+      setMyStoreCourierLinks([]);
+      setAdminMerchantStores([]);
+      setAdminStoreLinksByStoreId({});
+      setAdminStoreDsnDrafts({});
+      setAdminStoreMigrateLoading({});
       return;
     }
 
@@ -1398,7 +1635,7 @@ export default function App() {
     if (!token) return;
     const interval = window.setInterval(() => {
       if (user?.role === 'customer') {
-        loadOrders().catch(() => undefined);
+        Promise.all([loadOrders(), loadMyStoreData()]).catch(() => undefined);
       }
       if (user?.role === 'courier') {
         Promise.all([loadCourierOrders(), loadOpenCourierOrders(), loadCourierHistory()]).catch(() => undefined);
@@ -1421,6 +1658,7 @@ export default function App() {
     loadCourierProfile().catch(() => undefined);
     loadAdminData().catch(() => undefined);
     loadWarehouseData().catch(() => undefined);
+    loadMyStoreData().catch(() => undefined);
   }, [user]);
 
   useEffect(() => {
@@ -1450,6 +1688,12 @@ export default function App() {
     }, 220);
     return () => clearTimeout(timer);
   }, [adminSearchQuery, user?.role, user?.permissions]);
+
+  useEffect(() => {
+    if (user?.role !== 'admin' || !isSystemAdmin) return;
+    if (adminTab !== 'merchants') return;
+    loadAdminMerchantStores().catch(() => undefined);
+  }, [user?.role, isSystemAdmin, adminTab, adminMerchantStatus]);
 
   useEffect(() => {
     if (!availableAdminTabs.length) return;
@@ -1670,7 +1914,8 @@ export default function App() {
       body: JSON.stringify({
         deliveryAddress: fullAddress,
         deliveryLat: payload.location?.lat ?? null,
-        deliveryLng: payload.location?.lng ?? null
+        deliveryLng: payload.location?.lng ?? null,
+        paymentMethod: checkoutPaymentMethod
       })
     });
     await Promise.all([loadCart(), loadOrders(), loadCourierOrders(), loadAdminData()]);
@@ -1775,6 +2020,31 @@ export default function App() {
     }
   }
 
+  async function revertToCustomerRole() {
+    if (!window.confirm('Вернуться к роли покупателя?')) return;
+    setRevertingToCustomer(true);
+    try {
+      const data = await api<{ message: string; token: string; user: User }>('/api/couriers/revert-to-customer', {
+        method: 'POST'
+      });
+      if (data.token) {
+        setToken(data.token);
+        localStorage.setItem('token', data.token);
+      }
+      setUser(data.user);
+      setCourierProfile(null);
+      setCourierOrders([]);
+      setOpenCourierOrders([]);
+      setCourierHistory([]);
+      await Promise.all([loadMe(), loadOrders(), loadCart(), loadMyStoreData()]);
+      notify(data.message || 'Роль изменена на покупателя');
+    } catch (err) {
+      notify((err as Error).message);
+    } finally {
+      setRevertingToCustomer(false);
+    }
+  }
+
   async function setOrderStatus(orderId: number, status: Status) {
     try {
       await api(`/api/orders/${orderId}/status`, {
@@ -1861,6 +2131,41 @@ export default function App() {
     }
   }
 
+  async function payMyOrder(orderId: number) {
+    setPayingOrderId(orderId);
+    try {
+      const idempotencyKey = `${orderId}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const data = await api<{
+        ok: boolean;
+        payment?: { providerPaymentId: string; status: string };
+        webhookTest?: {
+          headers: { 'x-webhook-signature': string };
+          body: Record<string, unknown>;
+        };
+      }>(`/api/orders/${orderId}/pay`, {
+        method: 'POST',
+        headers: { 'x-idempotency-key': idempotencyKey }
+      });
+
+      if (data.webhookTest) {
+        await api('/api/payments/webhook', {
+          method: 'POST',
+          headers: {
+            'x-webhook-signature': data.webhookTest.headers['x-webhook-signature']
+          },
+          body: JSON.stringify(data.webhookTest.body)
+        });
+      }
+
+      await Promise.all([loadOrders(), loadCourierOrders(), loadOpenCourierOrders(), loadAdminData()]);
+      notify('Оплата подтверждена');
+    } catch (err) {
+      notify((err as Error).message);
+    } finally {
+      setPayingOrderId(null);
+    }
+  }
+
   async function editMyOrder(order: Order) {
     if (order.status !== 'assembling' && order.status !== 'courier_assigned') {
       notify('Изменение доступно только на этапах "Собирается" или "Назначен курьер"');
@@ -1898,6 +2203,119 @@ export default function App() {
       notify((err as Error).message);
     } finally {
       setDeletingOrderId(null);
+    }
+  }
+
+  async function submitMyStore(e: FormEvent) {
+    e.preventDefault();
+    const name = storeForm.name.trim();
+    const phone = storeForm.phone.trim();
+    const logoUrl = storeForm.logoUrl.trim() || null;
+    const description = storeForm.description.trim() || null;
+    const hasLat = storeForm.lat.trim() !== '';
+    const hasLng = storeForm.lng.trim() !== '';
+    const lat = hasLat ? Number(storeForm.lat) : null;
+    const lng = hasLng ? Number(storeForm.lng) : null;
+
+    if (!name || !phone) {
+      notify('Укажите название точки и телефон');
+      return;
+    }
+    if (hasLat !== hasLng) {
+      notify('Координаты нужно указывать парой lat/lng');
+      return;
+    }
+    if (
+      (lat !== null && (!Number.isFinite(lat) || lat < -90 || lat > 90)) ||
+      (lng !== null && (!Number.isFinite(lng) || lng < -180 || lng > 180))
+    ) {
+      notify('Некорректные координаты точки');
+      return;
+    }
+
+    setStoreFormSubmitting(true);
+    try {
+      if (myStore) {
+        await api('/api/stores/my', {
+          method: 'PATCH',
+          body: JSON.stringify({ name, phone, logoUrl, description, lat, lng })
+        });
+      } else {
+        await api('/api/stores/my', {
+          method: 'POST',
+          body: JSON.stringify({ name, phone, logoUrl, description, lat, lng })
+        });
+      }
+      await loadMyStoreData();
+      notify('Точка сохранена и отправлена на одобрение главному администратору');
+    } catch (err) {
+      notify((err as Error).message);
+    } finally {
+      setStoreFormSubmitting(false);
+    }
+  }
+
+  async function createStoreProduct(e: FormEvent) {
+    e.preventDefault();
+    const name = storeProductForm.name.trim();
+    const description = storeProductForm.description.trim() || null;
+    const imageUrl = storeProductForm.imageUrl.trim() || null;
+    const price = Number(storeProductForm.price);
+    const stockQuantity = Math.max(0, Math.floor(Number(storeProductForm.stockQuantity || '0')));
+    if (!name || !Number.isFinite(price) || price <= 0) {
+      notify('Укажите корректные название и цену товара');
+      return;
+    }
+
+    setStoreProductSubmitting(true);
+    try {
+      await api('/api/stores/my/products', {
+        method: 'POST',
+        body: JSON.stringify({
+          name,
+          description,
+          imageUrl,
+          price,
+          stockQuantity,
+          inStock: stockQuantity > 0
+        })
+      });
+      await loadMyStoreData();
+      setStoreProductForm({ name: '', description: '', price: '', imageUrl: '', stockQuantity: '0' });
+      notify('Товар добавлен в каталог вашей точки');
+    } catch (err) {
+      notify((err as Error).message);
+    } finally {
+      setStoreProductSubmitting(false);
+    }
+  }
+
+  async function deleteStoreProduct(productId: number) {
+    if (!window.confirm('Удалить товар из каталога точки?')) return;
+    try {
+      await api(`/api/stores/my/products/${productId}`, { method: 'DELETE' });
+      await loadMyStoreData();
+      notify('Товар удален');
+    } catch (err) {
+      notify((err as Error).message);
+    }
+  }
+
+  async function requestStoreCourierLink() {
+    const courierId = Number(storeCourierIdDraft);
+    if (!courierId) {
+      notify('Выберите курьера');
+      return;
+    }
+    try {
+      await api('/api/stores/my/courier-links', {
+        method: 'POST',
+        body: JSON.stringify({ courierId })
+      });
+      await loadMyStoreData();
+      notify('Заявка отправлена главному администратору');
+    } catch (err) {
+      notify((err as Error).message);
     }
   }
 
@@ -2664,6 +3082,52 @@ export default function App() {
     }
   }
 
+  async function createWarehousePoint(e: FormEvent) {
+    e.preventDefault();
+    const code = warehouseCreateForm.code.trim().toUpperCase();
+    const name = warehouseCreateForm.name.trim();
+    const hasLat = warehouseCreateForm.lat.trim() !== '';
+    const hasLng = warehouseCreateForm.lng.trim() !== '';
+    const lat = hasLat ? Number(warehouseCreateForm.lat) : null;
+    const lng = hasLng ? Number(warehouseCreateForm.lng) : null;
+
+    if (!code || !name) {
+      notify('Укажите код и название точки');
+      return;
+    }
+    if (hasLat !== hasLng) {
+      notify('Координаты lat/lng нужно указывать парой');
+      return;
+    }
+    if (
+      (lat !== null && (!Number.isFinite(lat) || lat < -90 || lat > 90)) ||
+      (lng !== null && (!Number.isFinite(lng) || lng < -180 || lng > 180))
+    ) {
+      notify('Некорректные координаты точки');
+      return;
+    }
+
+    setWarehouseCreateSubmitting(true);
+    try {
+      await api('/api/admin/warehouses', {
+        method: 'POST',
+        body: JSON.stringify({
+          code,
+          name,
+          lat,
+          lng
+        })
+      });
+      await loadWarehouseData();
+      setWarehouseCreateForm({ code: '', name: '', lat: '', lng: '' });
+      notify('Точка создана');
+    } catch (err) {
+      notify((err as Error).message);
+    } finally {
+      setWarehouseCreateSubmitting(false);
+    }
+  }
+
   async function deleteWarehouseLocation() {
     const warehouseId = Number(warehousePointForm.warehouseId);
     if (!warehouseId) {
@@ -2931,6 +3395,18 @@ export default function App() {
                       </div>
                     ) : null}
                     <div className="inline-actions" style={{ marginTop: '8px' }}>
+                      <label>
+                        Способ оплаты:
+                        <select
+                          value={checkoutPaymentMethod}
+                          onChange={(e) => setCheckoutPaymentMethod((e.target.value as 'cash' | 'wallet') || 'wallet')}
+                        >
+                          <option value="wallet">Кошелёк (онлайн)</option>
+                          <option value="cash">Наличные</option>
+                        </select>
+                      </label>
+                    </div>
+                    <div className="inline-actions" style={{ marginTop: '8px' }}>
                       <button onClick={checkout} disabled={!quickAddress || deliveryQuoteLoading || deliveryQuote?.serviceable === false}>
                         Оформить за 1 клик
                       </button>
@@ -3053,10 +3529,158 @@ export default function App() {
                         Удалить
                       </button>
                     )}
+                    {order.status === 'received' && order.paymentMethod === 'wallet' ? (
+                      <button
+                        type="button"
+                        onClick={() => payMyOrder(order.id)}
+                        disabled={payingOrderId === order.id}
+                      >
+                        {payingOrderId === order.id ? 'Оплата...' : 'Оплатить'}
+                      </button>
+                    ) : null}
                   </div>
                 </div>
               ))}
             </section>
+        ) : null}
+
+        {loggedIn && user?.role === 'customer' ? (
+          <section className="panel">
+            <h2>Создать онлайн магазин</h2>
+            <form onSubmit={submitMyStore}>
+              <input
+                placeholder="Название магазина/точки"
+                value={storeForm.name}
+                onChange={(e) => setStoreForm((prev) => ({ ...prev, name: e.target.value }))}
+                required
+              />
+              <input
+                placeholder="Телефон точки"
+                value={storeForm.phone}
+                onChange={(e) => setStoreForm((prev) => ({ ...prev, phone: e.target.value }))}
+                required
+              />
+              <input
+                placeholder="Ссылка на логотип (опц.)"
+                value={storeForm.logoUrl}
+                onChange={(e) => setStoreForm((prev) => ({ ...prev, logoUrl: e.target.value }))}
+              />
+              <input
+                placeholder="Описание магазина (опц.)"
+                value={storeForm.description}
+                onChange={(e) => setStoreForm((prev) => ({ ...prev, description: e.target.value }))}
+              />
+              <input
+                type="number"
+                step="0.000001"
+                placeholder="Широта (опц.)"
+                value={storeForm.lat}
+                onChange={(e) => setStoreForm((prev) => ({ ...prev, lat: e.target.value }))}
+              />
+              <input
+                type="number"
+                step="0.000001"
+                placeholder="Долгота (опц.)"
+                value={storeForm.lng}
+                onChange={(e) => setStoreForm((prev) => ({ ...prev, lng: e.target.value }))}
+              />
+              <button type="submit" disabled={storeFormSubmitting}>
+                {storeFormSubmitting ? 'Сохраняем...' : myStore ? 'Обновить точку' : 'Создать онлайн магазин'}
+              </button>
+            </form>
+
+            {myStore ? (
+              <div className="row">
+                <strong>{myStore.name}</strong>
+                <div>Телефон: {myStore.phone}</div>
+                <div>
+                  Статус: <span className={`badge ${myStore.status}`}>{myStore.status === 'approved' ? 'Одобрена' : myStore.status === 'rejected' ? 'Отклонена' : 'На модерации'}</span>
+                </div>
+                {myStore.rejectionReason ? <div className="muted">Причина отклонения: {myStore.rejectionReason}</div> : null}
+                {myStore.logoUrl ? <img src={toSecureUrl(myStore.logoUrl)} alt="Логотип точки" style={{ width: '120px', borderRadius: '8px' }} /> : null}
+              </div>
+            ) : (
+              <p className="muted">Создайте точку и дождитесь разрешения главного администратора.</p>
+            )}
+
+            {myStore?.status === 'approved' ? (
+              <>
+                <div className="row">
+                  <strong>Карточки Товаров Вашей Точки</strong>
+                  <form onSubmit={createStoreProduct}>
+                    <input
+                      placeholder="Название товара"
+                      value={storeProductForm.name}
+                      onChange={(e) => setStoreProductForm((prev) => ({ ...prev, name: e.target.value }))}
+                      required
+                    />
+                    <input
+                      placeholder="Описание"
+                      value={storeProductForm.description}
+                      onChange={(e) => setStoreProductForm((prev) => ({ ...prev, description: e.target.value }))}
+                    />
+                    <input
+                      type="number"
+                      min="0.01"
+                      step="0.01"
+                      placeholder="Цена"
+                      value={storeProductForm.price}
+                      onChange={(e) => setStoreProductForm((prev) => ({ ...prev, price: e.target.value }))}
+                      required
+                    />
+                    <input
+                      placeholder="Ссылка на фото (опц.)"
+                      value={storeProductForm.imageUrl}
+                      onChange={(e) => setStoreProductForm((prev) => ({ ...prev, imageUrl: e.target.value }))}
+                    />
+                    <input
+                      type="number"
+                      min="0"
+                      step="1"
+                      placeholder="Остаток"
+                      value={storeProductForm.stockQuantity}
+                      onChange={(e) => setStoreProductForm((prev) => ({ ...prev, stockQuantity: e.target.value }))}
+                    />
+                    <button type="submit" disabled={storeProductSubmitting}>{storeProductSubmitting ? 'Добавляем...' : 'Добавить товар'}</button>
+                  </form>
+                  {myStoreProducts.length === 0 ? <div className="muted">Пока нет товаров в вашей точке.</div> : null}
+                  {myStoreProducts.map((product) => (
+                    <div className="row" key={`my-store-product-${product.id}`}>
+                      <strong>{product.name}</strong>
+                      <div>${product.price.toFixed(2)} | Остаток: {product.stockQuantity}</div>
+                      {product.description ? <div className="muted">{product.description}</div> : null}
+                      <div className="inline-actions">
+                        <button type="button" className="danger" onClick={() => deleteStoreProduct(product.id)}>Удалить</button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="row">
+                  <strong>Подключение К Курьерам</strong>
+                  <div className="inline-actions">
+                    <select value={storeCourierIdDraft} onChange={(e) => setStoreCourierIdDraft(Number(e.target.value))}>
+                      <option value={0}>Выберите курьера</option>
+                      {storeCouriers.map((c) => (
+                        <option key={`store-courier-${c.id}`} value={c.id}>
+                          #{c.id} {c.fullName} ({c.isOnline ? 'online' : 'offline'})
+                        </option>
+                      ))}
+                    </select>
+                    <button type="button" onClick={requestStoreCourierLink}>Запросить подключение</button>
+                  </div>
+                  {myStoreCourierLinks.length === 0 ? <div className="muted">Заявок на курьеров пока нет.</div> : null}
+                  {myStoreCourierLinks.map((link) => (
+                    <div className="row" key={`store-link-${link.id}`}>
+                      <div>Курьер: {link.courierName || `#${link.courierId}`}</div>
+                      <div className={`badge ${link.status}`}>{link.status === 'approved' ? 'Подключен' : link.status === 'rejected' ? 'Отклонено' : 'На модерации'}</div>
+                      {link.rejectionReason ? <div className="muted">Причина: {link.rejectionReason}</div> : null}
+                    </div>
+                  ))}
+                </div>
+              </>
+            ) : null}
+          </section>
         ) : null}
 
         {user?.role === 'courier' && (
@@ -3070,6 +3694,15 @@ export default function App() {
                 <div className="muted" style={{ color: '#d83434' }}>
                   Для получения заказов заполните данные транспорта, права/лицензию и загрузите фото техпаспорта.
                 </div>
+              ) : null}
+              {courierProfile?.canRevertToCustomer ? (
+                <div className="inline-actions">
+                  <button type="button" className="danger" onClick={revertToCustomerRole} disabled={revertingToCustomer}>
+                    {revertingToCustomer ? 'Переключаем...' : 'Назад в покупатели'}
+                  </button>
+                </div>
+              ) : courierProfile?.revertToCustomerReason ? (
+                <div className="muted">{courierProfile.revertToCustomerReason}</div>
               ) : null}
               <form onSubmit={submitCourierVerification}>
                 <input
@@ -3662,6 +4295,45 @@ export default function App() {
             {adminTab === 'warehouse' && hasAdminPermission('manage_warehouse') && (
               <div>
                 <h3>Склад</h3>
+                <div className="row">
+                  <strong>Создать точку</strong>
+                  <form onSubmit={createWarehousePoint}>
+                    <input
+                      placeholder="Код (например: POINT_A)"
+                      value={warehouseCreateForm.code}
+                      onChange={(e) => setWarehouseCreateForm((prev) => ({ ...prev, code: e.target.value }))}
+                      required
+                    />
+                    <input
+                      placeholder="Название точки"
+                      value={warehouseCreateForm.name}
+                      onChange={(e) => setWarehouseCreateForm((prev) => ({ ...prev, name: e.target.value }))}
+                      required
+                    />
+                    <input
+                      type="number"
+                      step="0.000001"
+                      placeholder="lat (опц.)"
+                      value={warehouseCreateForm.lat}
+                      onChange={(e) => setWarehouseCreateForm((prev) => ({ ...prev, lat: e.target.value }))}
+                    />
+                    <input
+                      type="number"
+                      step="0.000001"
+                      placeholder="lng (опц.)"
+                      value={warehouseCreateForm.lng}
+                      onChange={(e) => setWarehouseCreateForm((prev) => ({ ...prev, lng: e.target.value }))}
+                    />
+                    <button type="submit" disabled={warehouseCreateSubmitting || (!isSystemAdmin && warehouseOverview.warehouses.length >= 1)}>
+                      {warehouseCreateSubmitting ? 'Создаём...' : 'Создать точку'}
+                    </button>
+                  </form>
+                  {!isSystemAdmin ? (
+                    <div className="muted">
+                      Для обычного администратора доступна только одна собственная точка.
+                    </div>
+                  ) : null}
+                </div>
                 <div className="cards">
                   <div className="card">
                     <div className="card-content">
@@ -3692,6 +4364,7 @@ export default function App() {
                     </div>
                   </div>
                 </div>
+                {warehouseOverview.warehouses.length > 0 ? (
                 <div className="row">
                   <strong>Точка склада на карте</strong>
                   <form onSubmit={saveWarehouseLocation}>
@@ -3755,7 +4428,13 @@ export default function App() {
                     Координаты синхронизируются в обе БД: складская логика и карта.
                   </div>
                 </div>
+                ) : (
+                  <div className="row">
+                    <div className="muted">У вас пока нет доступных точек. Сначала создайте точку выше.</div>
+                  </div>
+                )}
 
+                {warehouseOverview.warehouses.length > 0 ? (
                 <div className="row">
                   <strong>Складская операция</strong>
                   <form onSubmit={submitStockMovement} ref={warehouseOperationFormRef}>
@@ -3854,6 +4533,7 @@ export default function App() {
                     </button>
                   </form>
                 </div>
+                ) : null}
 
                 <div className="row">
                   <strong>Автопополнение (ниже минимума)</strong>
@@ -4403,6 +5083,122 @@ export default function App() {
                       <button type="button" onClick={() => adminReviewCourier(courier.id, 'approved')}>Подтвердить</button>
                       <button type="button" className="danger" onClick={() => adminReviewCourier(courier.id, 'rejected')}>Отклонить</button>
                     </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {adminTab === 'merchants' && isSystemAdmin && (
+              <div>
+                <h3>Модерация Точек Продавцов</h3>
+                <div className="inline-actions">
+                  <label>
+                    Статус:
+                    <select value={adminMerchantStatus} onChange={(e) => setAdminMerchantStatus(e.target.value as 'pending' | 'approved' | 'rejected')}>
+                      <option value="pending">На модерации</option>
+                      <option value="approved">Одобренные</option>
+                      <option value="rejected">Отклоненные</option>
+                    </select>
+                  </label>
+                  <button type="button" onClick={() => loadAdminMerchantStores().catch((e: Error) => notify(e.message))}>
+                    Обновить
+                  </button>
+                </div>
+
+                {adminMerchantStores.length === 0 ? <p className="muted">Точек с выбранным статусом пока нет.</p> : null}
+                {adminMerchantStores.map((store) => (
+                  <div className="row" key={`merchant-store-${store.id}`}>
+                    <strong>#{store.id} {store.name}</strong>
+                    <div>Владелец: {store.ownerName || '-'} ({store.ownerEmail || '-'})</div>
+                    <div>Телефон: {store.phone}</div>
+                    <div>Координаты: {store.lat ?? '-'}, {store.lng ?? '-'}</div>
+                    <div>
+                      Статус: <span className={`badge ${store.status}`}>{store.status === 'approved' ? 'Одобрена' : store.status === 'rejected' ? 'Отклонена' : 'На модерации'}</span>
+                    </div>
+                    {store.rejectionReason ? <div className="muted">Причина отказа: {store.rejectionReason}</div> : null}
+                    <input
+                      placeholder="Комментарий (причина отклонения)"
+                      value={adminStoreReviewNotes[store.id] || ''}
+                      onChange={(e) => setAdminStoreReviewNotes((prev) => ({ ...prev, [store.id]: e.target.value }))}
+                    />
+                    <div className="inline-actions">
+                      <button type="button" onClick={() => reviewAdminMerchantStore(store.id, 'approved').catch((e: Error) => notify(e.message))}>
+                        Одобрить
+                      </button>
+                      <button type="button" className="danger" onClick={() => reviewAdminMerchantStore(store.id, 'rejected').catch((e: Error) => notify(e.message))}>
+                        Отклонить
+                      </button>
+                      <button type="button" onClick={() => loadAdminStoreCourierLinks(store.id).catch((e: Error) => notify(e.message))}>
+                        Заявки на курьеров
+                      </button>
+                    </div>
+                    <div className="inline-actions">
+                      <input
+                        placeholder="dsnKey (например STORE_42)"
+                        value={adminStoreDsnDrafts[store.id] || ''}
+                        onChange={(e) =>
+                          setAdminStoreDsnDrafts((prev) => ({
+                            ...prev,
+                            [store.id]: e.target.value
+                          }))
+                        }
+                      />
+                      <button
+                        type="button"
+                        onClick={() => migrateAdminStoreProducts(store.id, true)}
+                        disabled={Boolean(adminStoreMigrateLoading[store.id])}
+                      >
+                        {adminStoreMigrateLoading[store.id] ? 'Проверка...' : 'Dry run'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => migrateAdminStoreProducts(store.id, false)}
+                        disabled={Boolean(adminStoreMigrateLoading[store.id])}
+                      >
+                        {adminStoreMigrateLoading[store.id] ? 'Миграция...' : 'Мигрировать товары'}
+                      </button>
+                    </div>
+
+                    {(adminStoreLinksByStoreId[store.id] || []).length > 0 ? (
+                      <div className="row">
+                        <strong>Курьеры точки</strong>
+                        {(adminStoreLinksByStoreId[store.id] || []).map((link) => (
+                          <div className="row" key={`merchant-store-${store.id}-link-${link.id}`}>
+                            <div>
+                              Курьер: {link.courierName || `#${link.courierId}`} ({link.courierEmail || '-'})
+                            </div>
+                            <div className={`badge ${link.status}`}>
+                              {link.status === 'approved' ? 'Подключен' : link.status === 'rejected' ? 'Отклонен' : 'На модерации'}
+                            </div>
+                            <input
+                              placeholder="Причина отклонения (опц.)"
+                              value={adminCourierReviewNotes[`${store.id}:${link.id}`] || ''}
+                              onChange={(e) =>
+                                setAdminCourierReviewNotes((prev) => ({
+                                  ...prev,
+                                  [`${store.id}:${link.id}`]: e.target.value
+                                }))
+                              }
+                            />
+                            <div className="inline-actions">
+                              <button
+                                type="button"
+                                onClick={() => reviewAdminStoreCourierLink(store.id, link.id, 'approved').catch((e: Error) => notify(e.message))}
+                              >
+                                Подключить
+                              </button>
+                              <button
+                                type="button"
+                                className="danger"
+                                onClick={() => reviewAdminStoreCourierLink(store.id, link.id, 'rejected').catch((e: Error) => notify(e.message))}
+                              >
+                                Отклонить
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    ) : null}
                   </div>
                 ))}
               </div>
