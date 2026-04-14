@@ -56,6 +56,51 @@ const CUSTOMER_EDITABLE_STATUSES: OrderStatus[] = [ORDER_STATUS.assembling, ORDE
 const MAX_UPLOAD_FILE_SIZE_BYTES = 12 * 1024 * 1024; // увеличили лимит до 12 МБ для мобильных фото
 
 const app = express();
+
+class HttpError extends Error {
+  statusCode: number;
+  exposeMessage: boolean;
+
+  constructor(statusCode: number, message: string, opts?: { exposeMessage?: boolean }) {
+    super(message);
+    this.name = 'HttpError';
+    this.statusCode = Math.max(400, Math.min(599, Math.floor(Number(statusCode) || 500)));
+    this.exposeMessage = opts?.exposeMessage ?? this.statusCode < 500;
+  }
+}
+
+function wrapAsyncHandler(handler: any) {
+  if (typeof handler !== 'function') return handler;
+  if (handler.length === 4) return handler;
+  return function wrappedHandler(req: express.Request, res: express.Response, next: express.NextFunction) {
+    try {
+      const maybePromise = handler(req, res, next);
+      if (maybePromise && typeof maybePromise.then === 'function') {
+        void maybePromise.catch(next);
+      }
+    } catch (error) {
+      next(error);
+    }
+  };
+}
+
+function wrapRouteArg(arg: any): any {
+  if (Array.isArray(arg)) return arg.map((item) => wrapRouteArg(item));
+  return wrapAsyncHandler(arg);
+}
+
+function patchAsyncRouteErrorHandling(targetApp: express.Application) {
+  const methods = ['use', 'all', 'get', 'post', 'put', 'patch', 'delete', 'options', 'head'] as const;
+  for (const method of methods) {
+    const original = (targetApp as any)[method].bind(targetApp);
+    (targetApp as any)[method] = (...args: any[]) => {
+      return original(...args.map((arg: any) => wrapRouteArg(arg)));
+    };
+  }
+}
+
+patchAsyncRouteErrorHandling(app);
+
 const db: Pool = connectDb(DATABASE_URL);
 const mapDb: Pool = connectDb(MAP_DATABASE_URL);
 const tenantDbResolver = new TenantDbResolver(db);
@@ -159,6 +204,8 @@ function publicUser(user: DbUser): PublicUser {
     isActive: user.is_active,
     permissions: user.permissions,
     warehouseScopes: user.warehouse_scopes,
+    emailVerifiedAt: user.email_verified_at ?? null,
+    phoneVerifiedAt: user.phone_verified_at ?? null,
     createdAt: user.created_at
   };
 }
@@ -191,6 +238,8 @@ function normalizeUserRow(row: any): DbUser {
       ? row.permissions.map((p: unknown) => String(p))
       : [],
     warehouse_scopes: parseWarehouseScopes(row.warehouse_scopes),
+    email_verified_at: row.email_verified_at ? toDateString(row.email_verified_at) : null,
+    phone_verified_at: row.phone_verified_at ? toDateString(row.phone_verified_at) : null,
     created_at: toDateString(row.created_at)
   };
 }
@@ -242,6 +291,32 @@ function normalizeMerchantCourierLinkStatus(value: unknown): MerchantCourierLink
   return 'pending';
 }
 
+function normalizeVerificationChannel(value: unknown): 'email' | 'phone' | null {
+  const raw = String(value || '').trim().toLowerCase();
+  if (raw === 'email') return 'email';
+  if (raw === 'phone') return 'phone';
+  return null;
+}
+
+function generateVerificationCode() {
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+function normalizeTin(value: unknown) {
+  return String(value || '')
+    .trim()
+    .replace(/\s+/g, '');
+}
+
+function isValidTin(value: string) {
+  return /^\d{9,14}$/.test(value);
+}
+
+function isLikelyDocumentUrl(value: string) {
+  if (!value) return false;
+  return /^(\/uploads\/|https?:\/\/)/i.test(value);
+}
+
 function merchantStoreView(row: any) {
   return {
     id: toNumber(row.id),
@@ -250,6 +325,8 @@ function merchantStoreView(row: any) {
     logoUrl: row.logo_url ?? null,
     phone: String(row.phone),
     description: row.description ?? null,
+    tin: row.tin ?? null,
+    legalDocumentUrl: row.legal_document_url ?? null,
     lat: row.lat === null ? null : Number(row.lat),
     lng: row.lng === null ? null : Number(row.lng),
     status: normalizeMerchantStoreStatus(row.status),
@@ -269,6 +346,7 @@ function merchantProductView(row: any) {
     description: row.description ?? null,
     price: Number(row.price),
     imageUrl: row.image_url ?? null,
+    unit: row.unit ?? 'шт',
     inStock: row.in_stock !== false,
     stockQuantity: toNumber(row.stock_quantity ?? 0),
     createdAt: toDateString(row.created_at),
@@ -361,7 +439,7 @@ async function getWarehouseIdByCode(client: Pool | PoolClient, code: string | nu
 }
 
 async function findAvailablePickerId(client: Pool | PoolClient, warehouseId: number | null) {
-  // Выбираем активного сборщика с наименьшим числом активных задач
+  // Выбираем только свободного сборщика (без активных задач)
   const rows = (
     await client.query(
       `
@@ -374,7 +452,9 @@ async function findAvailablePickerId(client: Pool | PoolClient, warehouseId: num
           WHERE status IN ('new','in_progress')
           GROUP BY assigned_to
         ) active_tasks ON active_tasks.picker_id = u.id
-        WHERE u.role = 'picker' AND u.is_active = TRUE
+        WHERE u.role = 'picker'
+          AND u.is_active = TRUE
+          AND COALESCE(active_tasks.count, 0) = 0
         ORDER BY active_tasks.count ASC, u.id ASC
         LIMIT 1
       `
@@ -382,6 +462,28 @@ async function findAvailablePickerId(client: Pool | PoolClient, warehouseId: num
   ).rows;
   if (!rows.length) return null;
   return toNumber(rows[0].id);
+}
+
+async function pickerHasAnotherActiveTask(
+  client: Pool | PoolClient,
+  pickerId: number,
+  opts: { excludeTaskId?: number | null } = {}
+) {
+  const excludeTaskId = opts.excludeTaskId ? Number(opts.excludeTaskId) : null;
+  const row = (
+    await client.query(
+      `
+        SELECT id
+        FROM pick_tasks
+        WHERE assigned_to = $1
+          AND status IN ('new', 'in_progress')
+          AND ($2::bigint IS NULL OR id <> $2::bigint)
+        LIMIT 1
+      `,
+      [pickerId, excludeTaskId]
+    )
+  ).rows[0];
+  return row ? toNumber(row.id) : null;
 }
 
 async function createPickTaskInternal(
@@ -419,7 +521,14 @@ async function createPickTaskInternal(
     )
   ).rows;
   if (!items.length) {
-    throw new Error('У заказа нет позиций для сборки');
+    throw new HttpError(400, 'У заказа нет позиций для сборки');
+  }
+
+  if (assignedTo) {
+    const conflictTaskId = await pickerHasAnotherActiveTask(client, assignedTo);
+    if (conflictTaskId) {
+      throw new HttpError(409, `У сборщика уже есть активная задача #${conflictTaskId}`);
+    }
   }
 
   const taskRow = (
@@ -451,7 +560,7 @@ async function createPickTaskInternal(
     ).rows[0];
     const available = Math.max(toNumber(stock?.quantity ?? 0) - toNumber(stock?.reserved_quantity ?? 0), 0);
     if (available < requestedQty) {
-      throw new Error(`Недостаточно остатка для товара "${String(item.product_name)}". Нужно: ${requestedQty}, доступно: ${available}`);
+      throw new HttpError(400, `Недостаточно остатка для товара "${String(item.product_name)}". Нужно: ${requestedQty}, доступно: ${available}`);
     }
 
     await client.query(
@@ -786,6 +895,34 @@ async function tryAssignOldestPendingOrder() {
   return assignCourierIfPossible(toNumber(pendingRow.id));
 }
 
+async function assignPickTaskIfPossible(taskId: number) {
+  const taskRow = (await db.query('SELECT warehouse_id FROM pick_tasks WHERE id = $1 AND assigned_to IS NULL LIMIT 1', [taskId])).rows[0];
+  if (!taskRow) return null;
+
+  const warehouseId = toNumber(taskRow.warehouse_id);
+  const pickerId = await findAvailablePickerId(db, warehouseId);
+  if (!pickerId) return null;
+
+  await db.query('UPDATE pick_tasks SET assigned_to = $1, status = $2 WHERE id = $3', [pickerId, 'in_progress', taskId]);
+  return pickerId;
+}
+
+async function tryAssignOldestPendingPickTask() {
+  const pendingRow = (await db.query(
+    `
+      SELECT id
+      FROM pick_tasks
+      WHERE assigned_to IS NULL
+        AND status = 'new'
+      ORDER BY id ASC
+      LIMIT 1
+    `
+  )).rows[0];
+
+  if (!pendingRow) return null;
+  return assignPickTaskIfPossible(toNumber(pendingRow.id));
+}
+
 async function getDefaultWarehouseId(client: Pool | PoolClient) {
   const row = (await client.query("SELECT id FROM warehouses WHERE code = 'MAIN' LIMIT 1")).rows[0];
   if (row) return toNumber(row.id);
@@ -878,6 +1015,7 @@ function normalizeProductRow(row: any) {
     price: Number(row.price),
     category: row.category,
     imageUrl: row.image_url,
+    unit: row.unit ?? 'шт',
     inStock: Boolean(row.in_stock),
     stockQuantity: Math.max(0, toNumber(row.stock_quantity ?? 0)),
     homeWarehouseId: row.home_warehouse_id === null || row.home_warehouse_id === undefined ? null : toNumber(row.home_warehouse_id)
@@ -1767,23 +1905,110 @@ app.put('/api/users/me', authRequired(JWT_SECRET), async (req, res) => {
   if (!user) return res.status(404).json({ message: 'Пользователь не найден' });
   if (!user.is_active) return res.status(403).json({ message: 'Аккаунт заблокирован администратором' });
 
+  const nextPhone = phone === undefined ? user.phone : phone;
+  const phoneChanged = nextPhone !== user.phone;
   const updated = await db.query(
     `
       UPDATE users
-      SET full_name = $1, phone = $2, address = $3
+      SET full_name = $1,
+          phone = $2,
+          address = $3,
+          phone_verified_at = CASE WHEN $5 THEN NULL ELSE phone_verified_at END
       WHERE id = $4
       RETURNING *
     `,
-    [fullName?.trim() || user.full_name, phone === undefined ? user.phone : phone, address === undefined ? user.address : address, user.id]
+    [fullName?.trim() || user.full_name, nextPhone, address === undefined ? user.address : address, user.id, phoneChanged]
   );
 
   return res.json({ user: publicUser(normalizeUserRow(updated.rows[0])) });
+});
+
+app.post('/api/users/me/verification/request', authRequired(JWT_SECRET), async (req, res) => {
+  const body = req.body as { channel?: 'email' | 'phone' };
+  const channel = normalizeVerificationChannel(body.channel);
+  if (!channel) return res.status(400).json({ message: 'channel должен быть email или phone' });
+
+  const user = await getUserById(req.user!.id);
+  if (!user) return res.status(404).json({ message: 'Пользователь не найден' });
+  if (channel === 'phone' && (!user.phone || !String(user.phone).trim())) {
+    return res.status(400).json({ message: 'Сначала укажите номер телефона в профиле' });
+  }
+
+  const code = generateVerificationCode();
+  const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+  await db.query(
+    `
+      INSERT INTO user_verification_codes (user_id, channel, purpose, code, expires_at)
+      VALUES ($1, $2, 'store_onboarding', $3, $4)
+    `,
+    [user.id, channel, code, expiresAt.toISOString()]
+  );
+
+  return res.json({
+    message:
+      channel === 'email'
+        ? 'Код подтверждения email создан (dev-режим: код возвращен в ответе)'
+        : 'Код подтверждения телефона создан (dev-режим: код возвращен в ответе)',
+    channel,
+    expiresAt: expiresAt.toISOString(),
+    code
+  });
+});
+
+app.post('/api/users/me/verification/confirm', authRequired(JWT_SECRET), async (req, res) => {
+  const body = req.body as { channel?: 'email' | 'phone'; code?: string };
+  const channel = normalizeVerificationChannel(body.channel);
+  const code = String(body.code || '').trim();
+  if (!channel) return res.status(400).json({ message: 'channel должен быть email или phone' });
+  if (!/^\d{6}$/.test(code)) return res.status(400).json({ message: 'Код должен состоять из 6 цифр' });
+
+  const verificationRow = (
+    await db.query(
+      `
+        SELECT id
+        FROM user_verification_codes
+        WHERE user_id = $1
+          AND channel = $2
+          AND purpose = 'store_onboarding'
+          AND code = $3
+          AND used_at IS NULL
+          AND expires_at > NOW()
+        ORDER BY id DESC
+        LIMIT 1
+      `,
+      [req.user!.id, channel, code]
+    )
+  ).rows[0];
+  if (!verificationRow) return res.status(400).json({ message: 'Неверный или просроченный код подтверждения' });
+
+  await db.query('UPDATE user_verification_codes SET used_at = NOW() WHERE id = $1', [toNumber(verificationRow.id)]);
+  if (channel === 'email') {
+    await db.query('UPDATE users SET email_verified_at = NOW() WHERE id = $1', [req.user!.id]);
+  } else {
+    await db.query('UPDATE users SET phone_verified_at = NOW() WHERE id = $1', [req.user!.id]);
+  }
+
+  const updatedUser = await getUserById(req.user!.id);
+  if (!updatedUser) return res.status(404).json({ message: 'Пользователь не найден' });
+  return res.json({ message: `${channel === 'email' ? 'Email' : 'Телефон'} подтвержден`, user: publicUser(updatedUser) });
 });
 
 app.post('/api/stores/uploads/logo', authRequired(JWT_SECRET), roleRequired('customer'), upload.single('image'), async (req, res) => {
   const file = req.file;
   if (!file) return res.status(400).json({ message: 'Файл логотипа обязателен' });
   return res.status(201).json({ logoUrl: `/uploads/${file.filename}` });
+});
+
+app.post('/api/stores/uploads/kyc-document', authRequired(JWT_SECRET), roleRequired('customer'), upload.single('image'), async (req, res) => {
+  const file = req.file;
+  if (!file) return res.status(400).json({ message: 'Файл документа обязателен' });
+  return res.status(201).json({ documentUrl: `/uploads/${file.filename}` });
+});
+
+app.post('/api/stores/uploads/product-image', authRequired(JWT_SECRET), roleRequired('customer'), upload.single('image'), async (req, res) => {
+  const file = req.file;
+  if (!file) return res.status(400).json({ message: 'Файл изображения товара обязателен' });
+  return res.status(201).json({ imageUrl: `/uploads/${file.filename}` });
 });
 
 app.get('/api/stores/my', authRequired(JWT_SECRET), roleRequired('customer'), async (req, res) => {
@@ -1796,11 +2021,28 @@ app.post('/api/stores/my', authRequired(JWT_SECRET), roleRequired('customer'), a
   const existing = await getMerchantStoreByOwner(req.user!.id);
   if (existing) return res.status(409).json({ message: 'У вас уже есть точка. Можно редактировать существующую.' });
 
-  const body = req.body as { name?: string; logoUrl?: string; phone?: string; description?: string; lat?: number; lng?: number };
+  const owner = await getUserById(req.user!.id);
+  if (!owner) return res.status(404).json({ message: 'Пользователь не найден' });
+  if (!owner.email_verified_at || !owner.phone_verified_at) {
+    return res.status(403).json({ message: 'Перед созданием магазина подтвердите email и телефон' });
+  }
+
+  const body = req.body as {
+    name?: string;
+    logoUrl?: string;
+    phone?: string;
+    description?: string;
+    tin?: string;
+    legalDocumentUrl?: string;
+    lat?: number;
+    lng?: number;
+  };
   const name = String(body.name || '').trim();
   const logoUrl = String(body.logoUrl || '').trim() || null;
   const phone = String(body.phone || '').trim();
   const description = String(body.description || '').trim() || null;
+  const tin = normalizeTin(body.tin);
+  const legalDocumentUrl = String(body.legalDocumentUrl || '').trim();
   const lat = body.lat === undefined || body.lat === null ? null : Number(body.lat);
   const lng = body.lng === undefined || body.lng === null ? null : Number(body.lng);
 
@@ -1809,6 +2051,12 @@ app.post('/api/stores/my', authRequired(JWT_SECRET), roleRequired('customer'), a
   }
   if (!phone || phone.length < 5 || phone.length > 30) {
     return res.status(400).json({ message: 'Укажите корректный номер телефона точки' });
+  }
+  if (!isValidTin(tin)) {
+    return res.status(400).json({ message: 'Укажите корректный ИНН (9-14 цифр)' });
+  }
+  if (!isLikelyDocumentUrl(legalDocumentUrl)) {
+    return res.status(400).json({ message: 'Загрузите документ KYC (ссылка на файл обязательна)' });
   }
   if ((lat === null) !== (lng === null)) {
     return res.status(400).json({ message: 'Координаты lat/lng должны передаваться парой' });
@@ -1824,12 +2072,12 @@ app.post('/api/stores/my', authRequired(JWT_SECRET), roleRequired('customer'), a
     await db.query(
       `
         INSERT INTO merchant_stores (
-          owner_user_id, name, logo_url, phone, description, lat, lng, status
+          owner_user_id, name, logo_url, phone, description, tin, legal_document_url, lat, lng, status
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending')
         RETURNING *
       `,
-      [req.user!.id, name, logoUrl, phone, description, lat, lng]
+      [req.user!.id, name, logoUrl, phone, description, tin, legalDocumentUrl, lat, lng]
     )
   ).rows[0];
   await tenantDbResolver.ensureStoreRouting(toNumber(created.id));
@@ -1844,11 +2092,29 @@ app.patch('/api/stores/my', authRequired(JWT_SECRET), roleRequired('customer'), 
   const store = await getMerchantStoreByOwner(req.user!.id);
   if (!store) return res.status(404).json({ message: 'Сначала создайте свою точку' });
 
-  const body = req.body as { name?: string; logoUrl?: string; phone?: string; description?: string; lat?: number | null; lng?: number | null };
+  const owner = await getUserById(req.user!.id);
+  if (!owner) return res.status(404).json({ message: 'Пользователь не найден' });
+  if (!owner.email_verified_at || !owner.phone_verified_at) {
+    return res.status(403).json({ message: 'Перед отправкой на модерацию подтвердите email и телефон' });
+  }
+
+  const body = req.body as {
+    name?: string;
+    logoUrl?: string;
+    phone?: string;
+    description?: string;
+    tin?: string;
+    legalDocumentUrl?: string;
+    lat?: number | null;
+    lng?: number | null;
+  };
   const nextName = body.name !== undefined ? String(body.name).trim() : String(store.name);
   const nextLogoUrl = body.logoUrl !== undefined ? (String(body.logoUrl || '').trim() || null) : store.logo_url;
   const nextPhone = body.phone !== undefined ? String(body.phone).trim() : String(store.phone);
   const nextDescription = body.description !== undefined ? (String(body.description || '').trim() || null) : store.description;
+  const nextTin = body.tin !== undefined ? normalizeTin(body.tin) : normalizeTin(store.tin);
+  const nextLegalDocumentUrl =
+    body.legalDocumentUrl !== undefined ? String(body.legalDocumentUrl || '').trim() : String(store.legal_document_url || '');
   const nextLat = body.lat !== undefined ? (body.lat === null ? null : Number(body.lat)) : (store.lat === null ? null : Number(store.lat));
   const nextLng = body.lng !== undefined ? (body.lng === null ? null : Number(body.lng)) : (store.lng === null ? null : Number(store.lng));
 
@@ -1857,6 +2123,12 @@ app.patch('/api/stores/my', authRequired(JWT_SECRET), roleRequired('customer'), 
   }
   if (!nextPhone || nextPhone.length < 5 || nextPhone.length > 30) {
     return res.status(400).json({ message: 'Укажите корректный номер телефона точки' });
+  }
+  if (!isValidTin(nextTin)) {
+    return res.status(400).json({ message: 'Укажите корректный ИНН (9-14 цифр)' });
+  }
+  if (!isLikelyDocumentUrl(nextLegalDocumentUrl)) {
+    return res.status(400).json({ message: 'Загрузите документ KYC (ссылка на файл обязательна)' });
   }
   if ((nextLat === null) !== (nextLng === null)) {
     return res.status(400).json({ message: 'Координаты lat/lng должны передаваться парой' });
@@ -1877,16 +2149,18 @@ app.patch('/api/stores/my', authRequired(JWT_SECRET), roleRequired('customer'), 
           logo_url = $2,
           phone = $3,
           description = $4,
-          lat = $5,
-          lng = $6,
+          tin = $5,
+          legal_document_url = $6,
+          lat = $7,
+          lng = $8,
           status = 'pending',
           approved_by_admin_id = NULL,
           approved_at = NULL,
           rejection_reason = NULL
-        WHERE id = $7
+        WHERE id = $9
         RETURNING *
       `,
-      [nextName, nextLogoUrl, nextPhone, nextDescription, nextLat, nextLng, toNumber(store.id)]
+      [nextName, nextLogoUrl, nextPhone, nextDescription, nextTin, nextLegalDocumentUrl, nextLat, nextLng, toNumber(store.id)]
     )
   ).rows[0];
 
@@ -1925,7 +2199,7 @@ app.post('/api/stores/my/products', authRequired(JWT_SECRET), roleRequired('cust
     return res.status(403).json({ message: 'Добавление товаров доступно после одобрения точки главным администратором' });
   }
 
-  const body = req.body as { name?: string; description?: string; price?: number; imageUrl?: string; inStock?: boolean; stockQuantity?: number };
+  const body = req.body as { name?: string; description?: string; price?: number; imageUrl?: string; unit?: string; inStock?: boolean; stockQuantity?: number };
   const name = String(body.name || '').trim();
   const description = String(body.description || '').trim() || null;
   const imageUrl = String(body.imageUrl || '').trim() || null;
@@ -1944,11 +2218,11 @@ app.post('/api/stores/my/products', authRequired(JWT_SECRET), roleRequired('cust
   const created = (
     await tenantPool.query(
       `
-        INSERT INTO merchant_products (store_id, name, description, price, image_url, in_stock, stock_quantity)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        INSERT INTO merchant_products (store_id, name, description, price, image_url, unit, in_stock, stock_quantity)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         RETURNING *
       `,
-      [toNumber(store.id), name, description, round2(price), imageUrl, inStock, stockQuantity]
+      [toNumber(store.id), name, description, round2(price), imageUrl, body.unit?.trim() || 'шт', inStock, stockQuantity]
     )
   ).rows[0];
 
@@ -1979,10 +2253,11 @@ app.put('/api/stores/my/products/:productId', authRequired(JWT_SECRET), roleRequ
   ).rows[0];
   if (!existing) return res.status(404).json({ message: 'Товар точки не найден' });
 
-  const body = req.body as { name?: string; description?: string; price?: number; imageUrl?: string; inStock?: boolean; stockQuantity?: number };
+  const body = req.body as { name?: string; description?: string; price?: number; imageUrl?: string; unit?: string; inStock?: boolean; stockQuantity?: number };
   const nextName = body.name !== undefined ? String(body.name).trim() : String(existing.name);
   const nextDescription = body.description !== undefined ? (String(body.description || '').trim() || null) : existing.description;
   const nextImageUrl = body.imageUrl !== undefined ? (String(body.imageUrl || '').trim() || null) : existing.image_url;
+  const nextUnit = body.unit !== undefined ? String(body.unit || '').trim() || 'шт' : String(existing.unit || 'шт').trim() || 'шт';
   const nextPrice = body.price !== undefined ? Number(body.price) : Number(existing.price);
   const nextStockQuantity = body.stockQuantity !== undefined ? Math.max(0, Math.floor(Number(body.stockQuantity))) : toNumber(existing.stock_quantity);
   const nextInStock = body.inStock !== undefined ? Boolean(body.inStock) && nextStockQuantity > 0 : (existing.in_stock !== false && nextStockQuantity > 0);
@@ -2003,12 +2278,13 @@ app.put('/api/stores/my/products/:productId', authRequired(JWT_SECRET), roleRequ
           description = $2,
           price = $3,
           image_url = $4,
-          in_stock = $5,
-          stock_quantity = $6
-        WHERE id = $7
+          unit = $5,
+          in_stock = $6,
+          stock_quantity = $7
+        WHERE id = $8
         RETURNING *
       `,
-      [nextName, nextDescription, round2(nextPrice), nextImageUrl, nextInStock, nextStockQuantity, productId]
+      [nextName, nextDescription, round2(nextPrice), nextImageUrl, nextUnit, nextInStock, nextStockQuantity, productId]
     )
   ).rows[0];
 
@@ -2118,7 +2394,7 @@ app.post('/api/stores/my/courier-links', authRequired(JWT_SECRET), roleRequired(
   return res.status(201).json({ link: merchantCourierLinkView(created), message: 'Заявка на подключение курьера отправлена главному администратору' });
 });
 
-app.get('/api/products', async (_req, res) => {
+app.get('/api/products', authRequired(JWT_SECRET), roleRequired('customer', 'courier', 'admin'), async (req, res) => {
   const rows = (await db.query('SELECT * FROM products WHERE in_stock = TRUE AND stock_quantity > 0 ORDER BY id DESC')).rows;
   res.json({ products: rows.map((row: any) => normalizeProductRow(row)) });
 });
@@ -2385,6 +2661,7 @@ app.post('/api/admin/products', authRequired(JWT_SECRET), roleRequired('admin'),
     price?: number;
     category?: string;
     imageUrl?: string;
+    unit?: string;
     inStock?: boolean;
     stockQuantity?: number;
     warehouseId?: number;
@@ -2412,8 +2689,8 @@ app.post('/api/admin/products', authRequired(JWT_SECRET), roleRequired('admin'),
 
   const created = await db.query(
     `
-      INSERT INTO products (name, description, price, category, image_url, in_stock, stock_quantity, home_warehouse_id)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      INSERT INTO products (name, description, price, category, image_url, unit, in_stock, stock_quantity, home_warehouse_id)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
       RETURNING *
     `,
     [
@@ -2422,6 +2699,7 @@ app.post('/api/admin/products', authRequired(JWT_SECRET), roleRequired('admin'),
       price,
       categoryPath || null,
       body.imageUrl?.trim() || null,
+      body.unit?.trim() || 'шт',
       stockQuantity > 0 && (body.inStock !== undefined ? Boolean(body.inStock) : true),
       stockQuantity,
       warehouseId
@@ -2458,6 +2736,7 @@ app.put('/api/admin/products/:productId', authRequired(JWT_SECRET), roleRequired
     price?: number;
     category?: string;
     imageUrl?: string;
+    unit?: string;
     inStock?: boolean;
     stockQuantity?: number;
     warehouseId?: number;
@@ -2471,6 +2750,8 @@ app.put('/api/admin/products/:productId', authRequired(JWT_SECRET), roleRequired
 
   const nextCategory =
     body.category !== undefined ? String(body.category || '').trim() : String(existingRow.category || '').trim();
+  const nextUnit =
+    body.unit !== undefined ? String(body.unit || '').trim() : String(existingRow.unit || 'шт').trim() || 'шт';
   if (nextCategory && !(await categoryExists(nextCategory))) {
     return res.status(400).json({ message: 'Категория/подкатегория не найдена в справочнике' });
   }
@@ -2495,8 +2776,8 @@ app.put('/api/admin/products/:productId', authRequired(JWT_SECRET), roleRequired
   const updated = await db.query(
     `
       UPDATE products
-      SET name = $1, description = $2, price = $3, category = $4, image_url = $5, in_stock = $6, stock_quantity = $7, home_warehouse_id = $8
-      WHERE id = $9
+      SET name = $1, description = $2, price = $3, category = $4, image_url = $5, unit = $6, in_stock = $7, stock_quantity = $8, home_warehouse_id = $9
+      WHERE id = $10
       RETURNING *
     `,
     [
@@ -2505,6 +2786,7 @@ app.put('/api/admin/products/:productId', authRequired(JWT_SECRET), roleRequired
       nextPrice,
       nextCategory || null,
       body.imageUrl !== undefined ? body.imageUrl?.trim() || null : existingRow.image_url,
+      nextUnit,
       nextStockQuantity > 0 && (body.inStock !== undefined ? Boolean(body.inStock) : Boolean(existingRow.in_stock)),
       nextStockQuantity,
       nextWarehouseId,
@@ -2991,8 +3273,8 @@ app.get('/api/admin/pick-tasks', authRequired(JWT_SECRET), roleRequired('admin',
     applyWarehouseScopeToQuery(where, params, allowedWarehouseIds, 'pt.warehouse_id');
     whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
   } else {
-    // picker: видит новые и свои задачи (new/in_progress/done) чтобы можно было отдать курьеру
-    whereSql = `WHERE (pt.assigned_to IS NULL OR pt.assigned_to = $1) AND pt.status IN ('new','in_progress','done')`;
+    // picker: видит все свои задачи
+    whereSql = `WHERE pt.assigned_to = $1`;
     params = [req.user!.id];
   }
 
@@ -3284,6 +3566,9 @@ app.post('/api/admin/pick-tasks/from-order', authRequired(JWT_SECRET), roleRequi
     return res.status(201).json({ message: 'Задача сборки создана', taskId });
   } catch (error) {
     await client.query('ROLLBACK');
+    if (error instanceof Error && /У сборщика уже есть активная задача/i.test(error.message)) {
+      return res.status(409).json({ message: error.message });
+    }
     return res.status(500).json({ message: 'Не удалось создать задачу сборки', error: error instanceof Error ? error.message : 'unknown' });
   } finally {
     client.release();
@@ -3465,6 +3750,14 @@ app.patch('/api/admin/pick-tasks/:taskId', authRequired(JWT_SECRET), roleRequire
     }
 
     const nextAssignedTo = body.assignedTo === undefined ? (task.assigned_to === null ? null : toNumber(task.assigned_to)) : body.assignedTo;
+    const nextStatus = String(status);
+    if (nextAssignedTo && ['new', 'in_progress'].includes(nextStatus)) {
+      const conflictTaskId = await pickerHasAnotherActiveTask(client, Number(nextAssignedTo), { excludeTaskId: taskId });
+      if (conflictTaskId) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ message: `У сборщика уже есть активная задача #${conflictTaskId}` });
+      }
+    }
 
     await client.query(
       `
@@ -3481,6 +3774,7 @@ app.patch('/api/admin/pick-tasks/:taskId', authRequired(JWT_SECRET), roleRequire
     );
 
     await client.query('COMMIT');
+    await tryAssignOldestPendingPickTask();
     return res.json({ message: 'Задача сборки обновлена' });
   } catch (error) {
     await client.query('ROLLBACK');
@@ -4736,6 +5030,8 @@ app.post('/api/orders', authRequired(JWT_SECRET), async (req, res) => {
 
     await client.query('COMMIT');
 
+    await tryAssignOldestPendingPickTask();
+
     const orderRow = (await db.query('SELECT * FROM orders WHERE id = $1 LIMIT 1', [orderId])).rows[0];
     return res.status(201).json({ order: orderView(normalizeOrderRow(orderRow)) });
   } catch (error) {
@@ -5347,6 +5643,7 @@ app.post('/api/payments/webhook', async (req, res) => {
   }
 
   await tryAssignOldestPendingOrder();
+  await tryAssignOldestPendingPickTask();
   return res.json({ ok: true });
 });
 
@@ -5458,6 +5755,7 @@ app.patch('/api/orders/:orderId/status', authRequired(JWT_SECRET), async (req, r
 
   if (nextStatus === ORDER_STATUS.cancelled) {
     await tryAssignOldestPendingOrder();
+    await tryAssignOldestPendingPickTask();
   }
 
   const updatedRow = (await db.query('SELECT * FROM orders WHERE id = $1 LIMIT 1', [orderId])).rows[0];
@@ -5640,6 +5938,7 @@ app.post('/api/couriers/connect', authRequired(JWT_SECRET), roleRequired('custom
   ).rows[0];
   if (nextStatus === 'available') {
     await tryAssignOldestPendingOrder();
+    await tryAssignOldestPendingPickTask();
   }
   const updatedUser = await getUserById(targetUser.id);
   const isSelfUpdate = req.user!.id === targetUser.id;
@@ -5711,8 +6010,12 @@ app.use((error: any, req: express.Request, res: express.Response, next: express.
     return res.status(507).json({ message: 'На сервере закончилось место для загрузки файлов' });
   }
 
-  if (error && typeof error.message === 'string' && error.message.trim()) {
-    return res.status(400).json({ message: error.message });
+  const statusCode = Number(error?.statusCode);
+  const isHttpStatus = Number.isInteger(statusCode) && statusCode >= 400 && statusCode <= 599;
+  if (isHttpStatus) {
+    const exposeMessage = Boolean(error?.exposeMessage ?? statusCode < 500);
+    const message = exposeMessage && typeof error?.message === 'string' && error.message.trim() ? error.message : 'Внутренняя ошибка сервера';
+    return res.status(statusCode).json({ message });
   }
 
   return res.status(500).json({ message: 'Внутренняя ошибка сервера' });

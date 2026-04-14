@@ -197,6 +197,7 @@ npm start
 
 - Админ: `admin@universal.local`
 - Курьер: `courier@universal.local`
+- Покупатель: `customer@universal.local`
 
 ## Основные API
 
@@ -239,12 +240,16 @@ npm start
 Важно:
 - Точка и карточки товаров активны только после одобрения главным администратором (`admin@universal.local`).
 - Подключение курьеров к точке тоже требует одобрения главного администратора.
+- Перед созданием/обновлением точки пользователь должен подтвердить email и телефон.
+- Для модерации точки обязательны KYC-поля: ИНН и документ.
 
 Основные endpoint’ы:
 - `POST /api/stores/uploads/logo` (загрузка логотипа точки)
 - `GET /api/stores/my`
 - `POST /api/stores/my`
 - `PATCH /api/stores/my`
+- `POST /api/users/me/verification/request` (`channel=email|phone`)
+- `POST /api/users/me/verification/confirm` (`channel`, `code`)
 - `GET /api/stores/my/products`
 - `POST /api/stores/my/products`
 - `PUT /api/stores/my/products/:productId`
@@ -252,6 +257,7 @@ npm start
 - `GET /api/stores/couriers` (список доступных курьеров)
 - `GET /api/stores/my/courier-links`
 - `POST /api/stores/my/courier-links` (заявка на подключение курьера)
+- `POST /api/stores/uploads/kyc-document` (документ для KYC)
 
 Одобрение главным админом:
 - `GET /api/admin/stores?status=pending`

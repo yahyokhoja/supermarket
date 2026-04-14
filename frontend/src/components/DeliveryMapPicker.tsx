@@ -42,6 +42,13 @@ const TAJIK_CITY_PRESETS: Array<{ label: string; point: LatLng }> = [
 const MESSAGE_TYPE = 'delivery-map-click';
 const MESSAGE_SET_CENTER = 'delivery-map-set-center';
 
+function canUseGeolocationNow() {
+  if (typeof window === 'undefined') return false;
+  if (window.isSecureContext) return true;
+  const host = String(window.location.hostname || '').toLowerCase();
+  return host === 'localhost' || host === '127.0.0.1' || host === '::1' || host.endsWith('.localhost');
+}
+
 function sanitizeHouseInput(raw: string) {
   const value = raw.trim().replace(/^дом\s*/iu, '');
   if (!value) return '';
@@ -530,8 +537,9 @@ export default function DeliveryMapPicker({
       return;
     }
 
-    if (!window.isSecureContext) {
-      setGeoError('Геолокация требует защищенный контекст: откройте сайт по HTTPS или localhost.');
+    if (!canUseGeolocationNow()) {
+      const host = typeof window !== 'undefined' ? window.location.host : '';
+      setGeoError(`Геолокация требует HTTPS или localhost. Текущий адрес: ${host || 'unknown'}`);
       return;
     }
 
@@ -712,8 +720,9 @@ export default function DeliveryMapPicker({
       setGeoError('Ваш браузер не поддерживает геолокацию.');
       return;
     }
-    if (!window.isSecureContext) {
-      setGeoError('Геолокация требует защищенный контекст: откройте сайт по HTTPS или localhost.');
+    if (!canUseGeolocationNow()) {
+      const host = typeof window !== 'undefined' ? window.location.host : '';
+      setGeoError(`Геолокация требует HTTPS или localhost. Текущий адрес: ${host || 'unknown'}`);
       return;
     }
 

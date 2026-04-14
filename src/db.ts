@@ -19,6 +19,8 @@ export async function initDb(pool: Pool) {
       session_version INTEGER NOT NULL DEFAULT 0,
       permissions TEXT[] NOT NULL DEFAULT '{}',
       warehouse_scopes BIGINT[],
+      email_verified_at TIMESTAMPTZ,
+      phone_verified_at TIMESTAMPTZ,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
@@ -40,6 +42,7 @@ export async function initDb(pool: Pool) {
       price NUMERIC(12,2) NOT NULL,
       category TEXT,
       image_url TEXT,
+      unit TEXT NOT NULL DEFAULT 'шт',
       in_stock BOOLEAN NOT NULL DEFAULT TRUE,
       stock_quantity INTEGER NOT NULL DEFAULT 0,
       home_warehouse_id BIGINT REFERENCES warehouses(id) ON DELETE SET NULL,
@@ -76,7 +79,7 @@ export async function initDb(pool: Pool) {
       verification_requested_at TIMESTAMPTZ,
       verified_at TIMESTAMPTZ,
       verification_reviewed_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
-      max_active_orders INTEGER NOT NULL DEFAULT 5,
+      max_active_orders INTEGER NOT NULL DEFAULT 1,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
@@ -202,6 +205,8 @@ export async function initDb(pool: Pool) {
       logo_url TEXT,
       phone TEXT NOT NULL,
       description TEXT,
+      tin TEXT,
+      legal_document_url TEXT,
       lat DOUBLE PRECISION,
       lng DOUBLE PRECISION,
       status TEXT NOT NULL DEFAULT 'pending',
@@ -213,6 +218,17 @@ export async function initDb(pool: Pool) {
       UNIQUE(owner_user_id)
     );
 
+    CREATE TABLE IF NOT EXISTS user_verification_codes (
+      id BIGSERIAL PRIMARY KEY,
+      user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      channel TEXT NOT NULL CHECK (channel IN ('email', 'phone')),
+      purpose TEXT NOT NULL DEFAULT 'store_onboarding',
+      code TEXT NOT NULL,
+      expires_at TIMESTAMPTZ NOT NULL,
+      used_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
     CREATE TABLE IF NOT EXISTS merchant_products (
       id BIGSERIAL PRIMARY KEY,
       store_id BIGINT NOT NULL REFERENCES merchant_stores(id) ON DELETE CASCADE,
@@ -220,6 +236,7 @@ export async function initDb(pool: Pool) {
       description TEXT,
       price NUMERIC(12,2) NOT NULL,
       image_url TEXT,
+      unit TEXT NOT NULL DEFAULT 'шт',
       in_stock BOOLEAN NOT NULL DEFAULT TRUE,
       stock_quantity INTEGER NOT NULL DEFAULT 0 CHECK(stock_quantity >= 0),
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -292,6 +309,11 @@ export async function initDb(pool: Pool) {
   `);
 
   await pool.query(`
+    CREATE INDEX IF NOT EXISTS ix_user_verification_codes_lookup
+    ON user_verification_codes (user_id, channel, purpose, expires_at DESC);
+  `);
+
+  await pool.query(`
     INSERT INTO product_categories (category_name, subcategory_name)
     SELECT DISTINCT
       TRIM(SPLIT_PART(category, '>', 1)) AS category_name,
@@ -322,6 +344,20 @@ export async function initDb(pool: Pool) {
   `);
 
   await pool.query(`
+    ALTER TABLE users
+      ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS phone_verified_at TIMESTAMPTZ;
+  `);
+
+  await pool.query(`
+    UPDATE users
+    SET
+      email_verified_at = COALESCE(email_verified_at, NOW()),
+      phone_verified_at = CASE WHEN phone IS NOT NULL AND btrim(phone) <> '' THEN COALESCE(phone_verified_at, NOW()) ELSE phone_verified_at END
+    WHERE role IN ('admin', 'courier', 'picker');
+  `);
+
+  await pool.query(`
     ALTER TABLE couriers
       ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS verification_status TEXT NOT NULL DEFAULT 'pending',
@@ -339,7 +375,17 @@ export async function initDb(pool: Pool) {
   `);
 
   await pool.query(`
+    ALTER TABLE couriers
+      ADD COLUMN IF NOT EXISTS max_active_orders INTEGER NOT NULL DEFAULT 1;
+  `);
+
+  await pool.query(`
+    UPDATE couriers SET max_active_orders = 1 WHERE max_active_orders > 1;
+  `);
+
+  await pool.query(`
     ALTER TABLE products
+      ADD COLUMN IF NOT EXISTS unit TEXT NOT NULL DEFAULT 'шт',
       ADD COLUMN IF NOT EXISTS stock_quantity INTEGER NOT NULL DEFAULT 0,
       ADD COLUMN IF NOT EXISTS home_warehouse_id BIGINT REFERENCES warehouses(id) ON DELETE SET NULL;
   `);
@@ -364,9 +410,20 @@ export async function initDb(pool: Pool) {
   `);
 
   await pool.query(`
+    ALTER TABLE merchant_products
+      ADD COLUMN IF NOT EXISTS unit TEXT NOT NULL DEFAULT 'шт';
+  `);
+
+  await pool.query(`
     ALTER TABLE warehouses
       ADD COLUMN IF NOT EXISTS lat DOUBLE PRECISION,
       ADD COLUMN IF NOT EXISTS lng DOUBLE PRECISION;
+  `);
+
+  await pool.query(`
+    ALTER TABLE merchant_stores
+      ADD COLUMN IF NOT EXISTS tin TEXT,
+      ADD COLUMN IF NOT EXISTS legal_document_url TEXT;
   `);
 
   await pool.query(`

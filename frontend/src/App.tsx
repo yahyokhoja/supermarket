@@ -22,6 +22,8 @@ type User = {
   role: Role;
   permissions: string[];
   warehouseScopes?: number[] | null;
+  emailVerifiedAt?: string | null;
+  phoneVerifiedAt?: string | null;
 };
 
 type Product = {
@@ -31,6 +33,7 @@ type Product = {
   price: number;
   imageUrl: string;
   category?: string | null;
+  unit?: string | null;
   inStock?: boolean;
   stockQuantity?: number;
   homeWarehouseId?: number | null;
@@ -132,7 +135,7 @@ type AdminSearchResponse = {
   suggestions: string[];
   results: {
     users: Array<{ id: number; fullName: string; email: string; phone: string | null; role: Role; isActive: boolean }>;
-    products: Array<{ id: number; name: string; category: string | null; price: number; inStock: boolean; stockQuantity: number }>;
+    products: Array<{ id: number; name: string; category: string | null; price: number; unit?: string | null; inStock: boolean; stockQuantity: number }>;
     orders: Array<{ id: number; userId: number; status: Status; total: number; deliveryAddress: string; assignedCourierId: number | null }>;
     couriers: Array<{ id: number; userId: number; fullName: string; email: string; vehicleType: string | null; status: string; verificationStatus: string }>;
   };
@@ -306,6 +309,8 @@ type MerchantStore = {
   logoUrl: string | null;
   phone: string;
   description: string | null;
+  tin: string | null;
+  legalDocumentUrl: string | null;
   lat: number | null;
   lng: number | null;
   status: 'pending' | 'approved' | 'rejected';
@@ -315,6 +320,7 @@ type MerchantStore = {
   createdAt: string;
   updatedAt: string;
 };
+type VerificationChannel = 'email' | 'phone';
 type MerchantStoreProduct = {
   id: number;
   storeId: number;
@@ -365,8 +371,8 @@ type MerchantProductsMigrationResult = {
   verifiedRows: number;
   cutoverApplied: boolean;
 };
-type HeaderSection = 'catalog' | 'profile' | 'cart' | 'map';
-type AdminTab = 'orders' | 'analytics' | 'products' | 'warehouse' | 'users' | 'couriers' | 'audit' | 'search' | 'merchants';
+type HeaderSection = 'catalog' | 'profile' | 'cart' | 'map' | 'store';
+type AdminTab = 'orders' | 'analytics' | 'products' | 'warehouse' | 'users' | 'couriers' | 'audit' | 'search' | 'merchants' | 'pickTasks';
 type StockMovementType = 'receive' | 'writeoff' | 'reserve';
 
 function stockRowKey(warehouseId: number, productId: number) {
@@ -428,6 +434,7 @@ const PICK_TASK_STATUS_LABELS: Record<string, string> = {
   handed_to_courier: 'Отдана курьеру',
   cancelled: 'Отменена'
 };
+const ACTIVE_PICK_TASK_STATUSES: PickTask['status'][] = ['new', 'in_progress'];
 
 const ROLE_LABELS: Record<Role, string> = {
   customer: 'Покупатель',
@@ -456,7 +463,8 @@ const ADMIN_TAB_LABELS: Record<AdminTab, string> = {
   couriers: 'Курьеры',
   search: 'Поиск',
   audit: 'Аудит-лог',
-  merchants: 'Точки продавцов'
+  merchants: 'Точки продавцов',
+  pickTasks: 'Задачи сборки'
 };
 const DELIVERY_DRAFT_KEY = 'delivery_draft_v1';
 const LAST_DELIVERY_KEY = 'last_delivery_v1';
@@ -486,6 +494,13 @@ function normalizeHouseNumber(raw: string) {
   const tailMatch = value.match(/(\d+[A-Za-zА-Яа-я\-\/]*)$/u);
   if (tailMatch) return tailMatch[1];
   return value;
+}
+
+function canUseGeolocationNow() {
+  if (typeof window === 'undefined') return false;
+  if (window.isSecureContext) return true;
+  const host = String(window.location.hostname || '').toLowerCase();
+  return host === 'localhost' || host === '127.0.0.1' || host === '::1' || host.endsWith('.localhost');
 }
 
 function isValidHouseNumber(raw: string) {
@@ -717,6 +732,8 @@ export default function App() {
     logoUrl: '',
     phone: '',
     description: '',
+    tin: '',
+    legalDocumentUrl: '',
     lat: '',
     lng: ''
   });
@@ -728,6 +745,15 @@ export default function App() {
     stockQuantity: '0'
   });
   const [storeFormSubmitting, setStoreFormSubmitting] = useState(false);
+  const [verificationRequesting, setVerificationRequesting] = useState<Record<VerificationChannel, boolean>>({
+    email: false,
+    phone: false
+  });
+  const [verificationConfirming, setVerificationConfirming] = useState<Record<VerificationChannel, boolean>>({
+    email: false,
+    phone: false
+  });
+  const [verificationCodes, setVerificationCodes] = useState<Record<VerificationChannel, string>>({ email: '', phone: '' });
   const [storeProductSubmitting, setStoreProductSubmitting] = useState(false);
   const [storeCourierIdDraft, setStoreCourierIdDraft] = useState(0);
   const [lastDelivery, setLastDelivery] = useState<SavedDelivery | null>(() => {
@@ -855,10 +881,12 @@ export default function App() {
   const [selectedCategory, setSelectedCategory] = useState('all');
   const [selectedSubcategory, setSelectedSubcategory] = useState('all');
   const [profileOpen, setProfileOpen] = useState(false);
+  const [storeOpen, setStoreOpen] = useState(false);
   const [cartOpen, setCartOpen] = useState(false);
   const [deliveryMapOpen, setDeliveryMapOpen] = useState(false);
   const profileSectionRef = useRef<HTMLElement | null>(null);
   const catalogSectionRef = useRef<HTMLElement | null>(null);
+  const storeSectionRef = useRef<HTMLElement | null>(null);
   const cartSectionRef = useRef<HTMLElement | null>(null);
   const authSectionRef = useRef<HTMLElement | null>(null);
   const loginEmailInputRef = useRef<HTMLInputElement | null>(null);
@@ -868,6 +896,7 @@ export default function App() {
   const warehouseOperationFormRef = useRef<HTMLFormElement | null>(null);
   const warehouseOperationQuantityRef = useRef<HTMLInputElement | null>(null);
   const sessionExpiredHandledRef = useRef(false);
+  const previousPickTaskIdsRef = useRef<Set<number>>(new Set());
 
   const loggedIn = Boolean(token && user);
   const isSystemAdmin = user?.email?.trim().toLowerCase() === 'admin@universal.local';
@@ -951,6 +980,24 @@ export default function App() {
     return Array.from(adminCategoryMap.get(selected) || []).sort((a, b) => a.localeCompare(b, 'ru'));
   }, [adminCategoryMap, productFormCategory]);
   const adminDeliveredOrders = useMemo(() => allOrders.filter((o) => o.status === 'paid' || o.status === 'received'), [allOrders]);
+  const busyPickerIds = useMemo(() => {
+    const busy = new Set<number>();
+    for (const task of pickTasks) {
+      if (task.assignedTo && ACTIVE_PICK_TASK_STATUSES.includes(task.status)) {
+        busy.add(task.assignedTo);
+      }
+    }
+    return busy;
+  }, [pickTasks]);
+  const pickerStatusSummary = useMemo(() => {
+    const activePickers = adminUsers.filter((u) => u.role === 'picker' && u.isActive);
+    const busyCount = activePickers.filter((u) => busyPickerIds.has(u.id)).length;
+    return {
+      free: Math.max(activePickers.length - busyCount, 0),
+      busy: busyCount,
+      total: activePickers.length
+    };
+  }, [adminUsers, busyPickerIds]);
   const warehouseNameById = useMemo(() => {
     const map = new Map<number, string>();
     for (const w of warehouseOverview.warehouses) {
@@ -1090,6 +1137,7 @@ export default function App() {
     if (hasAdminPermission('view_analytics')) allowedTabs.push('analytics');
     if (hasAdminPermission('manage_products')) allowedTabs.push('products');
     if (hasAdminPermission('manage_warehouse')) allowedTabs.push('warehouse');
+    if (hasAdminPermission('manage_warehouse')) allowedTabs.push('pickTasks');
     if (hasAdminPermission('manage_users')) allowedTabs.push('users');
     if (hasAdminPermission('manage_couriers')) allowedTabs.push('couriers');
     if (hasAdminPermission('search_db')) allowedTabs.push('search');
@@ -1116,6 +1164,7 @@ export default function App() {
   function openOnlySection(section: HeaderSection) {
     setCatalogOpen(section === 'catalog');
     setProfileOpen(section === 'profile');
+    setStoreOpen(section === 'store');
     setCartOpen(section === 'cart' || section === 'map');
     setDeliveryMapOpen(section === 'map');
   }
@@ -1155,6 +1204,15 @@ export default function App() {
     }
     openOnlySection('profile');
     setTimeout(() => scrollToSection(profileSectionRef), 0);
+  }
+
+  function goToStore() {
+    if (storeOpen) {
+      setStoreOpen(false);
+      return;
+    }
+    openOnlySection('store');
+    setTimeout(() => scrollToSection(storeSectionRef), 0);
   }
 
   function goToMap() {
@@ -1231,6 +1289,41 @@ export default function App() {
     }
 
     return data as T;
+  }
+
+  function playPickTaskNotificationSound() {
+    try {
+      // Проигрываем звуковое уведомление
+      const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const oscillator = audioContext.createOscillator();
+      const gainNode = audioContext.createGain();
+      
+      oscillator.connect(gainNode);
+      gainNode.connect(audioContext.destination);
+      
+      // Звук: средняя нота для привлечения внимания
+      oscillator.frequency.value = 800;
+      oscillator.type = 'sine';
+      
+      gainNode.gain.setValueAtTime(0.3, audioContext.currentTime);
+      gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.5);
+      
+      oscillator.start(audioContext.currentTime);
+      oscillator.stop(audioContext.currentTime + 0.5);
+      
+      // Проигрываем голосовое сообщение
+      if ('speechSynthesis' in window) {
+        const utterance = new SpeechSynthesisUtterance('Поступила новая задача сборки');
+        utterance.lang = 'ru-RU';
+        utterance.rate = 1;
+        utterance.pitch = 1;
+        utterance.volume = 1;
+        window.speechSynthesis.cancel();
+        window.speechSynthesis.speak(utterance);
+      }
+    } catch (error) {
+      console.warn('Не удалось проиграть звуковое уведомление:', error);
+    }
   }
 
   async function loadProducts() {
@@ -1427,6 +1520,18 @@ export default function App() {
   async function loadPickTasksForPicker() {
     if (user?.role !== 'picker') return;
     const data = await api<PickTasksResponse>('/api/admin/pick-tasks');
+    
+    // Проверяем на новые задачи и проигрываем уведомление
+    const newTaskIds = new Set(data.tasks.map((task) => task.id));
+    const hasNewTasks = data.tasks.some(
+      (task) => task.status === 'new' && !previousPickTaskIdsRef.current.has(task.id)
+    );
+    
+    if (hasNewTasks) {
+      playPickTaskNotificationSound();
+    }
+    
+    previousPickTaskIdsRef.current = newTaskIds;
     setPickTasks(data.tasks);
     setPickTaskStatusDrafts(Object.fromEntries(data.tasks.map((task) => [task.id, task.status])) as Record<number, PickTask['status']>);
   }
@@ -1488,6 +1593,8 @@ export default function App() {
       logoUrl: myStoreRes.store.logoUrl || '',
       phone: myStoreRes.store.phone || '',
       description: myStoreRes.store.description || '',
+      tin: myStoreRes.store.tin || '',
+      legalDocumentUrl: myStoreRes.store.legalDocumentUrl || '',
       lat: myStoreRes.store.lat === null ? '' : String(myStoreRes.store.lat),
       lng: myStoreRes.store.lng === null ? '' : String(myStoreRes.store.lng)
     });
@@ -1614,6 +1721,7 @@ export default function App() {
       setMyStoreProducts([]);
       setStoreCouriers([]);
       setMyStoreCourierLinks([]);
+      setVerificationCodes({ email: '', phone: '' });
       setAdminMerchantStores([]);
       setAdminStoreLinksByStoreId({});
       setAdminStoreDsnDrafts({});
@@ -2206,12 +2314,96 @@ export default function App() {
     }
   }
 
+  async function requestVerificationCode(channel: VerificationChannel) {
+    setVerificationRequesting((prev) => ({ ...prev, [channel]: true }));
+    try {
+      const data = await api<{ message: string; code?: string; expiresAt?: string }>('/api/users/me/verification/request', {
+        method: 'POST',
+        body: JSON.stringify({ channel })
+      });
+      notify(data.code ? `${data.message}. Код: ${data.code}` : data.message);
+    } catch (err) {
+      notify((err as Error).message);
+    } finally {
+      setVerificationRequesting((prev) => ({ ...prev, [channel]: false }));
+    }
+  }
+
+  async function confirmVerificationCode(channel: VerificationChannel) {
+    const code = String(verificationCodes[channel] || '').trim();
+    if (!/^\d{6}$/.test(code)) {
+      notify('Введите 6-значный код');
+      return;
+    }
+    setVerificationConfirming((prev) => ({ ...prev, [channel]: true }));
+    try {
+      const data = await api<{ message: string; user: User }>('/api/users/me/verification/confirm', {
+        method: 'POST',
+        body: JSON.stringify({ channel, code })
+      });
+      setUser(data.user);
+      setVerificationCodes((prev) => ({ ...prev, [channel]: '' }));
+      notify(data.message || 'Подтверждено');
+    } catch (err) {
+      notify((err as Error).message);
+    } finally {
+      setVerificationConfirming((prev) => ({ ...prev, [channel]: false }));
+    }
+  }
+
+  async function uploadStoreKycDocument(file: File) {
+    const prepared = await prepareImageForUpload(file, 'Документ KYC', { targetMime: 'image/jpeg', maxSide: 1600 });
+    if (prepared.error || !prepared.file) {
+      notify(prepared.error || 'Не удалось подготовить документ');
+      return;
+    }
+    try {
+      const formData = new FormData();
+      formData.append('image', prepared.file);
+      const data = await api<{ documentUrl: string }>('/api/stores/uploads/kyc-document', {
+        method: 'POST',
+        body: formData
+      });
+      setStoreForm((prev) => ({ ...prev, legalDocumentUrl: data.documentUrl || '' }));
+      notify('Документ загружен');
+    } catch (err) {
+      notify((err as Error).message);
+    }
+  }
+
+  async function uploadStoreProductImage(file: File) {
+    let uploadFile = file;
+    if (file.size > MAX_UPLOAD_FILE_SIZE_BYTES) {
+      const prepared = await prepareImageForUpload(file, 'Фото товара', { targetMime: 'image/jpeg', maxSide: 1600 });
+      if (prepared.error || !prepared.file) {
+        notify(prepared.error || 'Не удалось подготовить фото товара');
+        return;
+      }
+      uploadFile = prepared.file;
+    }
+
+    try {
+      const formData = new FormData();
+      formData.append('image', uploadFile);
+      const data = await api<{ imageUrl: string }>('/api/stores/uploads/product-image', {
+        method: 'POST',
+        body: formData
+      });
+      setStoreProductForm((prev) => ({ ...prev, imageUrl: data.imageUrl }));
+      notify('Фото товара загружено');
+    } catch (err) {
+      notify((err as Error).message);
+    }
+  }
+
   async function submitMyStore(e: FormEvent) {
     e.preventDefault();
     const name = storeForm.name.trim();
     const phone = storeForm.phone.trim();
     const logoUrl = storeForm.logoUrl.trim() || null;
     const description = storeForm.description.trim() || null;
+    const tin = storeForm.tin.trim();
+    const legalDocumentUrl = storeForm.legalDocumentUrl.trim();
     const hasLat = storeForm.lat.trim() !== '';
     const hasLng = storeForm.lng.trim() !== '';
     const lat = hasLat ? Number(storeForm.lat) : null;
@@ -2219,6 +2411,18 @@ export default function App() {
 
     if (!name || !phone) {
       notify('Укажите название точки и телефон');
+      return;
+    }
+    if (!user?.emailVerifiedAt || !user?.phoneVerifiedAt) {
+      notify('Перед созданием магазина подтвердите email и телефон');
+      return;
+    }
+    if (!/^\d{9,14}$/.test(tin)) {
+      notify('Укажите корректный ИНН (9-14 цифр)');
+      return;
+    }
+    if (!legalDocumentUrl) {
+      notify('Загрузите документ KYC');
       return;
     }
     if (hasLat !== hasLng) {
@@ -2238,12 +2442,12 @@ export default function App() {
       if (myStore) {
         await api('/api/stores/my', {
           method: 'PATCH',
-          body: JSON.stringify({ name, phone, logoUrl, description, lat, lng })
+          body: JSON.stringify({ name, phone, logoUrl, description, tin, legalDocumentUrl, lat, lng })
         });
       } else {
         await api('/api/stores/my', {
           method: 'POST',
-          body: JSON.stringify({ name, phone, logoUrl, description, lat, lng })
+          body: JSON.stringify({ name, phone, logoUrl, description, tin, legalDocumentUrl, lat, lng })
         });
       }
       await loadMyStoreData();
@@ -3150,8 +3354,8 @@ export default function App() {
       notify('Браузер не поддерживает геолокацию');
       return;
     }
-    if (!window.isSecureContext) {
-      notify('Для геолокации нужен HTTPS или localhost');
+    if (!canUseGeolocationNow()) {
+      notify(`Для геолокации нужен HTTPS или localhost. Текущий адрес: ${window.location.host || 'unknown'}`);
       return;
     }
 
@@ -3212,8 +3416,9 @@ export default function App() {
       <header className={`topbar${!loggedIn ? ' topbar-guest' : ''}`}>
         <h1>Universal Market Delivery</h1>
         <div className="topbar-actions">
-          {loggedIn ? <button type="button" onClick={goToCatalog}>Товары</button> : null}
-          {loggedIn && user?.role !== 'courier' ? (
+          {loggedIn && user?.role !== 'picker' ? <button type="button" onClick={goToCatalog}>Товары</button> : null}
+          {loggedIn && user?.role === 'customer' ? <button type="button" onClick={goToStore}>Онлайн магазин</button> : null}
+          {loggedIn && user?.role !== 'courier' && user?.role !== 'picker' ? (
             <div className="topbar-filters">
               <select value={selectedCategory} onChange={(e) => changeHeaderCategory(e.target.value)}>
                 <option value="all">Категории</option>
@@ -3308,6 +3513,7 @@ export default function App() {
                     <h3>{p.name}</h3>
                     <p className="muted card-desc">{p.description}</p>
                     <div className="price">${p.price.toFixed(2)}</div>
+                    <div className="muted">Ед. изм.: {p.unit || 'шт'}</div>
                     <button onClick={() => addToCart(p.id)}>В корзину</button>
                   </div>
                 </article>
@@ -3332,6 +3538,7 @@ export default function App() {
                     <h3>{p.name}</h3>
                     <p className="muted card-desc">{p.description}</p>
                     <div className="price">${p.price.toFixed(2)}</div>
+                    <div className="muted">Ед. изм.: {p.unit || 'шт'}</div>
                     <div className="card-actions">
                       <button onClick={() => addToCart(p.id)}>В корзину</button>
                       <div className="card-qty">
@@ -3544,9 +3751,41 @@ export default function App() {
             </section>
         ) : null}
 
-        {loggedIn && user?.role === 'customer' ? (
-          <section className="panel">
+        {loggedIn && user?.role === 'customer' && storeOpen ? (
+          <section className="panel" ref={storeSectionRef}>
             <h2>Создать онлайн магазин</h2>
+            <p className="muted">Заполните данные магазина и отправьте заявку — после одобрения администратором ваш онлайн магазин станет доступен для покупателей.</p>
+            <div className="row">
+              <strong>Подтверждение контактов</strong>
+              <div className="muted">Email: {user?.emailVerifiedAt ? 'подтвержден' : 'не подтвержден'}</div>
+              <div className="inline-actions">
+                <button type="button" onClick={() => requestVerificationCode('email')} disabled={verificationRequesting.email}>
+                  {verificationRequesting.email ? 'Отправляем...' : 'Код на email'}
+                </button>
+                <input
+                  placeholder="Код email"
+                  value={verificationCodes.email}
+                  onChange={(e) => setVerificationCodes((prev) => ({ ...prev, email: e.target.value }))}
+                />
+                <button type="button" onClick={() => confirmVerificationCode('email')} disabled={verificationConfirming.email}>
+                  {verificationConfirming.email ? 'Проверяем...' : 'Подтвердить email'}
+                </button>
+              </div>
+              <div className="muted">Телефон: {user?.phoneVerifiedAt ? 'подтвержден' : 'не подтвержден'}</div>
+              <div className="inline-actions">
+                <button type="button" onClick={() => requestVerificationCode('phone')} disabled={verificationRequesting.phone}>
+                  {verificationRequesting.phone ? 'Отправляем...' : 'Код на телефон'}
+                </button>
+                <input
+                  placeholder="Код телефона"
+                  value={verificationCodes.phone}
+                  onChange={(e) => setVerificationCodes((prev) => ({ ...prev, phone: e.target.value }))}
+                />
+                <button type="button" onClick={() => confirmVerificationCode('phone')} disabled={verificationConfirming.phone}>
+                  {verificationConfirming.phone ? 'Проверяем...' : 'Подтвердить телефон'}
+                </button>
+              </div>
+            </div>
             <form onSubmit={submitMyStore}>
               <input
                 placeholder="Название магазина/точки"
@@ -3571,6 +3810,32 @@ export default function App() {
                 onChange={(e) => setStoreForm((prev) => ({ ...prev, description: e.target.value }))}
               />
               <input
+                placeholder="ИНН (9-14 цифр)"
+                value={storeForm.tin}
+                onChange={(e) => setStoreForm((prev) => ({ ...prev, tin: e.target.value }))}
+                required
+              />
+              <input
+                placeholder="Ссылка на KYC-документ"
+                value={storeForm.legalDocumentUrl}
+                onChange={(e) => setStoreForm((prev) => ({ ...prev, legalDocumentUrl: e.target.value }))}
+                required
+              />
+              <label>
+                Загрузить документ KYC
+                <input
+                  type="file"
+                  accept="image/*"
+                  capture="environment"
+                  onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    if (!file) return;
+                    void uploadStoreKycDocument(file);
+                    e.currentTarget.value = '';
+                  }}
+                />
+              </label>
+              <input
                 type="number"
                 step="0.000001"
                 placeholder="Широта (опц.)"
@@ -3593,11 +3858,17 @@ export default function App() {
               <div className="row">
                 <strong>{myStore.name}</strong>
                 <div>Телефон: {myStore.phone}</div>
+                <div>ИНН: {myStore.tin || '-'}</div>
                 <div>
                   Статус: <span className={`badge ${myStore.status}`}>{myStore.status === 'approved' ? 'Одобрена' : myStore.status === 'rejected' ? 'Отклонена' : 'На модерации'}</span>
                 </div>
                 {myStore.rejectionReason ? <div className="muted">Причина отклонения: {myStore.rejectionReason}</div> : null}
                 {myStore.logoUrl ? <img src={toSecureUrl(myStore.logoUrl)} alt="Логотип точки" style={{ width: '120px', borderRadius: '8px' }} /> : null}
+                {myStore.legalDocumentUrl ? (
+                  <a href={toSecureUrl(myStore.legalDocumentUrl)} target="_blank" rel="noreferrer">
+                    KYC документ
+                  </a>
+                ) : null}
               </div>
             ) : (
               <p className="muted">Создайте точку и дождитесь разрешения главного администратора.</p>
@@ -3633,6 +3904,25 @@ export default function App() {
                       value={storeProductForm.imageUrl}
                       onChange={(e) => setStoreProductForm((prev) => ({ ...prev, imageUrl: e.target.value }))}
                     />
+                    <label>
+                      Фото товара (камера/галерея)
+                      <input
+                        type="file"
+                        accept="image/*"
+                        capture="environment"
+                        onChange={(e) => {
+                          const file = e.target.files?.[0];
+                          if (!file) return;
+                          void uploadStoreProductImage(file);
+                          e.currentTarget.value = '';
+                        }}
+                        disabled={imageUploading}
+                      />
+                    </label>
+                    {imageUploading ? <div className="muted">Загрузка фото...</div> : null}
+                    {storeProductForm.imageUrl ? (
+                      <img src={toSecureUrl(storeProductForm.imageUrl)} alt="Фото товара" style={{ width: '140px', borderRadius: '8px' }} />
+                    ) : null}
                     <input
                       type="number"
                       min="0"
@@ -3846,8 +4136,8 @@ export default function App() {
         {user?.role === 'picker' && (
           <section className="panel">
             <h2>Задачи сборки</h2>
-            {pickTasks.length === 0 && <p className="muted">Нет задач доступных для сборки.</p>}
-            {pickTasks.map((task) => (
+            {pickTasks.filter((task) => task.status !== 'handed_to_courier' && task.status !== 'cancelled').length === 0 && <p className="muted">Нет задач доступных для сборки.</p>}
+            {pickTasks.filter((task) => task.status !== 'handed_to_courier' && task.status !== 'cancelled').map((task) => (
               <div className="row" key={`pick-${task.id}`}>
                 <strong>Задача #{task.id}</strong> <span className={`badge ${task.status}`}>{task.status}</span>
                 <div>Заказ: #{task.orderId} | Склад: {task.warehouseName}</div>
@@ -3892,6 +4182,23 @@ export default function App() {
                     </button>
                   </div>
                 ) : null}
+              </div>
+            ))}
+          </section>
+        )}
+
+        {user?.role === 'picker' && (
+          <section className="panel">
+            <h2>История Задач Сборки</h2>
+            {pickTasks.filter((task) => task.status === 'handed_to_courier' || task.status === 'cancelled').length === 0 && <p className="muted">Завершенных задач пока нет.</p>}
+            {pickTasks.filter((task) => task.status === 'handed_to_courier' || task.status === 'cancelled').map((task) => (
+              <div className="row" key={`history-pick-${task.id}`}>
+                <strong>Задача #{task.id}</strong> <span className={`badge ${task.status}`}>{task.status}</span>
+                <div>Заказ: #{task.orderId} | Склад: {task.warehouseName}</div>
+                <div>Завершено: {new Date(task.updatedAt).toLocaleString()}</div>
+                <div className="muted">
+                  Товары: {task.items.map((i) => `${i.productName} x${i.requestedQty}`).join(' | ')}
+                </div>
               </div>
             ))}
           </section>
@@ -4550,6 +4857,9 @@ export default function App() {
 
                 <div className="row">
                   <strong>Задачи сборки</strong>
+                  <div className="muted">
+                    Сборщики: свободно {pickerStatusSummary.free}, занято {pickerStatusSummary.busy}, всего {pickerStatusSummary.total}
+                  </div>
                   <form onSubmit={createPickTaskFromOrder}>
                     <input
                       placeholder="ID заказа"
@@ -4980,6 +5290,11 @@ export default function App() {
                           : 'все склады'}
                       </div>
                     ) : null}
+                    {u.role === 'picker' ? (
+                      <div className="muted">
+                        Сборщик: {u.isActive ? (busyPickerIds.has(u.id) ? 'Занят' : 'Свободен') : 'Заблокирован'}
+                      </div>
+                    ) : null}
                     <div className="inline-actions">
                         <select
                           value={adminUserRoleDrafts[u.id] || u.role}
@@ -5204,6 +5519,31 @@ export default function App() {
               </div>
             )}
 
+            {adminTab === 'pickTasks' && hasAdminPermission('manage_warehouse') && (
+              <div>
+                <h3>История Задач Сборки</h3>
+                <div className="muted">
+                  Сборщики: свободно {pickerStatusSummary.free}, занято {pickerStatusSummary.busy}, всего {pickerStatusSummary.total}
+                </div>
+                {pickTasks.length === 0 ? <div className="muted">Задач сборки пока нет.</div> : null}
+                {pickTasks.map((task) => (
+                  <div className="row" key={`pick-task-${task.id}`}>
+                    <strong>Задача #{task.id}</strong>
+                    <div>Заказ #{task.orderId} | Склад: {task.warehouseName}</div>
+                    <div>
+                      Статус: {PICK_TASK_STATUS_LABELS[task.status] || task.status} | Создал: {task.createdByName || '-'} | Обновлено: {new Date(task.updatedAt).toLocaleString()}
+                    </div>
+                    <div className="muted">
+                      {task.items.map((item) => `${item.productName}: ${item.pickedQty}/${item.requestedQty}`).join(' | ')}
+                    </div>
+                    {task.assignedTo ? (
+                      <div className="muted">Назначен: {task.assignedToName || `#${task.assignedTo}`}</div>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+            )}
+
             {adminTab === 'search' && hasAdminPermission('search_db') && (
               <div>
                 <h3>Поиск по всей базе</h3>
@@ -5307,6 +5647,9 @@ export default function App() {
           <button type="button" className={catalogOpen ? 'active' : ''} onClick={goToCatalog}>Товары</button>
           {user?.role !== 'courier' ? (
             <button type="button" className={profileOpen ? 'active' : ''} onClick={goToProfile}>Кабинет</button>
+          ) : null}
+          {user?.role === 'customer' ? (
+            <button type="button" className={storeOpen ? 'active' : ''} onClick={goToStore}>Магазин</button>
           ) : null}
           <button type="button" className={cartOpen ? 'active' : ''} onClick={goToCart}>
             Корзина{cartItemsCount > 0 ? ` (${cartItemsCount})` : ''}

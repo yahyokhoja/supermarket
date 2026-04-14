@@ -19,6 +19,8 @@ export interface DbUser {
   session_version: number;
   permissions: string[];
   warehouse_scopes: number[] | null;
+  email_verified_at?: string | null;
+  phone_verified_at?: string | null;
   created_at: string;
 }
 
@@ -32,6 +34,8 @@ export interface PublicUser {
   isActive: boolean;
   permissions: string[];
   warehouseScopes: number[] | null;
+  emailVerifiedAt?: string | null;
+  phoneVerifiedAt?: string | null;
   createdAt: string;
 }
 
