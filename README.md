@@ -119,6 +119,23 @@ npm run dev:all:https
 npm run db:up
 ```
 
+Схема больше не создаётся и не изменяется автоматически при старте API.
+
+Для уже существующей локальной БД применяйте только версионированные миграции:
+
+```bash
+npm run db:migrate
+```
+
+Для новой пустой БД сначала явно создайте legacy baseline, затем примените миграции:
+
+```bash
+npm run db:baseline
+npm run db:migrate
+```
+
+`db:baseline` откажется работать, если таблица `users` уже существует. Перед применением миграций к важной локальной базе сделайте резервную копию. Миграция этапа 1 не исправляет обнаруженные расхождения автоматически; отчёт доступен через `GET /api/admin/warehouse/consistency`.
+
 Проверка логов:
 
 ```bash
@@ -156,6 +173,14 @@ npm start
 
 Открыть: `http://localhost:4000`
 
+Проверка типов/качества:
+
+```bash
+npm run typecheck
+npm run lint
+npm test
+```
+
 ## Deploy на Vercel
 
 Проект подготовлен для Vercel:
@@ -167,6 +192,8 @@ npm start
 1. Подключите репозиторий в Vercel.
 2. В настройках проекта задайте переменные окружения:
    - `JWT_SECRET`
+   - `VERIFICATION_CODE_SECRET`
+   - `PAYMENT_WEBHOOK_SECRET`
    - `GEOCODER_PROVIDER`
    - `DGIS_GEOCODER_API_KEY` (если используете `2gis`)
    - `YANDEX_GEOCODER_API_KEY` (если используете `yandex`)
@@ -229,7 +256,7 @@ npm start
 
 - Для онлайн-оплаты используйте способ оплаты `wallet` при оформлении заказа.
 - После статуса заказа `received` клиент вызывает `POST /api/orders/:orderId/pay`.
-- API вернет `webhookTest` payload/signature для локального mock-подтверждения.
+- В dev-режиме API вернет `webhookTest` payload/signature для локального mock-подтверждения.
 - Подтверждение оплаты выполняется вызовом `POST /api/payments/webhook`.
 - Статус `paid` больше не выставляется вручную через `/api/orders/:orderId/status`.
 
@@ -258,6 +285,46 @@ npm start
 - `GET /api/stores/my/courier-links`
 - `POST /api/stores/my/courier-links` (заявка на подключение курьера)
 - `POST /api/stores/uploads/kyc-document` (документ для KYC)
+
+## Дополнительные возможности (новое)
+
+- Live-трекинг заказа:
+  - `GET /api/orders/:orderId/tracking` (live ETA, дистанция, позиция курьера)
+  - `GET /api/orders/:orderId/items-status` (статусы позиций сборки: picked/substituted/missing)
+- Курьерский маршрут:
+  - `GET /api/couriers/me/route` (активный маршрут и waypoints)
+  - `POST /api/couriers/me/heartbeat` теперь поддерживает `lat/lng` для live-трекинга
+- Замены товаров:
+  - при создании заказа `POST /api/orders` можно передать:
+    - `substitutionPreference`: `allow_similar | no_substitution | contact_me`
+    - `substitutionNote`: комментарий покупателя
+- Штрихкод:
+  - `GET /api/products/by-barcode?code=...`
+  - у товара поддерживается поле `barcode`
+- Центр уведомлений:
+  - `GET /api/notifications`
+  - `POST /api/notifications/:notificationId/read`
+  - `POST /api/notifications/read-all`
+- Склад и закупка:
+  - `POST /api/admin/warehouse/purchase-drafts/from-low-stock`
+  - `GET /api/admin/warehouse/purchase-drafts`
+
+## Чеклист Перед Релизом
+
+1. Прогнать сборки:
+   - `npm run build:api`
+   - `npm run build:web`
+2. Проверить health:
+   - `GET /api/health`
+   - `GET /api/health/ready`
+3. Проверить роли и критичный flow:
+   - customer: регистрация → корзина → заказ → трекинг
+   - picker: задачи сборки, статусы позиций
+   - courier: heartbeat с гео, маршрут, статусы доставки
+   - admin: модерация, склад, черновики закупки
+4. Проверить БД-бэкап и восстановление.
+5. Проверить CORS и HTTPS на frontend/backend.
+6. Проверить, что `JWT_SECRET`, `DATABASE_URL`, ключи геокодера и оплаты выставлены корректно.
 
 Одобрение главным админом:
 - `GET /api/admin/stores?status=pending`
@@ -321,3 +388,9 @@ npm run migrate:merchant-products -- --store-id 42 --dsn-key STORE_42 --dry-run
 - После сохранения координаты обновляются сразу в:
   - основной БД проекта (`warehouses.lat/lng`)
   - map-platform PostGIS (`public.warehouses.geom`)
+
+## Этап 2: документный складской учёт
+
+Добавлены черновики и проведение складских документов, поставщики, дробные количества, средневзвешенная складская стоимость, снимки инвентаризации, связанные обратные операции и контролируемое снятие ручных резервов. Legacy-стоимость после миграции помечается неизвестной, а не нулевой. Прямые API приёмки и списания отключены, чтобы нельзя было обойти документы.
+
+Модель, ограничения и безопасный порядок миграции описаны в [docs/stage2-warehouse-accounting.md](docs/stage2-warehouse-accounting.md).

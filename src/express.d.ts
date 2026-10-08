@@ -5,6 +5,8 @@ declare global {
     interface Request {
       user?: JwtPayload;
       file?: any;
+      rawBody?: string;
+      requestId?: string;
     }
   }
 }

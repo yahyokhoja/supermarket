@@ -2,7 +2,20 @@ import bcrypt from 'bcryptjs';
 import { Pool } from 'pg';
 
 export function connectDb(connectionString: string) {
-  return new Pool({ connectionString });
+  const pool = new Pool({
+    connectionString,
+    max: 5,  // минимум подключений
+    min: 0,  // не создавать предварительно
+    idleTimeoutMillis: 3000,
+    connectionTimeoutMillis: 2000,
+    application_name: 'supermarket-api',
+  });
+  
+  pool.on('error', (err) => {
+    console.error('Pool error', err);
+  });
+  
+  return pool;
 }
 
 export async function initDb(pool: Pool) {
@@ -41,6 +54,7 @@ export async function initDb(pool: Pool) {
       description TEXT,
       price NUMERIC(12,2) NOT NULL,
       category TEXT,
+      barcode TEXT,
       image_url TEXT,
       unit TEXT NOT NULL DEFAULT 'шт',
       in_stock BOOLEAN NOT NULL DEFAULT TRUE,
@@ -71,6 +85,9 @@ export async function initDb(pool: Pool) {
       vehicle_type TEXT,
       status TEXT NOT NULL DEFAULT 'offline',
       last_seen_at TIMESTAMPTZ,
+      current_lat DOUBLE PRECISION,
+      current_lng DOUBLE PRECISION,
+      current_location_updated_at TIMESTAMPTZ,
       verification_status TEXT NOT NULL DEFAULT 'pending',
       transport_license TEXT,
       vehicle_registration_number TEXT,
@@ -101,6 +118,8 @@ export async function initDb(pool: Pool) {
       delivery_fee NUMERIC(12,2),
       courier_fee NUMERIC(12,2),
       payment_method TEXT DEFAULT 'cash',
+      substitution_preference TEXT NOT NULL DEFAULT 'contact_me',
+      substitution_note TEXT,
       assigned_courier_id BIGINT REFERENCES couriers(id) ON DELETE SET NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -178,7 +197,11 @@ export async function initDb(pool: Pool) {
       product_id BIGINT NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
       product_name TEXT NOT NULL,
       requested_qty INTEGER NOT NULL CHECK(requested_qty > 0),
-      picked_qty INTEGER NOT NULL DEFAULT 0 CHECK(picked_qty >= 0)
+      picked_qty INTEGER NOT NULL DEFAULT 0 CHECK(picked_qty >= 0),
+      result_status TEXT NOT NULL DEFAULT 'pending',
+      substitute_product_name TEXT,
+      result_note TEXT,
+      barcode_scanned TEXT
     );
 
     CREATE TABLE IF NOT EXISTS payment_transactions (
@@ -224,6 +247,8 @@ export async function initDb(pool: Pool) {
       channel TEXT NOT NULL CHECK (channel IN ('email', 'phone')),
       purpose TEXT NOT NULL DEFAULT 'store_onboarding',
       code TEXT NOT NULL,
+      attempts_count INTEGER NOT NULL DEFAULT 0,
+      locked_until TIMESTAMPTZ,
       expires_at TIMESTAMPTZ NOT NULL,
       used_at TIMESTAMPTZ,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -235,6 +260,7 @@ export async function initDb(pool: Pool) {
       name TEXT NOT NULL,
       description TEXT,
       price NUMERIC(12,2) NOT NULL,
+      barcode TEXT,
       image_url TEXT,
       unit TEXT NOT NULL DEFAULT 'шт',
       in_stock BOOLEAN NOT NULL DEFAULT TRUE,
@@ -263,6 +289,29 @@ export async function initDb(pool: Pool) {
       mode TEXT NOT NULL DEFAULT 'shared' CHECK (mode IN ('shared', 'dedicated')),
       dsn_key TEXT,
       dedicated_database_url TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS notifications (
+      id BIGSERIAL PRIMARY KEY,
+      user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      level TEXT NOT NULL DEFAULT 'info',
+      title TEXT NOT NULL,
+      body TEXT,
+      entity_type TEXT,
+      entity_id BIGINT,
+      is_read BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      read_at TIMESTAMPTZ
+    );
+
+    CREATE TABLE IF NOT EXISTS warehouse_purchase_drafts (
+      id BIGSERIAL PRIMARY KEY,
+      warehouse_id BIGINT REFERENCES warehouses(id) ON DELETE CASCADE,
+      status TEXT NOT NULL DEFAULT 'draft',
+      created_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+      items_json JSONB NOT NULL DEFAULT '[]'::jsonb,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
@@ -309,8 +358,38 @@ export async function initDb(pool: Pool) {
   `);
 
   await pool.query(`
+    ALTER TABLE user_verification_codes
+      ADD COLUMN IF NOT EXISTS attempts_count INTEGER NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS locked_until TIMESTAMPTZ;
+  `);
+
+  await pool.query(`
     CREATE INDEX IF NOT EXISTS ix_user_verification_codes_lookup
     ON user_verification_codes (user_id, channel, purpose, expires_at DESC);
+  `);
+
+  // Ensure barcode column exists before creating index
+  await pool.query(`
+    ALTER TABLE products
+      ADD COLUMN IF NOT EXISTS barcode TEXT,
+      ADD COLUMN IF NOT EXISTS unit TEXT NOT NULL DEFAULT 'шт',
+      ADD COLUMN IF NOT EXISTS stock_quantity INTEGER NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS home_warehouse_id BIGINT REFERENCES warehouses(id) ON DELETE SET NULL;
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS ix_products_barcode
+    ON products (barcode);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS ix_notifications_user_read
+    ON notifications (user_id, is_read, created_at DESC);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS ix_warehouse_purchase_drafts_created
+    ON warehouse_purchase_drafts (created_at DESC);
   `);
 
   await pool.query(`
@@ -351,6 +430,12 @@ export async function initDb(pool: Pool) {
 
   await pool.query(`
     UPDATE users
+    SET role = 'customer'
+    WHERE lower(COALESCE(role, '')) = 'user';
+  `);
+
+  await pool.query(`
+    UPDATE users
     SET
       email_verified_at = COALESCE(email_verified_at, NOW()),
       phone_verified_at = CASE WHEN phone IS NOT NULL AND btrim(phone) <> '' THEN COALESCE(phone_verified_at, NOW()) ELSE phone_verified_at END
@@ -360,6 +445,9 @@ export async function initDb(pool: Pool) {
   await pool.query(`
     ALTER TABLE couriers
       ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS current_lat DOUBLE PRECISION,
+      ADD COLUMN IF NOT EXISTS current_lng DOUBLE PRECISION,
+      ADD COLUMN IF NOT EXISTS current_location_updated_at TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS verification_status TEXT NOT NULL DEFAULT 'pending',
       ADD COLUMN IF NOT EXISTS transport_license TEXT,
       ADD COLUMN IF NOT EXISTS vehicle_registration_number TEXT,
@@ -384,13 +472,6 @@ export async function initDb(pool: Pool) {
   `);
 
   await pool.query(`
-    ALTER TABLE products
-      ADD COLUMN IF NOT EXISTS unit TEXT NOT NULL DEFAULT 'шт',
-      ADD COLUMN IF NOT EXISTS stock_quantity INTEGER NOT NULL DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS home_warehouse_id BIGINT REFERENCES warehouses(id) ON DELETE SET NULL;
-  `);
-
-  await pool.query(`
     ALTER TABLE orders
       ADD COLUMN IF NOT EXISTS serviceable BOOLEAN,
       ADD COLUMN IF NOT EXISTS delivery_zone TEXT,
@@ -401,7 +482,9 @@ export async function initDb(pool: Pool) {
       ADD COLUMN IF NOT EXISTS delivery_eta_min INTEGER,
       ADD COLUMN IF NOT EXISTS delivery_fee NUMERIC(12,2),
       ADD COLUMN IF NOT EXISTS courier_fee NUMERIC(12,2),
-      ADD COLUMN IF NOT EXISTS payment_method TEXT DEFAULT 'cash';
+      ADD COLUMN IF NOT EXISTS payment_method TEXT DEFAULT 'cash',
+      ADD COLUMN IF NOT EXISTS substitution_preference TEXT NOT NULL DEFAULT 'contact_me',
+      ADD COLUMN IF NOT EXISTS substitution_note TEXT;
   `);
 
   await pool.query(`
@@ -411,7 +494,16 @@ export async function initDb(pool: Pool) {
 
   await pool.query(`
     ALTER TABLE merchant_products
+      ADD COLUMN IF NOT EXISTS barcode TEXT,
       ADD COLUMN IF NOT EXISTS unit TEXT NOT NULL DEFAULT 'шт';
+  `);
+
+  await pool.query(`
+    ALTER TABLE pick_task_items
+      ADD COLUMN IF NOT EXISTS result_status TEXT NOT NULL DEFAULT 'pending',
+      ADD COLUMN IF NOT EXISTS substitute_product_name TEXT,
+      ADD COLUMN IF NOT EXISTS result_note TEXT,
+      ADD COLUMN IF NOT EXISTS barcode_scanned TEXT;
   `);
 
   await pool.query(`

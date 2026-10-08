@@ -1,4 +1,4 @@
-export type UserRole = 'customer' | 'courier' | 'admin' | 'picker';
+export type UserRole = 'owner' | 'customer' | 'courier' | 'admin' | 'picker';
 
 export interface JwtPayload {
   id: number;
@@ -57,6 +57,8 @@ export interface DbOrder {
   delivery_fee: number | null;
   courier_fee: number | null;
   payment_method: string | null;
+  substitution_preference?: string | null;
+  substitution_note?: string | null;
   assigned_courier_id: number | null;
   created_at: string;
   updated_at: string;
@@ -85,6 +87,8 @@ export interface ApiOrder {
   deliveryFee: number | null;
   courierFee: number | null;
   paymentMethod: string | null;
+  substitutionPreference?: string | null;
+  substitutionNote?: string | null;
   assignedCourierId: number | null;
   createdAt: string;
   updatedAt: string;

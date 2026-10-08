@@ -1,0 +1,17 @@
+services:
+  postgres-test:
+    image: postgres:16
+    container_name: supermarket-postgres-stage1-test
+    environment:
+      POSTGRES_DB: supermarket_stage1_test
+      POSTGRES_USER: supermarket_test
+      POSTGRES_PASSWORD: supermarket_test_password
+    ports:
+      - "55433:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U supermarket_test -d supermarket_stage1_test"]
+      interval: 2s
+      timeout: 2s
+      retries: 20

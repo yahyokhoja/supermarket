@@ -6,24 +6,58 @@ import http from 'node:http';
 import https from 'node:https';
 import type { Server as NetServer } from 'node:net';
 import bcrypt from 'bcryptjs';
-import cors from 'cors';
 import express from 'express';
 import multer from 'multer';
 import morgan from 'morgan';
 import type { Pool, PoolClient } from 'pg';
 import { authRequired, buildToken, roleRequired, setAuthUserResolver } from './auth';
-import { connectDb, initDb, seedProductCategories, seedProducts, seedUsers } from './db';
+import { connectDb } from './db';
+import { HttpError } from './http-error';
 import { migrateMerchantProducts, type MerchantProductsMigrationStage } from './merchant-product-migration';
+import { createCorsMiddleware, createIpRateLimiter, parseCorsAllowlist, securityHeaders } from './security';
 import { TenantDbResolver } from './tenant-db';
+import {
+  consumePickTaskReservations,
+  inventoryConsistencyReport,
+  postSingleStockOperation,
+  recordOrderReservation,
+  releaseManualReservation,
+  releaseOrderReservations
+} from './inventory-service';
+import {
+  cancelInventoryDocument,
+  createInventoryDraft,
+  getInventoryDocument,
+  inventoryValuationReport,
+  listInventoryDocuments,
+  postInventoryDocument,
+  updateInventoryDraft,
+  type DraftInput
+} from './inventory-documents';
 import type { ApiOrder, DbOrder, DbUser, PublicUser, UserRole } from './types';
+import { validateBody, validateParams } from './validation';
+import { loginBodySchema, registerBodySchema, verificationConfirmBodySchema, verificationRequestBodySchema } from './validation/schemas/auth';
+import { cartAddItemBodySchema, cartItemParamsSchema, cartUpdateItemBodySchema } from './validation/schemas/cart';
+import { createOrderBodySchema, orderIdParamsSchema, updateOrderStatusBodySchema } from './validation/schemas/orders';
+import { updateMeBodySchema } from './validation/schemas/users';
+import { accessibleStoreIds, accessibleWarehouseIds, hasStoreAccess, warehouseOperational } from './network-access';
 
 const PORT = Number(process.env.PORT || 4000);
-const JWT_SECRET = process.env.JWT_SECRET || 'change_me_super_secret';
+const NODE_ENV = String(process.env.NODE_ENV || 'development').trim().toLowerCase();
+function readAppSecret(name: string, fallback: string) {
+  const value = String(process.env[name] || '').trim();
+  if (value && value !== fallback) return value;
+  if (NODE_ENV === 'production') {
+    throw new Error(`Environment variable ${name} must be configured with a secure value in production`);
+  }
+  return value || fallback;
+}
+const JWT_SECRET = readAppSecret('JWT_SECRET', 'change_me_super_secret');
 const DATABASE_URL = process.env.DATABASE_URL || 'postgresql://supermarket:supermarket_dev_password@localhost:55432/supermarket';
 const MAP_DATABASE_URL = process.env.MAP_DATABASE_URL || 'postgresql://map:mappass@localhost:5434/mapdb';
-const SYSTEM_ADMIN_EMAIL = 'admin@universal.local';
 const ADMIN_PERMISSIONS = [
   'view_orders',
+  'manage_orders',
   'view_analytics',
   'manage_products',
   'manage_warehouse',
@@ -39,8 +73,14 @@ const DGIS_GEOCODER_API_KEY = process.env.DGIS_GEOCODER_API_KEY || '';
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 const OPENAI_VISION_MODEL = process.env.OPENAI_VISION_MODEL || 'gpt-4.1-mini';
 const PAYMENT_PROVIDER = process.env.PAYMENT_PROVIDER || 'mockpay';
-const PAYMENT_WEBHOOK_SECRET = process.env.PAYMENT_WEBHOOK_SECRET || 'dev_payment_webhook_secret_change_me';
+const PAYMENT_WEBHOOK_SECRET = readAppSecret('PAYMENT_WEBHOOK_SECRET', 'dev_payment_webhook_secret_change_me');
+const VERIFICATION_CODE_SECRET = readAppSecret('VERIFICATION_CODE_SECRET', 'dev_verification_code_secret_change_me');
+const CORS_ORIGIN_ALLOWLIST = parseCorsAllowlist(process.env.CORS_ORIGIN_ALLOWLIST);
 const COURIER_ONLINE_TTL_MS = 5 * 60 * 1000; // 5 минут считаем онлайн
+const VERIFICATION_CODE_EXPIRES_MS = 10 * 60 * 1000;
+const VERIFICATION_CODE_RESEND_COOLDOWN_MS = 60 * 1000;
+const VERIFICATION_CODE_MAX_ATTEMPTS = 5;
+const VERIFICATION_CODE_LOCK_MINUTES = 10;
 const ORDER_STATUS = {
   assembling: 'assembling',
   courierAssigned: 'courier_assigned',
@@ -55,18 +95,91 @@ type OrderStatus = (typeof ORDER_STATUS)[keyof typeof ORDER_STATUS];
 const CUSTOMER_EDITABLE_STATUSES: OrderStatus[] = [ORDER_STATUS.assembling, ORDER_STATUS.courierAssigned];
 const MAX_UPLOAD_FILE_SIZE_BYTES = 12 * 1024 * 1024; // увеличили лимит до 12 МБ для мобильных фото
 
-const app = express();
+type OrderUpdateReason =
+  | 'created'
+  | 'status_changed'
+  | 'address_changed'
+  | 'courier_assigned'
+  | 'courier_location'
+  | 'picking_updated'
+  | 'payment_updated'
+  | 'deleted'
+  | 'updated';
+type OrderUpdateListener = (reason: OrderUpdateReason) => void;
+const orderUpdateListeners = new Map<number, Set<OrderUpdateListener>>();
 
-class HttpError extends Error {
-  statusCode: number;
-  exposeMessage: boolean;
+function subscribeOrderUpdates(orderId: number, listener: OrderUpdateListener) {
+  const current = orderUpdateListeners.get(orderId) ?? new Set<OrderUpdateListener>();
+  current.add(listener);
+  orderUpdateListeners.set(orderId, current);
+  return () => {
+    const next = orderUpdateListeners.get(orderId);
+    if (!next) return;
+    next.delete(listener);
+    if (next.size === 0) {
+      orderUpdateListeners.delete(orderId);
+    }
+  };
+}
 
-  constructor(statusCode: number, message: string, opts?: { exposeMessage?: boolean }) {
-    super(message);
-    this.name = 'HttpError';
-    this.statusCode = Math.max(400, Math.min(599, Math.floor(Number(statusCode) || 500)));
-    this.exposeMessage = opts?.exposeMessage ?? this.statusCode < 500;
+function notifyOrderUpdated(orderId: number, reason: OrderUpdateReason = 'updated') {
+  const listeners = orderUpdateListeners.get(orderId);
+  if (!listeners || listeners.size === 0) return;
+  for (const listener of Array.from(listeners)) {
+    try {
+      listener(reason);
+    } catch (error) {
+      console.warn(`Order update listener failed for #${orderId}:`, error);
+    }
   }
+}
+
+async function notifyCourierOrdersUpdated(courierId: number, reason: OrderUpdateReason = 'courier_location') {
+  const rows = (
+    await db.query(
+      `
+        SELECT id
+        FROM orders
+        WHERE assigned_courier_id = $1
+          AND status NOT IN ('paid', 'cancelled')
+      `,
+      [courierId]
+    )
+  ).rows as Array<{ id: number }>;
+  for (const row of rows) {
+    notifyOrderUpdated(toNumber(row.id), reason);
+  }
+}
+
+const app = express();
+app.disable('x-powered-by');
+app.use((req, res, next) => {
+  const inboundId = String(req.headers['x-request-id'] || '').trim();
+  const requestId = inboundId || randomUUID();
+  req.requestId = requestId;
+  res.setHeader('x-request-id', requestId);
+  next();
+});
+
+type ApiErrorCode =
+  | 'VALIDATION_ERROR'
+  | 'AUTH_REQUIRED'
+  | 'FORBIDDEN'
+  | 'NOT_FOUND'
+  | 'RATE_LIMITED'
+  | 'PAYLOAD_TOO_LARGE'
+  | 'STORAGE_FULL'
+  | 'INTERNAL_ERROR';
+
+function mapErrorCode(statusCode: number): ApiErrorCode {
+  if (statusCode === 400) return 'VALIDATION_ERROR';
+  if (statusCode === 401) return 'AUTH_REQUIRED';
+  if (statusCode === 403) return 'FORBIDDEN';
+  if (statusCode === 404) return 'NOT_FOUND';
+  if (statusCode === 413) return 'PAYLOAD_TOO_LARGE';
+  if (statusCode === 429) return 'RATE_LIMITED';
+  if (statusCode === 507) return 'STORAGE_FULL';
+  return 'INTERNAL_ERROR';
 }
 
 function wrapAsyncHandler(handler: any) {
@@ -126,12 +239,7 @@ const upload = multer({
   limits: { fileSize: MAX_UPLOAD_FILE_SIZE_BYTES }
 });
 
-const dbReady = (async () => {
-  await initDb(db);
-  await seedProducts(db);
-  await seedProductCategories(db);
-  await seedUsers(db);
-})().catch((error) => {
+const dbReady = db.query('SELECT 1').catch((error) => {
   dbBootstrapError = error instanceof Error ? error : new Error(String(error));
   console.error('DB bootstrap error:', dbBootstrapError);
 });
@@ -161,8 +269,36 @@ const mapReady = (async () => {
   console.error('Map bootstrap warning:', mapBootstrapError);
 });
 
-app.use(cors());
-app.use(express.json());
+const apiRateLimiter = createIpRateLimiter({
+  windowMs: 60_000,
+  max: 180,
+  message: 'Слишком много запросов. Попробуйте снова через минуту.',
+  keyPrefix: 'api',
+  skip: (req) => req.path.startsWith('/api/health')
+});
+const authRateLimiter = createIpRateLimiter({
+  windowMs: 10 * 60 * 1000,
+  max: 20,
+  message: 'Слишком много попыток авторизации. Повторите позже.',
+  keyPrefix: 'auth'
+});
+
+app.use(securityHeaders);
+app.use(createCorsMiddleware({ allowlist: CORS_ORIGIN_ALLOWLIST }));
+app.use('/api', apiRateLimiter);
+const defaultJsonParser = express.json({ limit: '1mb' });
+const webhookJsonParser = express.json({
+  limit: '512kb',
+  verify: (req: any, _res, buffer) => {
+    req.rawBody = buffer.toString('utf8');
+  }
+});
+app.use((req, res, next) => {
+  if (req.path === '/api/payments/webhook') {
+    return webhookJsonParser(req, res, next);
+  }
+  return defaultJsonParser(req, res, next);
+});
 app.use(morgan('dev'));
 app.use('/uploads', express.static(uploadsDir));
 app.use(async (_req, res, next) => {
@@ -184,6 +320,18 @@ app.use(async (_req, res, next) => {
   }
 });
 
+// Marketplace/delivery entry points are retained as historical code only and are
+// not active in the standalone retail-network product.
+app.use((req,res,next)=>{
+  const disabled = req.path==='/api/auth/register' ||
+    req.path.startsWith('/api/cart') || req.path.startsWith('/api/delivery/') ||
+    req.path.startsWith('/api/couriers') || req.path.startsWith('/api/stores/my') ||
+    req.path.startsWith('/api/stores/uploads') ||
+    (req.path.startsWith('/api/orders') && !req.path.startsWith('/api/admin/'));
+  if(disabled)return res.status(410).json({message:'Функция отключена: доставку и клиентские заказы обслуживает HARID24'});
+  next();
+});
+
 function toNumber(value: unknown) {
   return Number(value);
 }
@@ -191,6 +339,16 @@ function toNumber(value: unknown) {
 function toDateString(value: unknown) {
   if (value instanceof Date) return value.toISOString();
   return String(value);
+}
+
+function normalizeUserRole(value: unknown): UserRole {
+  const raw = String(value || '').trim().toLowerCase();
+  if (raw === 'owner' || raw === 'customer' || raw === 'courier' || raw === 'admin' || raw === 'picker') {
+    return raw;
+  }
+  // Backward compatibility for legacy rows.
+  if (raw === 'user') return 'customer';
+  return 'customer';
 }
 
 function publicUser(user: DbUser): PublicUser {
@@ -231,7 +389,7 @@ function normalizeUserRow(row: any): DbUser {
     phone: row.phone ?? null,
     address: row.address ?? null,
     password_hash: String(row.password_hash),
-    role: row.role as UserRole,
+    role: normalizeUserRole(row.role),
     is_active: row.is_active !== false,
     session_version: Number(row.session_version ?? 0),
     permissions: Array.isArray(row.permissions)
@@ -263,6 +421,8 @@ function normalizeOrderRow(row: any): DbOrder {
     delivery_fee: row.delivery_fee === null ? null : Number(row.delivery_fee),
     courier_fee: row.courier_fee === null ? null : Number(row.courier_fee),
     payment_method: row.payment_method === null ? null : String(row.payment_method),
+    substitution_preference: row.substitution_preference === null || row.substitution_preference === undefined ? 'contact_me' : String(row.substitution_preference),
+    substitution_note: row.substitution_note === null || row.substitution_note === undefined ? null : String(row.substitution_note),
     assigned_courier_id: row.assigned_courier_id === null ? null : Number(row.assigned_courier_id),
     created_at: toDateString(row.created_at),
     updated_at: toDateString(row.updated_at),
@@ -345,6 +505,7 @@ function merchantProductView(row: any) {
     name: String(row.name),
     description: row.description ?? null,
     price: Number(row.price),
+    barcode: row.barcode ?? null,
     imageUrl: row.image_url ?? null,
     unit: row.unit ?? 'шт',
     inStock: row.in_stock !== false,
@@ -515,7 +676,7 @@ async function createPickTaskInternal(
         SELECT product_id, product_name, quantity
         FROM order_items
         WHERE order_id = $1
-        ORDER BY id ASC
+        ORDER BY w.id ASC
       `,
       [orderId]
     )
@@ -546,31 +707,6 @@ async function createPickTaskInternal(
   for (const item of items) {
     const productId = toNumber(item.product_id);
     const requestedQty = toNumber(item.quantity);
-    await ensureWarehouseStockRow(client, warehouseId, productId);
-    const stock = (
-      await client.query(
-        `
-          SELECT quantity, reserved_quantity
-          FROM warehouse_stock
-          WHERE warehouse_id = $1 AND product_id = $2
-          FOR UPDATE
-        `,
-        [warehouseId, productId]
-      )
-    ).rows[0];
-    const available = Math.max(toNumber(stock?.quantity ?? 0) - toNumber(stock?.reserved_quantity ?? 0), 0);
-    if (available < requestedQty) {
-      throw new HttpError(400, `Недостаточно остатка для товара "${String(item.product_name)}". Нужно: ${requestedQty}, доступно: ${available}`);
-    }
-
-    await client.query(
-      `
-        UPDATE warehouse_stock
-        SET reserved_quantity = reserved_quantity + $1, updated_at = NOW()
-        WHERE warehouse_id = $2 AND product_id = $3
-      `,
-      [requestedQty, warehouseId, productId]
-    );
     await client.query(
       `
         INSERT INTO pick_task_items (pick_task_id, product_id, product_name, requested_qty, picked_qty)
@@ -578,15 +714,19 @@ async function createPickTaskInternal(
       `,
       [taskId, productId, String(item.product_name), requestedQty]
     );
-    await client.query(
-      `
-        INSERT INTO stock_movements (warehouse_id, product_id, movement_type, quantity, reason, reference_type, reference_id, created_by)
-        VALUES ($1, $2, 'reserve', $3, $4, 'pick_task', $5, $6)
-      `,
-      [warehouseId, productId, requestedQty, `Резерв под задачу сборки #${taskId}`, taskId, creatorUserId]
-    );
-    await syncProductAvailabilityFromWarehouse(client, productId);
   }
+
+  await recordOrderReservation(client, {
+    orderId,
+    taskId,
+    warehouseId,
+    createdBy: creatorUserId,
+    items: items.map((item: any) => ({
+      productId: toNumber(item.product_id),
+      productName: String(item.product_name),
+      quantity: toNumber(item.quantity)
+    }))
+  });
 
   return taskId;
 }
@@ -605,7 +745,7 @@ setAuthUserResolver(async (userId) => {
   return {
     id: Number(row.id),
     email: String(row.email),
-    role: row.role as UserRole,
+    role: normalizeUserRole(row.role),
     isActive: row.is_active !== false,
     sessionVersion: Number(row.session_version ?? 0)
   };
@@ -627,8 +767,48 @@ async function logAdminAction(
   );
 }
 
-function isSystemAdmin(user: Pick<DbUser, 'email'>) {
-  return user.email.trim().toLowerCase() === SYSTEM_ADMIN_EMAIL;
+type NotificationPayload = {
+  userId: number;
+  level?: 'info' | 'warning' | 'success';
+  title: string;
+  body?: string | null;
+  entityType?: string | null;
+  entityId?: number | null;
+};
+
+async function createNotification(payload: NotificationPayload) {
+  if (!payload.userId || !payload.title.trim()) return;
+  await db.query(
+    `
+      INSERT INTO notifications (user_id, level, title, body, entity_type, entity_id)
+      VALUES ($1, $2, $3, $4, $5, $6)
+    `,
+    [
+      payload.userId,
+      payload.level || 'info',
+      payload.title.trim(),
+      payload.body ? payload.body.trim() : null,
+      payload.entityType || null,
+      payload.entityId ?? null
+    ]
+  );
+}
+
+async function createNotificationForAdmins(payload: Omit<NotificationPayload, 'userId'>) {
+  const rows = (
+    await db.query(
+      `
+        SELECT id
+        FROM users
+        WHERE role = 'admin' AND is_active = TRUE
+      `
+    )
+  ).rows;
+  await Promise.all(rows.map((row: any) => createNotification({ ...payload, userId: toNumber(row.id) })));
+}
+
+function isSystemAdmin(user: Pick<DbUser, 'role'>) {
+  return user.role === 'owner';
 }
 
 function normalizePermissions(input: unknown): AdminPermission[] {
@@ -646,20 +826,8 @@ async function getUserPermissions(userId: number) {
 
 async function getAdminWarehouseScopeIds(userId: number) {
   const user = await getUserById(userId);
-  if (!user || user.role !== 'admin') return [] as number[];
-  if (isSystemAdmin(user)) return null as number[] | null;
-  const rows = (
-    await db.query(
-      `
-        SELECT id
-        FROM warehouses
-        WHERE created_by_admin_id = $1
-        ORDER BY id ASC
-      `,
-      [userId]
-    )
-  ).rows;
-  return rows.map((row: any) => toNumber(row.id));
+  if (!user || !['owner','admin','picker'].includes(user.role)) return [] as number[];
+  return accessibleWarehouseIds(db,userId);
 }
 
 async function sanitizeWarehouseScopes(input: unknown) {
@@ -707,9 +875,15 @@ async function assertWarehouseAccess(req: express.Request, res: express.Response
   return false;
 }
 
+async function assertWarehouseOperation(req:express.Request,res:express.Response,warehouseId:number){
+  if(!(await assertWarehouseAccess(req,res,warehouseId)))return false;
+  if(!(await warehouseOperational(db,warehouseId))){res.status(409).json({message:'Склад не сопоставлен с активным супермаркетом; новые операции запрещены'});return false}
+  return true;
+}
+
 async function adminHasPermission(userId: number, permission: AdminPermission) {
   const user = await getUserById(userId);
-  if (!user || user.role !== 'admin') return false;
+  if (!user || !['owner','admin'].includes(user.role)) return false;
   if (isSystemAdmin(user)) return true;
   const permissions = await getUserPermissions(userId);
   return permissions.includes(permission);
@@ -736,8 +910,8 @@ async function requireChiefAdmin(req: express.Request, res: express.Response) {
     return false;
   }
   const user = await getUserById(userId);
-  if (!user || user.role !== 'admin' || !isSystemAdmin(user)) {
-    res.status(403).json({ message: 'Только главный администратор может выполнить это действие' });
+  if (!user || user.role !== 'owner') {
+    res.status(403).json({ message: 'Только владелец сети может выполнить это действие' });
     return false;
   }
   return true;
@@ -831,8 +1005,8 @@ async function evaluateCourierCustomerRevert(userId: number, courierRow: any) {
   };
 }
 
-async function getActiveOrderCountForCourier(courierId: number) {
-  const row = (await db.query(
+async function getActiveOrderCountForCourier(courierId: number, client: Pool | PoolClient = db) {
+  const row = (await client.query(
     `
       SELECT COUNT(*)::text as cnt
       FROM orders
@@ -845,37 +1019,118 @@ async function getActiveOrderCountForCourier(courierId: number) {
 }
 
 async function assignCourierIfPossible(orderId: number) {
-  const couriersRows = (await db.query(
-    `
-      SELECT id, max_active_orders
-      FROM couriers
-      WHERE status = 'available'
-        AND last_seen_at IS NOT NULL
-        AND last_seen_at >= NOW() - INTERVAL '5 minutes'
-    `
-  )).rows;
-
-  let selected: { id: number; active: number } | null = null;
-  for (const row of couriersRows) {
-    const courierId = toNumber(row.id);
-    const active = await getActiveOrderCountForCourier(courierId);
-    if (active >= toNumber(row.max_active_orders)) continue;
-    if (!selected || active < selected.active) {
-      selected = { id: courierId, active };
+  const client = await db.connect();
+  let selectedCourierId: number | null = null;
+  let createdBy: number | null = null;
+  try {
+    await client.query('BEGIN');
+    const orderRow = (
+      await client.query(
+        `
+          SELECT id, user_id
+          FROM orders
+          WHERE id = $1
+            AND status = $2
+            AND assigned_courier_id IS NULL
+          FOR UPDATE
+          LIMIT 1
+        `,
+        [orderId, ORDER_STATUS.assembling]
+      )
+    ).rows[0];
+    if (!orderRow) {
+      await client.query('ROLLBACK');
+      return null;
     }
+    createdBy = toNumber(orderRow.user_id);
+
+    const selectedCourier = (
+      await client.query(
+        `
+          SELECT c.id, c.user_id
+          FROM couriers c
+          LEFT JOIN LATERAL (
+            SELECT COUNT(*)::int AS active_count
+            FROM orders o
+            WHERE o.assigned_courier_id = c.id
+              AND o.status IN ('courier_assigned', 'courier_picked', 'on_the_way', 'arrived')
+          ) active ON TRUE
+          WHERE c.status = 'available'
+            AND c.verification_status = 'approved'
+            AND c.transport_license IS NOT NULL AND btrim(c.transport_license) <> ''
+            AND c.vehicle_registration_number IS NOT NULL AND btrim(c.vehicle_registration_number) <> ''
+            AND c.tech_passport_image_url IS NOT NULL AND btrim(c.tech_passport_image_url) <> ''
+            AND c.last_seen_at IS NOT NULL
+            AND c.last_seen_at >= NOW() - INTERVAL '5 minutes'
+            AND COALESCE(active.active_count, 0) < c.max_active_orders
+          ORDER BY COALESCE(active.active_count, 0) ASC, c.id ASC
+          FOR UPDATE OF c SKIP LOCKED
+          LIMIT 1
+        `
+      )
+    ).rows[0];
+    if (!selectedCourier) {
+      await client.query('COMMIT');
+      return null;
+    }
+
+    const updatedOrder = (
+      await client.query(
+        `
+          UPDATE orders
+          SET assigned_courier_id = $1, status = $2, updated_at = NOW()
+          WHERE id = $3
+            AND status = $4
+            AND assigned_courier_id IS NULL
+          RETURNING id
+        `,
+        [toNumber(selectedCourier.id), ORDER_STATUS.courierAssigned, orderId, ORDER_STATUS.assembling]
+      )
+    ).rows[0];
+    if (!updatedOrder) {
+      await client.query('ROLLBACK');
+      return null;
+    }
+    selectedCourierId = toNumber(selectedCourier.id);
+
+    await client.query(
+      'INSERT INTO order_events (order_id, status, comment, created_by) VALUES ($1, $2, $3, $4)',
+      [orderId, ORDER_STATUS.courierAssigned, 'Курьер назначен автоматически', createdBy]
+    );
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
   }
 
-  if (!selected) return null;
+  if (!selectedCourierId) return null;
 
-  await db.query('UPDATE orders SET assigned_courier_id = $1, status = $2 WHERE id = $3', [selected.id, ORDER_STATUS.courierAssigned, orderId]);
-  const orderRow = (await db.query('SELECT user_id FROM orders WHERE id = $1 LIMIT 1', [orderId])).rows[0];
-  const createdBy = orderRow ? toNumber(orderRow.user_id) : null;
-  await db.query(
-    'INSERT INTO order_events (order_id, status, comment, created_by) VALUES ($1, $2, $3, $4)',
-    [orderId, ORDER_STATUS.courierAssigned, 'Курьер назначен автоматически', createdBy]
-  );
+  if (createdBy) {
+    await createNotification({
+      userId: createdBy,
+      level: 'info',
+      title: `Курьер назначен на заказ #${orderId}`,
+      body: 'Ожидайте прибытия курьера',
+      entityType: 'order',
+      entityId: orderId
+    });
+  }
+  const courierUser = (await db.query('SELECT user_id FROM couriers WHERE id = $1 LIMIT 1', [selectedCourierId])).rows[0];
+  if (courierUser?.user_id) {
+    await createNotification({
+      userId: toNumber(courierUser.user_id),
+      level: 'info',
+      title: `Новый назначенный заказ #${orderId}`,
+      body: 'Откройте раздел доставок',
+      entityType: 'order',
+      entityId: orderId
+    });
+  }
+  notifyOrderUpdated(orderId, 'courier_assigned');
 
-  return selected.id;
+  return selectedCourierId;
 }
 
 async function tryAssignOldestPendingOrder() {
@@ -995,6 +1250,8 @@ function orderView(order: DbOrder): ApiOrder {
     deliveryFee: order.delivery_fee,
     courierFee: order.courier_fee,
     paymentMethod: order.payment_method,
+    substitutionPreference: order.substitution_preference ?? 'contact_me',
+    substitutionNote: order.substitution_note ?? null,
     assignedCourierId: order.assigned_courier_id,
     createdAt: order.created_at,
     updatedAt: order.updated_at,
@@ -1014,6 +1271,7 @@ function normalizeProductRow(row: any) {
     description: row.description,
     price: Number(row.price),
     category: row.category,
+    barcode: row.barcode ?? null,
     imageUrl: row.image_url,
     unit: row.unit ?? 'шт',
     inStock: Boolean(row.in_stock),
@@ -1071,6 +1329,19 @@ function normalizePaymentStatus(value: unknown): PaymentTxStatus {
   if (raw === 'failed') return 'failed';
   if (raw === 'cancelled') return 'cancelled';
   return 'pending';
+}
+
+function hashVerificationCode(code: string) {
+  return createHmac('sha256', VERIFICATION_CODE_SECRET).update(code).digest('hex');
+}
+
+function verificationCodeMatches(stored: unknown, plainCode: string) {
+  const raw = String(stored || '').trim();
+  if (!raw) return false;
+  const hashed = hashVerificationCode(plainCode);
+  if (raw.length === hashed.length && safeEqualHex(raw, hashed)) return true;
+  // Backward compatibility for older rows created before hashing rollout.
+  return raw === plainCode;
 }
 
 function signWebhookPayload(payloadText: string) {
@@ -1855,12 +2126,16 @@ app.post('/api/delivery/quote', authRequired(JWT_SECRET), async (req, res) => {
   return res.json({ quote });
 });
 
-app.post('/api/auth/register', async (req, res) => {
-  const { fullName, email, password, phone, address } = req.body as Record<string, string>;
-  if (!fullName || !email || !password) return res.status(400).json({ message: 'fullName, email и password обязательны' });
+app.post('/api/auth/register', authRateLimiter, validateBody(registerBodySchema), async (req, res) => {
+  const { fullName, email, password, phone, address } = req.body as {
+    fullName: string;
+    email: string;
+    password: string;
+    phone?: string | null;
+    address?: string | null;
+  };
 
-  const normalizedEmail = email.trim().toLowerCase();
-  const existing = await getUserByEmail(normalizedEmail);
+  const existing = await getUserByEmail(email);
   if (existing) return res.status(409).json({ message: 'Пользователь с таким email уже существует' });
 
   const hash = bcrypt.hashSync(password, 10);
@@ -1870,18 +2145,16 @@ app.post('/api/auth/register', async (req, res) => {
       VALUES ($1, $2, $3, $4, $5, 'customer', '{}')
       RETURNING *
     `,
-    [fullName.trim(), normalizedEmail, phone || null, address || null, hash]
+    [fullName.trim(), email, phone ?? null, address ?? null, hash]
   );
 
   const user = normalizeUserRow(insert.rows[0]);
   return res.status(201).json({ token: buildToken(user, JWT_SECRET), user: publicUser(user) });
 });
 
-app.post('/api/auth/login', async (req, res) => {
-  const { email, password } = req.body as Record<string, string>;
-  if (!email || !password) return res.status(400).json({ message: 'email и password обязательны' });
-
-  const user = await getUserByEmail(email.trim().toLowerCase());
+app.post('/api/auth/login', authRateLimiter, validateBody(loginBodySchema), async (req, res) => {
+  const { email, password } = req.body as { email: string; password: string };
+  const user = await getUserByEmail(email);
   if (!user || !bcrypt.compareSync(password, user.password_hash)) {
     return res.status(401).json({ message: 'Неверные учетные данные' });
   }
@@ -1899,11 +2172,84 @@ app.get('/api/users/me', authRequired(JWT_SECRET), async (req, res) => {
   return res.json({ user: publicUser(user) });
 });
 
-app.put('/api/users/me', authRequired(JWT_SECRET), async (req, res) => {
+app.get('/api/admin/network/context',authRequired(JWT_SECRET),roleRequired('admin'),async(req,res)=>{
+  const stores=await accessibleStoreIds(db,req.user!.id);
+  const rows=(await db.query(`SELECT id,name,code,address,is_active FROM business_stores WHERE ($1::bigint[] IS NULL OR id=ANY($1::bigint[])) ORDER BY name`,[stores])).rows;
+  return res.json({role:req.user!.role,stores:rows,canViewAll:req.user!.role==='owner',message:req.user!.role==='admin'&&!rows.length?'Вам пока не назначен супермаркет':null});
+});
+
+app.get('/api/admin/network/stores',authRequired(JWT_SECRET),roleRequired('admin'),async(req,res)=>{
+  const stores=await accessibleStoreIds(db,req.user!.id);
+  const rows=(await db.query(`SELECT s.id,s.name,s.code,s.address,s.phone,s.is_active,s.archived_at,count(w.id)::int warehouse_count FROM business_stores s LEFT JOIN warehouses w ON w.business_store_id=s.id WHERE ($1::bigint[] IS NULL OR s.id=ANY($1::bigint[])) GROUP BY s.id ORDER BY s.archived_at NULLS FIRST,s.name`,[stores])).rows;
+  return res.json({stores:rows});
+});
+
+app.post('/api/admin/network/stores',authRequired(JWT_SECRET),roleRequired('owner'),async(req,res)=>{
+  const body=req.body as {name?:string;code?:string;address?:string;phone?:string};
+  const name=String(body.name||'').trim(),code=String(body.code||'').trim().toUpperCase();
+  if(name.length<2||code.length<2)return res.status(400).json({message:'Укажите название и код супермаркета'});
+  let company=(await db.query(`SELECT id FROM companies ORDER BY id LIMIT 2`)).rows;
+  if(company.length>1)return res.status(409).json({message:'В БД несколько компаний; требуется ручное сопоставление сети'});
+  if(!company.length)company=(await db.query(`INSERT INTO companies(name) VALUES('Торговая сеть') RETURNING id`)).rows;
+  const row=(await db.query(`INSERT INTO business_stores(company_id,name,code,address,phone) VALUES($1,$2,$3,$4,$5) RETURNING *`,[company[0].id,name,code,String(body.address||'').trim()||null,String(body.phone||'').trim()||null])).rows[0];
+  await logAdminAction(req.user!.id,'network_store.create','business_store',Number(row.id),{name,code});
+  return res.status(201).json({store:row});
+});
+
+app.get('/api/admin/network/stores/:storeId',authRequired(JWT_SECRET),roleRequired('admin'),async(req,res)=>{const id=Number(req.params.storeId);if(!(await hasStoreAccess(db,req.user!.id,id)))return res.status(403).json({message:'Нет доступа к супермаркету'});const row=(await db.query(`SELECT s.*,count(w.id)::int warehouse_count FROM business_stores s LEFT JOIN warehouses w ON w.business_store_id=s.id WHERE s.id=$1 GROUP BY s.id`,[id])).rows[0];if(!row)return res.status(404).json({message:'Супермаркет не найден'});return res.json({store:row})});
+
+app.put('/api/admin/network/stores/:storeId',authRequired(JWT_SECRET),roleRequired('owner'),async(req,res)=>{const id=Number(req.params.storeId),body=req.body as Record<string,unknown>,name=String(body.name||'').trim(),code=String(body.code||'').trim().toUpperCase();if(name.length<2||code.length<2)return res.status(400).json({message:'Укажите название и код супермаркета'});const row=(await db.query(`UPDATE business_stores SET name=$1,code=$2,address=$3,phone=$4,updated_at=NOW() WHERE id=$5 RETURNING *`,[name,code,String(body.address||'').trim()||null,String(body.phone||'').trim()||null,id])).rows[0];if(!row)return res.status(404).json({message:'Супермаркет не найден'});await logAdminAction(req.user!.id,'network_store.update','business_store',id,{name,code});return res.json({store:row})});
+
+app.post('/api/admin/network/stores/:storeId/archive',authRequired(JWT_SECRET),roleRequired('owner'),async(req,res)=>{const id=Number(req.params.storeId);const blockers=(await db.query(`SELECT (SELECT count(*) FROM inventory_documents d JOIN warehouses w ON w.id IN(d.source_warehouse_id,d.destination_warehouse_id) WHERE w.business_store_id=$1 AND d.status='draft')::int drafts,(SELECT count(*) FROM inventory_reservations r JOIN warehouses w ON w.id=r.warehouse_id WHERE w.business_store_id=$1 AND r.status='active')::int reservations,(SELECT count(*) FROM pick_tasks p JOIN warehouses w ON w.id=p.warehouse_id WHERE w.business_store_id=$1 AND p.status IN('new','in_progress'))::int pick_tasks`,[id])).rows[0];if(!blockers)return res.status(404).json({message:'Супермаркет не найден'});await db.query(`INSERT INTO store_archive_checks(store_id,checked_by,blockers) VALUES($1,$2,$3)`,[id,req.user!.id,blockers]);const reasons=Object.entries(blockers).filter(([,v])=>Number(v)>0).map(([k,v])=>`${k}: ${v}`);if(reasons.length)return res.status(409).json({message:'Архивирование заблокировано активными процессами',reasons});const row=(await db.query(`UPDATE business_stores SET is_active=FALSE,archived_at=NOW(),archived_by=$1,updated_at=NOW() WHERE id=$2 AND archived_at IS NULL RETURNING id`,[req.user!.id,id])).rows[0];if(!row)return res.status(404).json({message:'Активный супермаркет не найден'});await logAdminAction(req.user!.id,'network_store.archive','business_store',id,{});return res.json({message:'Супермаркет архивирован'})});
+
+app.get('/api/admin/network/assignments',authRequired(JWT_SECRET),roleRequired('owner'),async(_req,res)=>{
+  const rows=(await db.query(`SELECT a.id,a.user_id,a.store_id,a.permissions,a.assigned_at,u.full_name,u.email,s.name store_name FROM store_user_assignments a JOIN users u ON u.id=a.user_id JOIN business_stores s ON s.id=a.store_id WHERE a.is_active ORDER BY u.full_name,s.name`)).rows;
+  return res.json({assignments:rows});
+});
+
+app.post('/api/admin/network/assignments',authRequired(JWT_SECRET),roleRequired('owner'),async(req,res)=>{
+  const body=req.body as {userId?:number;storeId?:number;permissions?:string[]};const userId=Number(body.userId),storeId=Number(body.storeId);
+  const user=(await db.query(`SELECT role,is_active FROM users WHERE id=$1`,[userId])).rows[0];
+  if(!user||user.role!=='admin'||user.is_active===false)return res.status(400).json({message:'Назначить можно только активного администратора'});
+  if(!(await db.query(`SELECT 1 FROM business_stores WHERE id=$1 AND is_active`,[storeId])).rowCount)return res.status(404).json({message:'Супермаркет не найден'});
+  const permissions=normalizePermissions(body.permissions);
+  const client=await db.connect();try{await client.query('BEGIN');const row=(await client.query(`INSERT INTO store_user_assignments(user_id,store_id,permissions,assigned_by) VALUES($1,$2,$3,$4) RETURNING *`,[userId,storeId,permissions,req.user!.id])).rows[0];await client.query(`INSERT INTO store_assignment_audit(assignment_id,user_id,store_id,action,permissions,actor_user_id) VALUES($1,$2,$3,'assigned',$4,$5)`,[row.id,userId,storeId,permissions,req.user!.id]);await client.query('COMMIT');return res.status(201).json({assignment:row});}catch(e:any){await client.query('ROLLBACK');if(e?.code==='23505')return res.status(409).json({message:'Активное назначение уже существует'});throw e;}finally{client.release()}
+});
+
+app.delete('/api/admin/network/assignments/:assignmentId',authRequired(JWT_SECRET),roleRequired('owner'),async(req,res)=>{
+  const client=await db.connect();try{await client.query('BEGIN');const row=(await client.query(`UPDATE store_user_assignments SET is_active=FALSE,revoked_by=$1,revoked_at=NOW() WHERE id=$2 AND is_active RETURNING *`,[req.user!.id,Number(req.params.assignmentId)])).rows[0];if(!row){await client.query('ROLLBACK');return res.status(404).json({message:'Активное назначение не найдено'})}await client.query(`INSERT INTO store_assignment_audit(assignment_id,user_id,store_id,action,permissions,actor_user_id) VALUES($1,$2,$3,'revoked',$4,$5)`,[row.id,row.user_id,row.store_id,row.permissions,req.user!.id]);await client.query('COMMIT');return res.json({message:'Доступ отозван'});}catch(e){await client.query('ROLLBACK');throw e}finally{client.release()}
+});
+
+app.get('/api/admin/network/mapping-report',authRequired(JWT_SECRET),roleRequired('owner'),async(_req,res)=>{
+  const rows=(await db.query(`SELECT m.warehouse_id,w.code warehouse_code,w.name warehouse_name,m.proposed_store_id,s.name proposed_store_name,m.status,m.reason,coalesce(sum(ws.quantity),0)::text stock_quantity,coalesce(sum(ws.reserved_quantity),0)::text reserved_quantity FROM legacy_warehouse_store_mapping m JOIN warehouses w ON w.id=m.warehouse_id LEFT JOIN business_stores s ON s.id=m.proposed_store_id LEFT JOIN warehouse_stock ws ON ws.warehouse_id=w.id GROUP BY m.warehouse_id,w.code,w.name,m.proposed_store_id,s.name,m.status,m.reason ORDER BY m.status,w.name`)).rows;
+  return res.json({rows,requiresManualDecision:rows.filter(r=>r.status!=='confirmed').length});
+});
+
+app.get('/api/admin/network/mapping/:warehouseId/preview',authRequired(JWT_SECRET),roleRequired('owner'),async(req,res)=>{const warehouseId=Number(req.params.warehouseId),storeId=Number(req.query.storeId);const row=(await db.query(`SELECT w.id,m.status,w.business_store_id,(SELECT count(*) FROM inventory_documents d WHERE d.source_warehouse_id=w.id OR d.destination_warehouse_id=w.id)::int documents,(SELECT count(*) FROM inventory_operations o JOIN inventory_operation_lines l ON l.operation_id=o.id WHERE l.warehouse_id=w.id)::int operations,(SELECT count(*) FROM inventory_reservations r WHERE r.warehouse_id=w.id)::int reservations,(SELECT count(*) FROM stock_movements sm WHERE sm.warehouse_id=w.id)::int movements,(SELECT count(*) FROM inventory_documents d JOIN warehouses other ON other.id=CASE WHEN d.source_warehouse_id=w.id THEN d.destination_warehouse_id ELSE d.source_warehouse_id END WHERE d.document_type='transfer' AND (d.source_warehouse_id=w.id OR d.destination_warehouse_id=w.id) AND other.business_store_id IS NOT NULL AND other.business_store_id<>$2)::int conflicting_transfers FROM warehouses w JOIN legacy_warehouse_store_mapping m ON m.warehouse_id=w.id WHERE w.id=$1`,[warehouseId,storeId])).rows[0];if(!row)return res.status(404).json({message:'Legacy-склад не найден'});return res.json({preview:row,canConfirm:row.status==='unresolved'&&Number(row.conflicting_transfers)===0})});
+
+app.post('/api/admin/network/mapping/:warehouseId/confirm',authRequired(JWT_SECRET),roleRequired('owner'),async(req,res)=>{const warehouseId=Number(req.params.warehouseId),storeId=Number((req.body as any).storeId),key=String(req.headers['x-idempotency-key']||'').trim();if(!key)return res.status(400).json({message:'Требуется X-Idempotency-Key'});const client=await db.connect();try{await client.query('BEGIN');const map=(await client.query(`SELECT * FROM legacy_warehouse_store_mapping WHERE warehouse_id=$1 FOR UPDATE`,[warehouseId])).rows[0];if(!map)throw new HttpError(404,'Legacy-склад не найден');if(map.status==='confirmed'){if(Number(map.proposed_store_id)===storeId&&map.idempotency_key===key){await client.query('COMMIT');return res.json({reused:true})}throw new HttpError(409,'Подтверждённую принадлежность нельзя изменить обычным сопоставлением')}const store=(await client.query(`SELECT id,company_id FROM business_stores WHERE id=$1 AND is_active AND archived_at IS NULL`,[storeId])).rows[0];if(!store)throw new HttpError(404,'Активный супермаркет не найден');const dep=(await client.query(`SELECT (SELECT count(*) FROM inventory_documents d WHERE d.source_warehouse_id=$1 OR d.destination_warehouse_id=$1)::int documents,(SELECT count(*) FROM inventory_reservations r WHERE r.warehouse_id=$1)::int reservations,(SELECT count(*) FROM stock_movements sm WHERE sm.warehouse_id=$1)::int movements,(SELECT count(*) FROM inventory_documents d JOIN warehouses other ON other.id=CASE WHEN d.source_warehouse_id=$1 THEN d.destination_warehouse_id ELSE d.source_warehouse_id END WHERE d.document_type='transfer' AND (d.source_warehouse_id=$1 OR d.destination_warehouse_id=$1) AND other.business_store_id IS NOT NULL AND other.business_store_id<>$2)::int conflicts`,[warehouseId,storeId])).rows[0];if(Number(dep.conflicts)>0)throw new HttpError(409,'Найдены межскладские связи с другим магазином; требуется ручное решение');await client.query(`UPDATE warehouses SET business_store_id=$1,company_id=$2 WHERE id=$3`,[storeId,store.company_id,warehouseId]);await client.query(`UPDATE legacy_warehouse_store_mapping SET proposed_store_id=$1,status='confirmed',reason='Подтверждено владельцем',decided_by=$2,decided_at=NOW(),confirmed_at=NOW(),idempotency_key=$3,dependency_snapshot=$4 WHERE warehouse_id=$5`,[storeId,req.user!.id,key,dep,warehouseId]);await client.query(`INSERT INTO admin_audit_logs(admin_user_id,action,entity_type,entity_id,details) VALUES($1,'legacy_warehouse_mapping.confirm','warehouse',$2,$3)`,[req.user!.id,warehouseId,JSON.stringify({storeId,dependencies:dep})]);await client.query('COMMIT');return res.json({reused:false,warehouseId,storeId})}catch(e){await client.query('ROLLBACK');throw e}finally{client.release()}});
+
+app.get('/api/admin/network/stores/:storeId/products',authRequired(JWT_SECRET),roleRequired('admin'),async(req,res)=>{const storeId=Number(req.params.storeId);if(!(await hasStoreAccess(db,req.user!.id,storeId)))return res.status(403).json({message:'Нет доступа к супермаркету'});const rows=(await db.query(`SELECT p.id,p.name,p.price legacy_price,s.is_listed,s.sale_price,s.updated_at FROM products p LEFT JOIN store_product_settings s ON s.product_id=p.id AND s.store_id=$1 ORDER BY p.name`,[storeId])).rows;return res.json({products:rows,pricePolicy:'explicit_store_price_required'})});
+
+app.put('/api/admin/network/stores/:storeId/products/:productId',authRequired(JWT_SECRET),roleRequired('admin'),async(req,res)=>{const storeId=Number(req.params.storeId),productId=Number(req.params.productId);if(!(await hasStoreAccess(db,req.user!.id,storeId)))return res.status(403).json({message:'Нет доступа к супермаркету'});const actor=await getUserById(req.user!.id);if(actor?.role!=='owner'&&!actor?.permissions.includes('manage_products'))return res.status(403).json({message:'Нет права управлять ассортиментом'});const body=req.body as {isListed?:boolean;salePrice?:number|null};if(typeof body.isListed!=='boolean')return res.status(400).json({message:'isListed обязателен'});const price=body.salePrice===null||body.salePrice===undefined?null:Number(body.salePrice);if(body.isListed&&(price===null||!Number.isFinite(price)||price<0))return res.status(400).json({message:'Для включённого товара нужна явная магазинная цена'});const row=(await db.query(`INSERT INTO store_product_settings(store_id,product_id,is_listed,sale_price,updated_by) VALUES($1,$2,$3,$4,$5) ON CONFLICT(store_id,product_id) DO UPDATE SET is_listed=EXCLUDED.is_listed,sale_price=EXCLUDED.sale_price,updated_by=EXCLUDED.updated_by,updated_at=NOW() RETURNING *`,[storeId,productId,body.isListed,price,req.user!.id])).rows[0];await logAdminAction(req.user!.id,'store_product.update','store_product',productId,{storeId,isListed:body.isListed,salePrice:price});return res.json({setting:row})});
+
+app.get('/api/admin/network/report',authRequired(JWT_SECRET),roleRequired('admin'),async(req,res)=>{
+  const warehouses=await accessibleWarehouseIds(db,req.user!.id);
+  const row=(await db.query(`SELECT count(DISTINCT ws.product_id)::int product_count,count(DISTINCT ws.warehouse_id)::int warehouse_count,coalesce(sum(ws.quantity),0)::text quantity,coalesce(sum(CASE WHEN c.cost_known THEN c.inventory_value ELSE 0 END),0)::text known_value,count(*) FILTER(WHERE NOT c.cost_known)::int unknown_cost_rows FROM warehouse_stock ws JOIN warehouse_stock_costs c USING(warehouse_id,product_id) WHERE ($1::bigint[] IS NULL OR ws.warehouse_id=ANY($1::bigint[]))`,[warehouses])).rows[0];
+  return res.json({totals:{productsTotal:row.product_count,warehousesTotal:row.warehouse_count,quantity:row.quantity,knownValue:row.known_value,unknownCostRows:row.unknown_cost_rows}});
+});
+
+app.get('/api/admin/legacy-orders',authRequired(JWT_SECRET),roleRequired('owner'),async(req,res)=>{const status=String(req.query.status||'').trim(),q=String(req.query.q||'').trim(),limit=Math.min(100,Math.max(1,Number(req.query.limit)||50)),offset=Math.max(0,Number(req.query.offset)||0);const rows=(await db.query(`SELECT o.id,o.status,o.total,o.delivery_address,o.payment_method,o.created_at,o.updated_at,count(oi.id)::int item_count FROM orders o LEFT JOIN order_items oi ON oi.order_id=o.id WHERE ($1='' OR o.status=$1) AND ($2='' OR o.id::text=$2) GROUP BY o.id ORDER BY o.created_at DESC LIMIT $3 OFFSET $4`,[status,q,limit,offset])).rows;return res.json({orders:rows,readOnly:true})});
+
+app.get('/api/admin/legacy-orders/:orderId',authRequired(JWT_SECRET),roleRequired('owner'),async(req,res)=>{const id=Number(req.params.orderId);const order=(await db.query(`SELECT id,status,total,delivery_address,payment_method,created_at,updated_at FROM orders WHERE id=$1`,[id])).rows[0];if(!order)return res.status(404).json({message:'Архивный заказ не найден'});const [items,events,movements]=await Promise.all([db.query(`SELECT id,product_id,product_name,quantity,unit_price FROM order_items WHERE order_id=$1 ORDER BY id`,[id]),db.query(`SELECT id,status,comment,created_at FROM order_events WHERE order_id=$1 ORDER BY id`,[id]),db.query(`SELECT id,warehouse_id,product_id,movement_type,quantity,reason,created_at FROM stock_movements WHERE reference_type IN('order','pick_task') AND (reference_id=$1 OR reference_id IN(SELECT id FROM pick_tasks WHERE order_id=$1)) ORDER BY id`,[id])]);return res.json({order,items:items.rows,events:events.rows,movements:movements.rows,readOnly:true})});
+
+app.get('/api/admin/legacy-users-report',authRequired(JWT_SECRET),roleRequired('owner'),async(_req,res)=>{const rows=(await db.query(`SELECT role,is_active,count(*)::int count FROM users WHERE role IN('customer','courier') GROUP BY role,is_active ORDER BY role,is_active DESC`)).rows;return res.json({rows,note:'Роли не изменены автоматически'})});
+
+app.put('/api/users/me', authRequired(JWT_SECRET), validateBody(updateMeBodySchema), async (req, res) => {
   const { fullName, phone, address } = req.body as { fullName?: string; phone?: string | null; address?: string | null };
   const user = await getUserById(req.user!.id);
-  if (!user) return res.status(404).json({ message: 'Пользователь не найден' });
-  if (!user.is_active) return res.status(403).json({ message: 'Аккаунт заблокирован администратором' });
+  if (!user) throw new HttpError(404, 'Пользователь не найден');
+  if (!user.is_active) throw new HttpError(403, 'Аккаунт заблокирован администратором');
 
   const nextPhone = phone === undefined ? user.phone : phone;
   const phoneChanged = nextPhone !== user.phone;
@@ -1923,69 +2269,217 @@ app.put('/api/users/me', authRequired(JWT_SECRET), async (req, res) => {
   return res.json({ user: publicUser(normalizeUserRow(updated.rows[0])) });
 });
 
-app.post('/api/users/me/verification/request', authRequired(JWT_SECRET), async (req, res) => {
-  const body = req.body as { channel?: 'email' | 'phone' };
-  const channel = normalizeVerificationChannel(body.channel);
-  if (!channel) return res.status(400).json({ message: 'channel должен быть email или phone' });
-
-  const user = await getUserById(req.user!.id);
-  if (!user) return res.status(404).json({ message: 'Пользователь не найден' });
-  if (channel === 'phone' && (!user.phone || !String(user.phone).trim())) {
-    return res.status(400).json({ message: 'Сначала укажите номер телефона в профиле' });
-  }
-
-  const code = generateVerificationCode();
-  const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
-  await db.query(
-    `
-      INSERT INTO user_verification_codes (user_id, channel, purpose, code, expires_at)
-      VALUES ($1, $2, 'store_onboarding', $3, $4)
-    `,
-    [user.id, channel, code, expiresAt.toISOString()]
-  );
-
+app.get('/api/notifications', authRequired(JWT_SECRET), async (req, res) => {
+  const limit = Math.max(1, Math.min(200, Number((req.query.limit as string) || 50)));
+  const rows = (
+    await db.query(
+      `
+        SELECT id, level, title, body, entity_type, entity_id, is_read, created_at, read_at
+        FROM notifications
+        WHERE user_id = $1
+        ORDER BY id DESC
+        LIMIT $2
+      `,
+      [req.user!.id, limit]
+    )
+  ).rows;
+  const unreadCountRow = (
+    await db.query(
+      `
+        SELECT COUNT(*)::text AS unread_count
+        FROM notifications
+        WHERE user_id = $1 AND is_read = FALSE
+      `,
+      [req.user!.id]
+    )
+  ).rows[0];
   return res.json({
-    message:
-      channel === 'email'
-        ? 'Код подтверждения email создан (dev-режим: код возвращен в ответе)'
-        : 'Код подтверждения телефона создан (dev-режим: код возвращен в ответе)',
-    channel,
-    expiresAt: expiresAt.toISOString(),
-    code
+    unreadCount: toNumber(unreadCountRow?.unread_count || 0),
+    notifications: rows.map((row: any) => ({
+      id: toNumber(row.id),
+      level: String(row.level || 'info'),
+      title: String(row.title || ''),
+      body: row.body ?? null,
+      entityType: row.entity_type ?? null,
+      entityId: row.entity_id === null ? null : toNumber(row.entity_id),
+      isRead: row.is_read === true,
+      createdAt: toDateString(row.created_at),
+      readAt: row.read_at ? toDateString(row.read_at) : null
+    }))
   });
 });
 
-app.post('/api/users/me/verification/confirm', authRequired(JWT_SECRET), async (req, res) => {
-  const body = req.body as { channel?: 'email' | 'phone'; code?: string };
-  const channel = normalizeVerificationChannel(body.channel);
-  const code = String(body.code || '').trim();
-  if (!channel) return res.status(400).json({ message: 'channel должен быть email или phone' });
-  if (!/^\d{6}$/.test(code)) return res.status(400).json({ message: 'Код должен состоять из 6 цифр' });
-
-  const verificationRow = (
+app.post('/api/notifications/:notificationId/read', authRequired(JWT_SECRET), async (req, res) => {
+  const notificationId = Number(req.params.notificationId);
+  if (!notificationId) return res.status(400).json({ message: 'Некорректный notificationId' });
+  const updated = (
     await db.query(
       `
+        UPDATE notifications
+        SET is_read = TRUE, read_at = NOW()
+        WHERE id = $1 AND user_id = $2
+        RETURNING id
+      `,
+      [notificationId, req.user!.id]
+    )
+  ).rows[0];
+  if (!updated) return res.status(404).json({ message: 'Уведомление не найдено' });
+  return res.json({ ok: true });
+});
+
+app.post('/api/notifications/read-all', authRequired(JWT_SECRET), async (req, res) => {
+  await db.query(
+    `
+      UPDATE notifications
+      SET is_read = TRUE, read_at = NOW()
+      WHERE user_id = $1 AND is_read = FALSE
+    `,
+    [req.user!.id]
+  );
+  return res.json({ ok: true });
+});
+
+app.post(
+  '/api/users/me/verification/request',
+  authRateLimiter,
+  authRequired(JWT_SECRET),
+  validateBody(verificationRequestBodySchema),
+  async (req, res) => {
+    const { channel } = req.body as { channel: 'email' | 'phone' };
+
+    const user = await getUserById(req.user!.id);
+    if (!user) return res.status(404).json({ message: 'Пользователь не найден' });
+    if (channel === 'phone' && (!user.phone || !String(user.phone).trim())) {
+      return res.status(400).json({ message: 'Сначала укажите номер телефона в профиле' });
+    }
+
+    const recentRequest = (
+      await db.query(
+        `
         SELECT id
         FROM user_verification_codes
         WHERE user_id = $1
           AND channel = $2
           AND purpose = 'store_onboarding'
-          AND code = $3
-          AND used_at IS NULL
-          AND expires_at > NOW()
+          AND created_at > NOW() - ($3::int * INTERVAL '1 millisecond')
         ORDER BY id DESC
         LIMIT 1
       `,
-      [req.user!.id, channel, code]
-    )
-  ).rows[0];
-  if (!verificationRow) return res.status(400).json({ message: 'Неверный или просроченный код подтверждения' });
+        [user.id, channel, VERIFICATION_CODE_RESEND_COOLDOWN_MS]
+      )
+    ).rows[0];
+    if (recentRequest) {
+      return res.status(429).json({ message: 'Слишком частая отправка кода. Попробуйте через минуту.' });
+    }
 
-  await db.query('UPDATE user_verification_codes SET used_at = NOW() WHERE id = $1', [toNumber(verificationRow.id)]);
-  if (channel === 'email') {
-    await db.query('UPDATE users SET email_verified_at = NOW() WHERE id = $1', [req.user!.id]);
-  } else {
-    await db.query('UPDATE users SET phone_verified_at = NOW() WHERE id = $1', [req.user!.id]);
+    const code = generateVerificationCode();
+    const expiresAt = new Date(Date.now() + VERIFICATION_CODE_EXPIRES_MS);
+    const codeHash = hashVerificationCode(code);
+    await db.query(
+      `
+      UPDATE user_verification_codes
+      SET used_at = NOW()
+      WHERE user_id = $1
+        AND channel = $2
+        AND purpose = 'store_onboarding'
+        AND used_at IS NULL
+    `,
+      [user.id, channel]
+    );
+    await db.query(
+      `
+      INSERT INTO user_verification_codes (user_id, channel, purpose, code, attempts_count, locked_until, expires_at)
+      VALUES ($1, $2, 'store_onboarding', $3, 0, NULL, $4)
+    `,
+      [user.id, channel, codeHash, expiresAt.toISOString()]
+    );
+
+    const responseBody: Record<string, unknown> = {
+      message:
+        channel === 'email'
+          ? 'Код подтверждения email создан'
+          : 'Код подтверждения телефона создан',
+      channel,
+      expiresAt: expiresAt.toISOString()
+    };
+    if (NODE_ENV !== 'production') {
+      responseBody.message =
+        channel === 'email'
+          ? 'Код подтверждения email создан (dev-режим: код возвращен в ответе)'
+          : 'Код подтверждения телефона создан (dev-режим: код возвращен в ответе)';
+      responseBody.code = code;
+    }
+    return res.json(responseBody);
+  }
+);
+
+app.post('/api/users/me/verification/confirm', authRequired(JWT_SECRET), validateBody(verificationConfirmBodySchema), async (req, res) => {
+  const { channel, code } = req.body as { channel: 'email' | 'phone'; code: string };
+
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    const verificationRow = (
+      await client.query(
+        `
+          SELECT id, code, attempts_count, locked_until, expires_at
+          FROM user_verification_codes
+          WHERE user_id = $1
+            AND channel = $2
+            AND purpose = 'store_onboarding'
+            AND used_at IS NULL
+          ORDER BY id DESC
+          FOR UPDATE
+          LIMIT 1
+        `,
+        [req.user!.id, channel]
+      )
+    ).rows[0];
+    if (!verificationRow || new Date(verificationRow.expires_at).getTime() <= Date.now()) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ message: 'Неверный или просроченный код подтверждения' });
+    }
+
+    const lockedUntilTime = verificationRow.locked_until ? new Date(verificationRow.locked_until).getTime() : null;
+    if (lockedUntilTime && lockedUntilTime > Date.now()) {
+      await client.query('ROLLBACK');
+      return res.status(429).json({ message: 'Слишком много неверных попыток. Повторите позже.' });
+    }
+
+    if (!verificationCodeMatches(verificationRow.code, code)) {
+      const nextAttempts = toNumber(verificationRow.attempts_count ?? 0) + 1;
+      const lockNow = nextAttempts >= VERIFICATION_CODE_MAX_ATTEMPTS;
+      await client.query(
+        `
+          UPDATE user_verification_codes
+          SET attempts_count = $1,
+              locked_until = CASE WHEN $2 THEN NOW() + ($3::int * INTERVAL '1 minute') ELSE NULL END
+          WHERE id = $4
+        `,
+        [nextAttempts, lockNow, VERIFICATION_CODE_LOCK_MINUTES, toNumber(verificationRow.id)]
+      );
+      await client.query('COMMIT');
+      if (lockNow) {
+        return res.status(429).json({ message: 'Слишком много неверных попыток. Повторите позже.' });
+      }
+      return res.status(400).json({ message: 'Неверный или просроченный код подтверждения' });
+    }
+
+    await client.query(
+      'UPDATE user_verification_codes SET used_at = NOW(), locked_until = NULL WHERE id = $1',
+      [toNumber(verificationRow.id)]
+    );
+    if (channel === 'email') {
+      await client.query('UPDATE users SET email_verified_at = NOW() WHERE id = $1', [req.user!.id]);
+    } else {
+      await client.query('UPDATE users SET phone_verified_at = NOW() WHERE id = $1', [req.user!.id]);
+    }
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
   }
 
   const updatedUser = await getUserById(req.user!.id);
@@ -2163,6 +2657,7 @@ app.patch('/api/stores/my', authRequired(JWT_SECRET), roleRequired('customer'), 
       [nextName, nextLogoUrl, nextPhone, nextDescription, nextTin, nextLegalDocumentUrl, nextLat, nextLng, toNumber(store.id)]
     )
   ).rows[0];
+  await notifyCourierOrdersUpdated(toNumber(updated.id), 'courier_location');
 
   return res.json({
     store: merchantStoreView(updated),
@@ -2199,7 +2694,7 @@ app.post('/api/stores/my/products', authRequired(JWT_SECRET), roleRequired('cust
     return res.status(403).json({ message: 'Добавление товаров доступно после одобрения точки главным администратором' });
   }
 
-  const body = req.body as { name?: string; description?: string; price?: number; imageUrl?: string; unit?: string; inStock?: boolean; stockQuantity?: number };
+  const body = req.body as { name?: string; description?: string; price?: number; barcode?: string; imageUrl?: string; unit?: string; inStock?: boolean; stockQuantity?: number };
   const name = String(body.name || '').trim();
   const description = String(body.description || '').trim() || null;
   const imageUrl = String(body.imageUrl || '').trim() || null;
@@ -2218,11 +2713,11 @@ app.post('/api/stores/my/products', authRequired(JWT_SECRET), roleRequired('cust
   const created = (
     await tenantPool.query(
       `
-        INSERT INTO merchant_products (store_id, name, description, price, image_url, unit, in_stock, stock_quantity)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        INSERT INTO merchant_products (store_id, name, description, price, barcode, image_url, unit, in_stock, stock_quantity)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         RETURNING *
       `,
-      [toNumber(store.id), name, description, round2(price), imageUrl, body.unit?.trim() || 'шт', inStock, stockQuantity]
+      [toNumber(store.id), name, description, round2(price), String(body.barcode || '').trim() || null, imageUrl, body.unit?.trim() || 'шт', inStock, stockQuantity]
     )
   ).rows[0];
 
@@ -2253,7 +2748,7 @@ app.put('/api/stores/my/products/:productId', authRequired(JWT_SECRET), roleRequ
   ).rows[0];
   if (!existing) return res.status(404).json({ message: 'Товар точки не найден' });
 
-  const body = req.body as { name?: string; description?: string; price?: number; imageUrl?: string; unit?: string; inStock?: boolean; stockQuantity?: number };
+  const body = req.body as { name?: string; description?: string; price?: number; barcode?: string; imageUrl?: string; unit?: string; inStock?: boolean; stockQuantity?: number };
   const nextName = body.name !== undefined ? String(body.name).trim() : String(existing.name);
   const nextDescription = body.description !== undefined ? (String(body.description || '').trim() || null) : existing.description;
   const nextImageUrl = body.imageUrl !== undefined ? (String(body.imageUrl || '').trim() || null) : existing.image_url;
@@ -2277,14 +2772,25 @@ app.put('/api/stores/my/products/:productId', authRequired(JWT_SECRET), roleRequ
           name = $1,
           description = $2,
           price = $3,
-          image_url = $4,
-          unit = $5,
-          in_stock = $6,
-          stock_quantity = $7
-        WHERE id = $8
+          barcode = $4,
+          image_url = $5,
+          unit = $6,
+          in_stock = $7,
+          stock_quantity = $8
+        WHERE id = $9
         RETURNING *
       `,
-      [nextName, nextDescription, round2(nextPrice), nextImageUrl, nextUnit, nextInStock, nextStockQuantity, productId]
+      [
+        nextName,
+        nextDescription,
+        round2(nextPrice),
+        body.barcode !== undefined ? (String(body.barcode || '').trim() || null) : (existing.barcode ?? null),
+        nextImageUrl,
+        nextUnit,
+        nextInStock,
+        nextStockQuantity,
+        productId
+      ]
     )
   ).rows[0];
 
@@ -2399,6 +2905,24 @@ app.get('/api/products', authRequired(JWT_SECRET), roleRequired('customer', 'cou
   res.json({ products: rows.map((row: any) => normalizeProductRow(row)) });
 });
 
+app.get('/api/products/by-barcode', authRequired(JWT_SECRET), roleRequired('picker', 'admin', 'courier', 'customer'), async (req, res) => {
+  const barcode = String(req.query.code || '').trim();
+  if (!barcode) return res.status(400).json({ message: 'Параметр code обязателен' });
+  const row = (
+    await db.query(
+      `
+        SELECT *
+        FROM products
+        WHERE barcode = $1
+        LIMIT 1
+      `,
+      [barcode]
+    )
+  ).rows[0];
+  if (!row) return res.status(404).json({ message: 'Товар по штрихкоду не найден' });
+  return res.json({ product: normalizeProductRow(row) });
+});
+
 app.get('/api/admin/products', authRequired(JWT_SECRET), roleRequired('admin'), async (_req, res) => {
   if (!(await requireAdminPermission(_req, res, 'manage_products'))) return;
   const allowedWarehouseIds = await getAdminWarehouseScopeIds(_req.user!.id);
@@ -2445,7 +2969,7 @@ app.get('/api/admin/categories', authRequired(JWT_SECRET), roleRequired('admin')
   });
 });
 
-app.post('/api/admin/categories', authRequired(JWT_SECRET), roleRequired('admin'), async (req, res) => {
+app.post('/api/admin/categories', authRequired(JWT_SECRET), roleRequired('owner'), async (req, res) => {
   if (!(await requireAdminPermission(req, res, 'manage_products'))) return;
   const body = req.body as { category?: string; subcategory?: string | null };
   const category = String(body.category || '').trim();
@@ -2553,7 +3077,7 @@ app.post('/api/admin/products/smart-detect', authRequired(JWT_SECRET), roleRequi
   });
 });
 
-app.patch('/api/admin/categories/rename', authRequired(JWT_SECRET), roleRequired('admin'), async (req, res) => {
+app.patch('/api/admin/categories/rename', authRequired(JWT_SECRET), roleRequired('owner'), async (req, res) => {
   if (!(await requireAdminPermission(req, res, 'manage_products'))) return;
   const body = req.body as {
     oldCategory?: string;
@@ -2616,7 +3140,7 @@ app.patch('/api/admin/categories/rename', authRequired(JWT_SECRET), roleRequired
   return res.json({ message: 'Категория переименована' });
 });
 
-app.delete('/api/admin/categories', authRequired(JWT_SECRET), roleRequired('admin'), async (req, res) => {
+app.delete('/api/admin/categories', authRequired(JWT_SECRET), roleRequired('owner'), async (req, res) => {
   if (!(await requireAdminPermission(req, res, 'manage_products'))) return;
   const body = req.body as { category?: string; subcategory?: string | null };
   const category = String(body.category || '').trim();
@@ -2653,13 +3177,14 @@ app.delete('/api/admin/categories', authRequired(JWT_SECRET), roleRequired('admi
   return res.json({ message: 'Категория удалена' });
 });
 
-app.post('/api/admin/products', authRequired(JWT_SECRET), roleRequired('admin'), async (req, res) => {
+app.post('/api/admin/products', authRequired(JWT_SECRET), roleRequired('owner'), async (req, res) => {
   if (!(await requireAdminPermission(req, res, 'manage_products'))) return;
   const body = req.body as {
     name?: string;
     description?: string;
     price?: number;
     category?: string;
+    barcode?: string;
     imageUrl?: string;
     unit?: string;
     inStock?: boolean;
@@ -2678,6 +3203,9 @@ app.post('/api/admin/products', authRequired(JWT_SECRET), roleRequired('admin'),
   if (!Number.isFinite(stockQuantityRaw) || stockQuantity < 0) {
     return res.status(400).json({ message: 'Количество в наличии должно быть целым числом 0 или больше' });
   }
+  if (stockQuantity !== 0) {
+    return res.status(400).json({ message: 'Начальный остаток проводится отдельной складской операцией после создания товара' });
+  }
 
   const categoryPath = String(body.category || '').trim();
   if (categoryPath && !(await categoryExists(categoryPath))) {
@@ -2689,8 +3217,8 @@ app.post('/api/admin/products', authRequired(JWT_SECRET), roleRequired('admin'),
 
   const created = await db.query(
     `
-      INSERT INTO products (name, description, price, category, image_url, unit, in_stock, stock_quantity, home_warehouse_id)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      INSERT INTO products (name, description, price, category, barcode, image_url, unit, in_stock, stock_quantity, home_warehouse_id)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
       RETURNING *
     `,
     [
@@ -2698,31 +3226,24 @@ app.post('/api/admin/products', authRequired(JWT_SECRET), roleRequired('admin'),
       body.description?.trim() || null,
       price,
       categoryPath || null,
+      String(body.barcode || '').trim() || null,
       body.imageUrl?.trim() || null,
       body.unit?.trim() || 'шт',
-      stockQuantity > 0 && (body.inStock !== undefined ? Boolean(body.inStock) : true),
-      stockQuantity,
+      body.inStock !== undefined ? Boolean(body.inStock) : true,
+      0,
       warehouseId
     ]
   );
 
   const createdProduct = normalizeProductRow(created.rows[0]);
   await ensureWarehouseStockRow(db, warehouseId, createdProduct.id);
-  await db.query(
-    `
-      UPDATE warehouse_stock
-      SET quantity = $1, reserved_quantity = 0, updated_at = NOW()
-      WHERE warehouse_id = $2 AND product_id = $3
-    `,
-    [stockQuantity, warehouseId, createdProduct.id]
-  );
   await syncProductAvailabilityFromWarehouse(db, createdProduct.id);
 
   const freshCreated = (await db.query('SELECT * FROM products WHERE id = $1 LIMIT 1', [createdProduct.id])).rows[0];
   return res.status(201).json({ product: normalizeProductRow(freshCreated) });
 });
 
-app.put('/api/admin/products/:productId', authRequired(JWT_SECRET), roleRequired('admin'), async (req, res) => {
+app.put('/api/admin/products/:productId', authRequired(JWT_SECRET), roleRequired('owner'), async (req, res) => {
   if (!(await requireAdminPermission(req, res, 'manage_products'))) return;
   const productId = Number(req.params.productId);
   if (!productId) return res.status(400).json({ message: 'Некорректный productId' });
@@ -2735,6 +3256,7 @@ app.put('/api/admin/products/:productId', authRequired(JWT_SECRET), roleRequired
     description?: string;
     price?: number;
     category?: string;
+    barcode?: string;
     imageUrl?: string;
     unit?: string;
     inStock?: boolean;
@@ -2762,6 +3284,9 @@ app.put('/api/admin/products/:productId', authRequired(JWT_SECRET), roleRequired
   if (!Number.isFinite(nextStockQuantityRaw) || nextStockQuantity < 0) {
     return res.status(400).json({ message: 'Количество в наличии должно быть целым числом 0 или больше' });
   }
+  if (body.stockQuantity !== undefined) {
+    return res.status(400).json({ message: 'Остаток нельзя изменять через карточку товара. Используйте складскую операцию.' });
+  }
 
   const existingWarehouseId = existingRow.home_warehouse_id ? toNumber(existingRow.home_warehouse_id) : null;
   const nextWarehouseIdRaw = body.warehouseId !== undefined ? Number(body.warehouseId) : existingWarehouseId;
@@ -2776,7 +3301,7 @@ app.put('/api/admin/products/:productId', authRequired(JWT_SECRET), roleRequired
   const updated = await db.query(
     `
       UPDATE products
-      SET name = $1, description = $2, price = $3, category = $4, image_url = $5, unit = $6, in_stock = $7, stock_quantity = $8, home_warehouse_id = $9
+      SET name = $1, description = $2, price = $3, category = $4, barcode = $5, image_url = $6, unit = $7, in_stock = $8, home_warehouse_id = $9
       WHERE id = $10
       RETURNING *
     `,
@@ -2785,33 +3310,20 @@ app.put('/api/admin/products/:productId', authRequired(JWT_SECRET), roleRequired
       body.description !== undefined ? body.description?.trim() || null : existingRow.description,
       nextPrice,
       nextCategory || null,
+      body.barcode !== undefined ? (String(body.barcode || '').trim() || null) : existingRow.barcode,
       body.imageUrl !== undefined ? body.imageUrl?.trim() || null : existingRow.image_url,
       nextUnit,
-      nextStockQuantity > 0 && (body.inStock !== undefined ? Boolean(body.inStock) : Boolean(existingRow.in_stock)),
-      nextStockQuantity,
+      body.inStock !== undefined ? Boolean(body.inStock) : Boolean(existingRow.in_stock),
       nextWarehouseId,
       productId
     ]
   );
 
-  if (body.stockQuantity !== undefined) {
-    await ensureWarehouseStockRow(db, nextWarehouseId, productId);
-    await db.query(
-      `
-        UPDATE warehouse_stock
-        SET quantity = $1 + reserved_quantity, updated_at = NOW()
-        WHERE warehouse_id = $2 AND product_id = $3
-      `,
-      [nextStockQuantity, nextWarehouseId, productId]
-    );
-    await syncProductAvailabilityFromWarehouse(db, productId);
-  }
-
   const freshUpdated = (await db.query('SELECT * FROM products WHERE id = $1 LIMIT 1', [productId])).rows[0];
   return res.json({ product: normalizeProductRow(freshUpdated || updated.rows[0]) });
 });
 
-app.delete('/api/admin/products/:productId', authRequired(JWT_SECRET), roleRequired('admin'), async (req, res) => {
+app.delete('/api/admin/products/:productId', authRequired(JWT_SECRET), roleRequired('owner'), async (req, res) => {
   if (!(await requireAdminPermission(req, res, 'manage_products'))) return;
   const productId = Number(req.params.productId);
   if (!productId) return res.status(400).json({ message: 'Некорректный productId' });
@@ -2826,11 +3338,11 @@ app.post('/api/admin/warehouses', authRequired(JWT_SECRET), roleRequired('admin'
   if (!(await requireAdminPermission(req, res, 'manage_warehouse'))) return;
 
   const adminUser = await getUserById(req.user!.id);
-  if (!adminUser || adminUser.role !== 'admin') {
+  if (!adminUser || !['owner','admin'].includes(adminUser.role)) {
     return res.status(403).json({ message: 'Недостаточно прав' });
   }
 
-  const body = req.body as { code?: string; name?: string; lat?: number | null; lng?: number | null; isActive?: boolean };
+  const body = req.body as { code?: string; name?: string; storeId?:number; lat?: number | null; lng?: number | null; isActive?: boolean };
   const code = String(body.code || '').trim().toUpperCase();
   const name = String(body.name || '').trim();
   const hasLat = body.lat !== undefined && body.lat !== null;
@@ -2838,6 +3350,9 @@ app.post('/api/admin/warehouses', authRequired(JWT_SECRET), roleRequired('admin'
   const lat = hasLat ? Number(body.lat) : null;
   const lng = hasLng ? Number(body.lng) : null;
   const isActive = body.isActive === undefined ? true : Boolean(body.isActive);
+  const storeId=Number(body.storeId);
+  if(!storeId)return res.status(400).json({message:'Для склада необходимо выбрать супермаркет'});
+  if(!(await hasStoreAccess(db,req.user!.id,storeId)))return res.status(403).json({message:'Нет доступа к выбранному супермаркету'});
 
   if (!code || code.length < 2 || code.length > 32 || !/^[A-Z0-9_-]+$/.test(code)) {
     return res.status(400).json({ message: 'Код точки должен содержать 2-32 символа: A-Z, 0-9, _, -' });
@@ -2877,11 +3392,11 @@ app.post('/api/admin/warehouses', authRequired(JWT_SECRET), roleRequired('admin'
     const created = (
       await db.query(
         `
-          INSERT INTO warehouses (code, name, lat, lng, created_by_admin_id, is_active)
-          VALUES ($1, $2, $3, $4, $5, $6)
+          INSERT INTO warehouses (code, name, lat, lng, created_by_admin_id, is_active, business_store_id)
+          VALUES ($1, $2, $3, $4, $5, $6, $7)
           RETURNING id, code, name, lat, lng, is_active, created_by_admin_id
         `,
-        [code, name, lat, lng, adminUser.id, isActive]
+        [code, name, lat, lng, adminUser.id, isActive,storeId]
       )
     ).rows[0];
 
@@ -2917,8 +3432,12 @@ app.get('/api/admin/warehouse/overview', authRequired(JWT_SECRET), roleRequired(
   const [warehouseRows, stockRows, movementRows] = await Promise.all([
     db.query(
       `
-        SELECT id, code, name, lat, lng, is_active, created_by_admin_id
-        FROM warehouses
+        SELECT w.id, w.code, w.name, w.lat, w.lng, w.is_active, w.created_by_admin_id,
+               w.business_store_id, s.name AS business_store_name,
+               COALESCE(m.status, CASE WHEN w.business_store_id IS NULL THEN 'unresolved' ELSE 'confirmed' END) AS mapping_status
+        FROM warehouses w
+        LEFT JOIN business_stores s ON s.id=w.business_store_id
+        LEFT JOIN legacy_warehouse_store_mapping m ON m.warehouse_id=w.id
         ORDER BY id ASC
       `
     ),
@@ -2932,6 +3451,7 @@ app.get('/api/admin/warehouse/overview', authRequired(JWT_SECRET), roleRequired(
           p.name AS product_name,
           p.image_url,
           p.category,
+          p.unit,
           ws.quantity,
           ws.reserved_quantity,
           GREATEST(ws.quantity - ws.reserved_quantity, 0) AS available_quantity,
@@ -2976,6 +3496,7 @@ app.get('/api/admin/warehouse/overview', authRequired(JWT_SECRET), roleRequired(
     productId: toNumber(row.product_id),
     productName: String(row.product_name),
     category: row.category ?? null,
+    unit: row.unit ?? null,
     imageUrl: row.image_url ?? null,
     quantity: toNumber(row.quantity),
     reservedQuantity: toNumber(row.reserved_quantity),
@@ -3005,7 +3526,10 @@ app.get('/api/admin/warehouse/overview', authRequired(JWT_SECRET), roleRequired(
         lat: row.lat === null ? null : Number(row.lat),
         lng: row.lng === null ? null : Number(row.lng),
         isActive: row.is_active !== false,
-        createdByAdminId: row.created_by_admin_id === null ? null : toNumber(row.created_by_admin_id)
+        createdByAdminId: row.created_by_admin_id === null ? null : toNumber(row.created_by_admin_id),
+        storeId: row.business_store_id === null ? null : toNumber(row.business_store_id),
+        storeName: row.business_store_name ?? null,
+        mappingStatus: String(row.mapping_status)
       }))
       .filter((w) => (allowedWarehouseIds === null ? true : allowedWarehouseIds.includes(w.id))),
     stock: scopedStock,
@@ -3029,6 +3553,142 @@ app.get('/api/admin/warehouse/overview', authRequired(JWT_SECRET), roleRequired(
   });
 });
 
+app.get('/api/admin/warehouse/consistency', authRequired(JWT_SECRET), roleRequired('admin'), async (req, res) => {
+  if (!(await requireAdminPermission(req, res, 'manage_warehouse'))) return;
+  const allowedWarehouseIds = await getAdminWarehouseScopeIds(req.user!.id);
+  const rows = await inventoryConsistencyReport(db);
+  const scoped = allowedWarehouseIds === null ? rows : rows.filter((row) => allowedWarehouseIds.includes(row.warehouseId));
+  return res.json({
+    rows: scoped,
+    consistent: scoped.every((row) => row.consistent),
+    historicalJournalComplete: false,
+    note: 'Исторический журнал до миграции этапа 1 может быть неполным; автоматическое исправление не выполняется.'
+  });
+});
+
+app.get('/api/admin/warehouse/purchase-drafts', authRequired(JWT_SECRET), roleRequired('admin'), async (req, res) => {
+  if (!(await requireAdminPermission(req, res, 'manage_warehouse'))) return;
+  const allowedWarehouseIds = await getAdminWarehouseScopeIds(req.user!.id);
+  const rows = (
+    await db.query(
+      `
+        SELECT d.id, d.warehouse_id, d.status, d.created_by, d.items_json, d.created_at, d.updated_at,
+               w.name AS warehouse_name,
+               u.full_name AS created_by_name
+        FROM warehouse_purchase_drafts d
+        LEFT JOIN warehouses w ON w.id = d.warehouse_id
+        LEFT JOIN users u ON u.id = d.created_by
+        ORDER BY d.id DESC
+        LIMIT 100
+      `
+    )
+  ).rows.filter((row: any) => (allowedWarehouseIds === null ? true : allowedWarehouseIds.includes(toNumber(row.warehouse_id))));
+  return res.json({
+    drafts: rows.map((row: any) => ({
+      id: toNumber(row.id),
+      warehouseId: row.warehouse_id === null ? null : toNumber(row.warehouse_id),
+      warehouseName: row.warehouse_name ?? null,
+      status: String(row.status || 'draft'),
+      createdBy: row.created_by === null ? null : toNumber(row.created_by),
+      createdByName: row.created_by_name ?? null,
+      items: Array.isArray(row.items_json) ? row.items_json : [],
+      createdAt: toDateString(row.created_at),
+      updatedAt: toDateString(row.updated_at)
+    }))
+  });
+});
+
+app.post('/api/admin/warehouse/purchase-drafts/from-low-stock', authRequired(JWT_SECRET), roleRequired('admin'), async (req, res) => {
+  if (!(await requireAdminPermission(req, res, 'manage_warehouse'))) return;
+  const body = req.body as { warehouseId?: number | null };
+  const warehouseId = body.warehouseId ? Number(body.warehouseId) : null;
+  const allowedWarehouseIds = await getAdminWarehouseScopeIds(req.user!.id);
+  if (warehouseId && allowedWarehouseIds !== null && !allowedWarehouseIds.includes(warehouseId)) {
+    return res.status(403).json({ message: 'Нет доступа к выбранному складу' });
+  }
+
+  const params: any[] = [];
+  let whereSql = '';
+  if (warehouseId) {
+    params.push(warehouseId);
+    whereSql = 'WHERE ws.warehouse_id = $1';
+  } else if (allowedWarehouseIds !== null) {
+    params.push(allowedWarehouseIds.length ? allowedWarehouseIds : [-1]);
+    whereSql = 'WHERE ws.warehouse_id = ANY($1)';
+  }
+
+  const rows = (
+    await db.query(
+      `
+        SELECT ws.warehouse_id,
+               w.name AS warehouse_name,
+               ws.product_id,
+               p.name AS product_name,
+               ws.reorder_target,
+               GREATEST(ws.quantity - ws.reserved_quantity, 0) AS available_quantity
+        FROM warehouse_stock ws
+        JOIN warehouses w ON w.id = ws.warehouse_id
+        JOIN products p ON p.id = ws.product_id
+        ${whereSql}
+        ORDER BY ws.warehouse_id ASC, p.name ASC
+      `,
+      params
+    )
+  ).rows;
+
+  const lowItems = rows
+    .map((row: any) => ({
+      warehouseId: toNumber(row.warehouse_id),
+      warehouseName: String(row.warehouse_name || ''),
+      productId: toNumber(row.product_id),
+      productName: String(row.product_name || ''),
+      availableQuantity: toNumber(row.available_quantity),
+      reorderTarget: toNumber(row.reorder_target),
+      orderSuggestion: Math.max(toNumber(row.reorder_target) - toNumber(row.available_quantity), 0)
+    }))
+    .filter((item) => item.orderSuggestion > 0);
+
+  if (!lowItems.length) {
+    return res.status(409).json({ message: 'Нет товаров для автопополнения' });
+  }
+
+  const grouped = new Map<number, typeof lowItems>();
+  for (const item of lowItems) {
+    if (!grouped.has(item.warehouseId)) grouped.set(item.warehouseId, []);
+    grouped.get(item.warehouseId)!.push(item);
+  }
+
+  const createdDrafts: any[] = [];
+  for (const [wId, items] of grouped.entries()) {
+    const created = (
+      await db.query(
+        `
+          INSERT INTO warehouse_purchase_drafts (warehouse_id, status, created_by, items_json)
+          VALUES ($1, 'draft', $2, $3::jsonb)
+          RETURNING *
+        `,
+        [wId, req.user!.id, JSON.stringify(items)]
+      )
+    ).rows[0];
+    createdDrafts.push({
+      id: toNumber(created.id),
+      warehouseId: toNumber(created.warehouse_id),
+      status: String(created.status),
+      items
+    });
+  }
+
+  await createNotificationForAdmins({
+    level: 'warning',
+    title: 'Создан черновик закупки по низким остаткам',
+    body: `Черновиков: ${createdDrafts.length}`,
+    entityType: 'purchase_draft',
+    entityId: createdDrafts[0]?.id ?? null
+  });
+
+  return res.status(201).json({ drafts: createdDrafts });
+});
+
 app.get('/api/admin/stock/movements', authRequired(JWT_SECRET), roleRequired('admin'), async (req, res) => {
   if (!(await requireAdminPermission(req, res, 'manage_warehouse'))) return;
   const allowedWarehouseIds = await getAdminWarehouseScopeIds(req.user!.id);
@@ -3037,18 +3697,20 @@ app.get('/api/admin/stock/movements', authRequired(JWT_SECRET), roleRequired('ad
   const warehouseId = Number(query.warehouseId || 0);
   const productQuery = String(query.product || '').trim();
   const movementType = String(query.movementType || '').trim().toLowerCase();
+  const documentId = String(query.documentId || '').trim();
   const dateFromRaw = String(query.dateFrom || '').trim();
   const dateToRaw = String(query.dateTo || '').trim();
   const limitRaw = Number(query.limit || 200);
   const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(Math.floor(limitRaw), 1), 1000) : 200;
 
-  const allowedMovementTypes = new Set(['receive', 'writeoff', 'reserve', 'release']);
+  const allowedMovementTypes = new Set(['receive', 'writeoff', 'reserve', 'release', 'pick', 'opening_balance', 'receipt', 'transfer', 'stocktake', 'reversal']);
   if (movementType && !allowedMovementTypes.has(movementType)) {
     return res.status(400).json({ message: 'Некорректный movementType' });
   }
   if (warehouseId && allowedWarehouseIds !== null && !allowedWarehouseIds.includes(warehouseId)) {
     return res.status(403).json({ message: 'Нет доступа к выбранному складу' });
   }
+  if (documentId && !/^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(documentId)) return res.status(400).json({ message: 'Некорректный documentId' });
 
   let dateFrom: Date | null = null;
   let dateTo: Date | null = null;
@@ -3074,6 +3736,10 @@ app.get('/api/admin/stock/movements', authRequired(JWT_SECRET), roleRequired('ad
   if (movementType) {
     params.push(movementType);
     where.push(`sm.movement_type = $${params.length}`);
+  }
+  if (documentId) {
+    params.push(documentId);
+    where.push(`sm.document_id = $${params.length}::uuid`);
   }
   if (productQuery) {
     params.push(`%${productQuery}%`);
@@ -3103,6 +3769,10 @@ app.get('/api/admin/stock/movements', authRequired(JWT_SECRET), roleRequired('ad
         sm.reason,
         sm.reference_type,
         sm.reference_id,
+        sm.document_id,
+        sm.operation_id,
+        sm.unit_cost,
+        sm.value_delta,
         sm.created_at,
         w.name AS warehouse_name,
         p.name AS product_name,
@@ -3124,10 +3794,14 @@ app.get('/api/admin/stock/movements', authRequired(JWT_SECRET), roleRequired('ad
       warehouseId: toNumber(row.warehouse_id),
       productId: toNumber(row.product_id),
       movementType: String(row.movement_type),
-      quantity: toNumber(row.quantity),
+      quantity: String(row.quantity),
       reason: row.reason ?? null,
       referenceType: row.reference_type ?? null,
       referenceId: row.reference_id === null ? null : toNumber(row.reference_id),
+      documentId: row.document_id ?? null,
+      operationId: row.operation_id ?? null,
+      unitCost: row.unit_cost === null ? null : String(row.unit_cost),
+      valueDelta: row.value_delta === null ? null : String(row.value_delta),
       warehouseName: String(row.warehouse_name),
       productName: String(row.product_name),
       createdBy: row.created_by_name ?? null,
@@ -3172,26 +3846,13 @@ app.patch('/api/admin/warehouses/:warehouseId/location', authRequired(JWT_SECRET
       [lat, lng, warehouseId]
     )).rows[0];
 
-    // Mirror point to map-platform PostGIS so marker on map moves too.
-    const mapUpdate = await mapDb.query(
-      `
-        UPDATE public.warehouses
-        SET geom = ST_SetSRID(ST_MakePoint($1, $2), 4326)
-        WHERE lower(name) = lower($3)
-      `,
-      [lng, lat, String(existing.name)]
-    );
-    if (!mapUpdate.rowCount) {
-      await mapDb.query(
-        `
-          INSERT INTO public.warehouses (name, geom)
-          VALUES ($1, ST_SetSRID(ST_MakePoint($2, $3), 4326))
-        `,
-        [String(existing.name), lng, lat]
-      );
-    }
-
     await client.query('COMMIT');
+
+    let mapSynchronized=true;
+    try {
+      const mapUpdate = await mapDb.query(`UPDATE public.warehouses SET geom=ST_SetSRID(ST_MakePoint($1,$2),4326) WHERE lower(name)=lower($3)`,[lng,lat,String(existing.name)]);
+      if(!mapUpdate.rowCount)await mapDb.query(`INSERT INTO public.warehouses(name,geom) VALUES($1,ST_SetSRID(ST_MakePoint($2,$3),4326))`,[String(existing.name),lng,lat]);
+    } catch(mapError){mapSynchronized=false;console.warn('Optional map warehouse location sync failed:',mapError instanceof Error?mapError.message:'unknown')}
 
     await logAdminAction(req.user!.id, 'warehouse.location_update', 'warehouse', warehouseId, {
       code: String(existing.code),
@@ -3208,7 +3869,9 @@ app.patch('/api/admin/warehouses/:warehouseId/location', authRequired(JWT_SECRET
         lat: updated.lat === null ? null : Number(updated.lat),
         lng: updated.lng === null ? null : Number(updated.lng),
         isActive: updated.is_active !== false
-      }
+      },
+      mapSynchronized,
+      warning: mapSynchronized?null:'Координаты сохранены, но синхронизация с картографическим сервисом временно недоступна'
     });
   } catch (error) {
     await client.query('ROLLBACK');
@@ -3245,15 +3908,17 @@ app.delete('/api/admin/warehouses/:warehouseId/location', authRequired(JWT_SECRE
       [warehouseId]
     );
 
-    await mapDb.query('DELETE FROM public.warehouses WHERE lower(name) = lower($1)', [String(existing.name)]);
     await client.query('COMMIT');
+
+    let mapSynchronized=true;
+    try{await mapDb.query('DELETE FROM public.warehouses WHERE lower(name) = lower($1)',[String(existing.name)])}catch(mapError){mapSynchronized=false;console.warn('Optional map warehouse location delete sync failed:',mapError instanceof Error?mapError.message:'unknown')}
 
     await logAdminAction(req.user!.id, 'warehouse.location_delete', 'warehouse', warehouseId, {
       code: String(existing.code),
       name: String(existing.name)
     });
 
-    return res.json({ message: 'Точка склада удалена' });
+    return res.json({ message: 'Точка склада удалена',mapSynchronized,warning:mapSynchronized?null:'Основная запись удалена, но картографический сервис временно недоступен' });
   } catch (error) {
     await client.query('ROLLBACK');
     return res.status(500).json({ message: 'Не удалось удалить точку склада', error: error instanceof Error ? error.message : 'unknown' });
@@ -3308,25 +3973,45 @@ app.get('/api/admin/pick-tasks', authRequired(JWT_SECRET), roleRequired('admin',
   const itemRows = (await db.query(
     `
       SELECT
+        pti.id,
         pti.pick_task_id,
         pti.product_id,
         pti.product_name,
         pti.requested_qty,
-        pti.picked_qty
+        pti.picked_qty,
+        pti.result_status,
+        pti.substitute_product_name,
+        pti.result_note,
+        pti.barcode_scanned
       FROM pick_task_items pti
       ORDER BY pti.pick_task_id DESC, pti.id ASC
     `
   )).rows;
 
-  const itemsByTask = new Map<number, Array<{ productId: number; productName: string; requestedQty: number; pickedQty: number }>>();
+  const itemsByTask = new Map<number, Array<{
+    id: number;
+    productId: number;
+    productName: string;
+    requestedQty: number;
+    pickedQty: number;
+    resultStatus: string;
+    substituteProductName: string | null;
+    resultNote: string | null;
+    barcodeScanned: string | null;
+  }>>();
   for (const row of itemRows) {
     const taskId = toNumber(row.pick_task_id);
     if (!itemsByTask.has(taskId)) itemsByTask.set(taskId, []);
     itemsByTask.get(taskId)!.push({
+      id: toNumber(row.id),
       productId: toNumber(row.product_id),
       productName: String(row.product_name),
       requestedQty: toNumber(row.requested_qty),
-      pickedQty: toNumber(row.picked_qty)
+      pickedQty: toNumber(row.picked_qty),
+      resultStatus: String(row.result_status || 'pending'),
+      substituteProductName: row.substitute_product_name ?? null,
+      resultNote: row.result_note ?? null,
+      barcodeScanned: row.barcode_scanned ?? null
     });
   }
 
@@ -3350,8 +4035,98 @@ app.get('/api/admin/pick-tasks', authRequired(JWT_SECRET), roleRequired('admin',
   });
 });
 
+app.get('/api/admin/suppliers', authRequired(JWT_SECRET), roleRequired('admin'), async (req, res) => {
+  if (!(await requireAdminPermission(req, res, 'manage_warehouse'))) return;
+  const includeArchived = String(req.query.includeArchived || '') === 'true';
+  const rows = (await db.query(
+    `SELECT s.*, EXISTS(SELECT 1 FROM inventory_documents d WHERE d.supplier_id=s.id) AS linked
+     FROM suppliers s WHERE ($1::boolean OR s.archived_at IS NULL) ORDER BY s.archived_at NULLS FIRST,s.name`, [includeArchived]
+  )).rows;
+  return res.json({ suppliers: rows });
+});
+
+app.post('/api/admin/suppliers', authRequired(JWT_SECRET), roleRequired('owner'), async (req, res) => {
+  if (!(await requireAdminPermission(req, res, 'manage_warehouse'))) return;
+  const body = req.body as Record<string, unknown>;
+  const name = String(body.name || '').trim();
+  if (!name) return res.status(400).json({ message: 'Название поставщика обязательно' });
+  const created = (await db.query(
+    `INSERT INTO suppliers(name,tax_id,phone,email,address,comment,created_by) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+    [name,String(body.taxId||'').trim()||null,String(body.phone||'').trim()||null,String(body.email||'').trim()||null,String(body.address||'').trim()||null,String(body.comment||'').trim()||null,req.user!.id]
+  )).rows[0];
+  await logAdminAction(req.user!.id,'supplier.create','supplier',toNumber(created.id),{name});
+  return res.status(201).json({ supplier: created });
+});
+
+app.put('/api/admin/suppliers/:supplierId', authRequired(JWT_SECRET), roleRequired('owner'), async (req, res) => {
+  if (!(await requireAdminPermission(req, res, 'manage_warehouse'))) return;
+  const id=Number(req.params.supplierId),body=req.body as Record<string,unknown>,name=String(body.name||'').trim();
+  if(!id||!name)return res.status(400).json({message:'Некорректный поставщик или пустое название'});
+  const updated=(await db.query(`UPDATE suppliers SET name=$1,tax_id=$2,phone=$3,email=$4,address=$5,comment=$6,updated_at=NOW() WHERE id=$7 RETURNING *`,[name,String(body.taxId||'').trim()||null,String(body.phone||'').trim()||null,String(body.email||'').trim()||null,String(body.address||'').trim()||null,String(body.comment||'').trim()||null,id])).rows[0];
+  if(!updated)return res.status(404).json({message:'Поставщик не найден'});await logAdminAction(req.user!.id,'supplier.update','supplier',id,{name});return res.json({supplier:updated});
+});
+
+app.delete('/api/admin/suppliers/:supplierId', authRequired(JWT_SECRET), roleRequired('owner'), async (req, res) => {
+  if (!(await requireAdminPermission(req, res, 'manage_warehouse'))) return;
+  const id=Number(req.params.supplierId);if(!id)return res.status(400).json({message:'Некорректный supplierId'});
+  const updated=(await db.query(`UPDATE suppliers SET archived_at=COALESCE(archived_at,NOW()),updated_at=NOW() WHERE id=$1 RETURNING id`,[id])).rows[0];
+  if(!updated)return res.status(404).json({message:'Поставщик не найден'});await logAdminAction(req.user!.id,'supplier.archive','supplier',id,{});return res.json({message:'Поставщик помещён в архив'});
+});
+
+app.get('/api/admin/inventory/documents', authRequired(JWT_SECRET), roleRequired('admin'), async (req,res)=>{
+  if (!(await requireAdminPermission(req,res,'manage_warehouse'))) return;
+  return res.json({documents:await listInventoryDocuments(db,await getAdminWarehouseScopeIds(req.user!.id))});
+});
+
+app.get('/api/admin/inventory/documents/:documentId', authRequired(JWT_SECRET), roleRequired('admin'), async (req,res)=>{
+  if (!(await requireAdminPermission(req,res,'manage_warehouse'))) return;
+  const doc=await getInventoryDocument(db,String(req.params.documentId));
+  for(const wid of [doc.source_warehouse_id,doc.destination_warehouse_id].filter(Boolean))if(!(await assertWarehouseAccess(req,res,Number(wid))))return;
+  return res.json({document:doc});
+});
+
+app.post('/api/admin/inventory/documents', authRequired(JWT_SECRET), roleRequired('admin'), async (req,res)=>{
+  if (!(await requireAdminPermission(req,res,'manage_warehouse'))) return;
+  const body=req.body as DraftInput;
+  for(const wid of [body.sourceWarehouseId,body.destinationWarehouseId].filter(Boolean))if(!(await assertWarehouseOperation(req,res,Number(wid))))return;
+  const result=await createInventoryDraft(db,body,req.user!.id);await logAdminAction(req.user!.id,'inventory_document.create','inventory_document',null,{documentId:result.id,type:body.documentType});return res.status(201).json(result);
+});
+
+app.put('/api/admin/inventory/documents/:documentId', authRequired(JWT_SECRET), roleRequired('admin'), async (req,res)=>{
+  if (!(await requireAdminPermission(req,res,'manage_warehouse'))) return;
+  const body=req.body as DraftInput&{version?:number};for(const wid of [body.sourceWarehouseId,body.destinationWarehouseId].filter(Boolean))if(!(await assertWarehouseOperation(req,res,Number(wid))))return;
+  return res.json(await updateInventoryDraft(db,String(req.params.documentId),Number(body.version),body,req.user!.id));
+});
+
+app.post('/api/admin/inventory/documents/:documentId/post', authRequired(JWT_SECRET), roleRequired('admin'), async (req,res)=>{
+  if (!(await requireAdminPermission(req,res,'manage_warehouse'))) return;
+  const id=String(req.params.documentId),doc=await getInventoryDocument(db,id);for(const wid of [doc.source_warehouse_id,doc.destination_warehouse_id].filter(Boolean))if(!(await assertWarehouseOperation(req,res,Number(wid))))return;
+  const result=await postInventoryDocument(db,id,String(req.headers['x-idempotency-key']||''),req.user!.id);await logAdminAction(req.user!.id,'inventory_document.post','inventory_document',null,{documentId:id,operationId:result.operationId,reused:result.reused});return res.status(result.reused?200:201).json(result);
+});
+
+app.post('/api/admin/inventory/documents/:documentId/cancel', authRequired(JWT_SECRET), roleRequired('admin'), async (req,res)=>{
+  if (!(await requireAdminPermission(req,res,'manage_warehouse'))) return;
+  const id=String(req.params.documentId),doc=await getInventoryDocument(db,id);for(const wid of [doc.source_warehouse_id,doc.destination_warehouse_id].filter(Boolean))if(!(await assertWarehouseOperation(req,res,Number(wid))))return;
+  const result=await cancelInventoryDocument(db,id,String(req.headers['x-idempotency-key']||''),req.user!.id);await logAdminAction(req.user!.id,'inventory_document.cancel','inventory_document',null,{documentId:id,...result});return res.json(result);
+});
+
+app.get('/api/admin/inventory/valuation', authRequired(JWT_SECRET), roleRequired('admin'), async(req,res)=>{
+  if (!(await requireAdminPermission(req,res,'manage_warehouse'))) return;return res.json({rows:await inventoryValuationReport(db,await getAdminWarehouseScopeIds(req.user!.id)),historicalJournalComplete:false});
+});
+
+app.get('/api/admin/inventory/reservations', authRequired(JWT_SECRET), roleRequired('admin'), async(req,res)=>{
+  if (!(await requireAdminPermission(req,res,'manage_warehouse'))) return;const allowed=await getAdminWarehouseScopeIds(req.user!.id),params:any[]=[];const where=allowed===null?'':(params.push(allowed),`AND r.warehouse_id=ANY($1::bigint[])`);
+  const rows=(await db.query(`SELECT r.id,r.warehouse_id,w.name warehouse_name,r.product_id,p.name product_name,r.quantity::text quantity,r.original_quantity::text original_quantity,r.status,r.reason,r.order_id,r.pick_task_id,r.created_at FROM inventory_reservations r JOIN warehouses w ON w.id=r.warehouse_id JOIN products p ON p.id=r.product_id WHERE r.status='active' ${where} ORDER BY r.created_at DESC`,params)).rows;return res.json({reservations:rows});
+});
+
+app.post('/api/admin/inventory/reservations/:reservationId/release', authRequired(JWT_SECRET), roleRequired('admin'), async(req,res)=>{
+  if (!(await requireAdminPermission(req,res,'manage_warehouse'))) return;const id=Number(req.params.reservationId),body=req.body as{quantity?:string;reason?:string};const row=(await db.query(`SELECT warehouse_id FROM inventory_reservations WHERE id=$1`,[id])).rows[0];if(!row)return res.status(404).json({message:'Резерв не найден'});if(!(await assertWarehouseOperation(req,res,Number(row.warehouse_id))))return;const reason=String(body.reason||'').trim();if(!reason)return res.status(400).json({message:'Причина снятия резерва обязательна'});const result=await releaseManualReservation(db,{reservationId:id,quantity:String(body.quantity||''),reason,idempotencyKey:String(req.headers['x-idempotency-key']||''),createdBy:req.user!.id});await logAdminAction(req.user!.id,'inventory_reservation.release','inventory_reservation',id,{quantity:String(body.quantity),reason,operationId:result.operationId});return res.status(result.reused?200:201).json(result);
+});
+
 app.post('/api/admin/stock/receive', authRequired(JWT_SECRET), roleRequired('admin'), async (req, res) => {
   if (!(await requireAdminPermission(req, res, 'manage_warehouse'))) return;
+  return res.status(410).json({ message: 'Прямая приёмка отключена. Создайте и проведите документ «Приёмка».' });
+  /* legacy parser retained temporarily for client compatibility diagnostics; unreachable by design */
   const body = req.body as { warehouseId?: number; productId?: number; quantity?: number; reason?: string };
   const productId = Number(body.productId);
   const quantity = Math.floor(Number(body.quantity));
@@ -3359,43 +4134,30 @@ app.post('/api/admin/stock/receive', authRequired(JWT_SECRET), roleRequired('adm
     return res.status(400).json({ message: 'Нужны корректные productId и quantity > 0' });
   }
 
-  const client = await db.connect();
-  try {
-    await client.query('BEGIN');
-    const warehouseId = body.warehouseId ? Number(body.warehouseId) : await getDefaultWarehouseId(client);
-    if (!(await assertWarehouseAccess(req, res, warehouseId))) {
-      await client.query('ROLLBACK');
-      return;
-    }
-    await ensureWarehouseStockRow(client, warehouseId, productId);
-    await client.query(
-      `
-        UPDATE warehouse_stock
-        SET quantity = quantity + $1, updated_at = NOW()
-        WHERE warehouse_id = $2 AND product_id = $3
-      `,
-      [quantity, warehouseId, productId]
-    );
-    await client.query(
-      `
-        INSERT INTO stock_movements (warehouse_id, product_id, movement_type, quantity, reason, created_by)
-        VALUES ($1, $2, 'receive', $3, $4, $5)
-      `,
-      [warehouseId, productId, quantity, String(body.reason || '').trim() || null, req.user!.id]
-    );
-    await syncProductAvailabilityFromWarehouse(client, productId);
-    await client.query('COMMIT');
-    return res.status(201).json({ message: 'Приемка проведена' });
-  } catch (error) {
-    await client.query('ROLLBACK');
-    return res.status(500).json({ message: 'Не удалось провести приемку', error: error instanceof Error ? error.message : 'unknown' });
-  } finally {
-    client.release();
-  }
+  const warehouseId = body.warehouseId ? Number(body.warehouseId) : await getDefaultWarehouseId(db);
+  if (!(await assertWarehouseAccess(req, res, warehouseId))) return;
+  const operation = await postSingleStockOperation(db, {
+    operationType: 'receive',
+    idempotencyKey: String(req.headers['x-idempotency-key'] || ''),
+    payload: { warehouseId, productId, quantity, reason: String(body.reason || '').trim() || null },
+    warehouseId,
+    productId,
+    quantity,
+    reason: String(body.reason || '').trim() || null,
+    referenceType: 'manual_receive',
+    createdBy: req.user!.id
+  });
+  return res.status(operation.reused ? 200 : 201).json({
+    message: operation.reused ? 'Приемка уже была проведена' : 'Приемка проведена',
+    operationId: operation.operationId,
+    reused: operation.reused
+  });
 });
 
 app.post('/api/admin/stock/writeoff', authRequired(JWT_SECRET), roleRequired('admin'), async (req, res) => {
   if (!(await requireAdminPermission(req, res, 'manage_warehouse'))) return;
+  return res.status(410).json({ message: 'Прямое списание отключено. Создайте и проведите документ «Списание».' });
+  /* legacy parser retained temporarily for client compatibility diagnostics; unreachable by design */
   const body = req.body as { warehouseId?: number; productId?: number; quantity?: number; reason?: string };
   const productId = Number(body.productId);
   const quantity = Math.floor(Number(body.quantity));
@@ -3403,54 +4165,24 @@ app.post('/api/admin/stock/writeoff', authRequired(JWT_SECRET), roleRequired('ad
     return res.status(400).json({ message: 'Нужны корректные productId и quantity > 0' });
   }
 
-  const client = await db.connect();
-  try {
-    await client.query('BEGIN');
-    const warehouseId = body.warehouseId ? Number(body.warehouseId) : await getDefaultWarehouseId(client);
-    if (!(await assertWarehouseAccess(req, res, warehouseId))) {
-      await client.query('ROLLBACK');
-      return;
-    }
-    await ensureWarehouseStockRow(client, warehouseId, productId);
-    const row = (await client.query(
-      `
-        SELECT quantity, reserved_quantity
-        FROM warehouse_stock
-        WHERE warehouse_id = $1 AND product_id = $2
-        FOR UPDATE
-      `,
-      [warehouseId, productId]
-    )).rows[0];
-    const available = Math.max(toNumber(row?.quantity ?? 0) - toNumber(row?.reserved_quantity ?? 0), 0);
-    if (available < quantity) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ message: `Недостаточно свободного остатка. Доступно: ${available}` });
-    }
-
-    await client.query(
-      `
-        UPDATE warehouse_stock
-        SET quantity = quantity - $1, updated_at = NOW()
-        WHERE warehouse_id = $2 AND product_id = $3
-      `,
-      [quantity, warehouseId, productId]
-    );
-    await client.query(
-      `
-        INSERT INTO stock_movements (warehouse_id, product_id, movement_type, quantity, reason, created_by)
-        VALUES ($1, $2, 'writeoff', $3, $4, $5)
-      `,
-      [warehouseId, productId, quantity, String(body.reason || '').trim() || null, req.user!.id]
-    );
-    await syncProductAvailabilityFromWarehouse(client, productId);
-    await client.query('COMMIT');
-    return res.status(201).json({ message: 'Списание проведено' });
-  } catch (error) {
-    await client.query('ROLLBACK');
-    return res.status(500).json({ message: 'Не удалось провести списание', error: error instanceof Error ? error.message : 'unknown' });
-  } finally {
-    client.release();
-  }
+  const warehouseId = body.warehouseId ? Number(body.warehouseId) : await getDefaultWarehouseId(db);
+  if (!(await assertWarehouseAccess(req, res, warehouseId))) return;
+  const operation = await postSingleStockOperation(db, {
+    operationType: 'writeoff',
+    idempotencyKey: String(req.headers['x-idempotency-key'] || ''),
+    payload: { warehouseId, productId, quantity, reason: String(body.reason || '').trim() || null },
+    warehouseId,
+    productId,
+    quantity,
+    reason: String(body.reason || '').trim() || null,
+    referenceType: 'manual_writeoff',
+    createdBy: req.user!.id
+  });
+  return res.status(operation.reused ? 200 : 201).json({
+    message: operation.reused ? 'Списание уже было проведено' : 'Списание проведено',
+    operationId: operation.operationId,
+    reused: operation.reused
+  });
 });
 
 app.post('/api/admin/stock/reserve', authRequired(JWT_SECRET), roleRequired('admin'), async (req, res) => {
@@ -3469,61 +4201,32 @@ app.post('/api/admin/stock/reserve', authRequired(JWT_SECRET), roleRequired('adm
     return res.status(400).json({ message: 'Нужны корректные productId и quantity > 0' });
   }
 
-  const client = await db.connect();
-  try {
-    await client.query('BEGIN');
-    const warehouseId = body.warehouseId ? Number(body.warehouseId) : await getDefaultWarehouseId(client);
-    if (!(await assertWarehouseAccess(req, res, warehouseId))) {
-      await client.query('ROLLBACK');
-      return;
-    }
-    await ensureWarehouseStockRow(client, warehouseId, productId);
-    const row = (await client.query(
-      `
-        SELECT quantity, reserved_quantity
-        FROM warehouse_stock
-        WHERE warehouse_id = $1 AND product_id = $2
-        FOR UPDATE
-      `,
-      [warehouseId, productId]
-    )).rows[0];
-    const available = Math.max(toNumber(row?.quantity ?? 0) - toNumber(row?.reserved_quantity ?? 0), 0);
-    if (available < quantity) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ message: `Недостаточно остатка для резерва. Доступно: ${available}` });
-    }
-    await client.query(
-      `
-        UPDATE warehouse_stock
-        SET reserved_quantity = reserved_quantity + $1, updated_at = NOW()
-        WHERE warehouse_id = $2 AND product_id = $3
-      `,
-      [quantity, warehouseId, productId]
-    );
-    await client.query(
-      `
-        INSERT INTO stock_movements (warehouse_id, product_id, movement_type, quantity, reason, reference_type, reference_id, created_by)
-        VALUES ($1, $2, 'reserve', $3, $4, $5, $6, $7)
-      `,
-      [
-        warehouseId,
-        productId,
-        quantity,
-        String(body.reason || '').trim() || null,
-        String(body.referenceType || '').trim() || null,
-        body.referenceId ? Number(body.referenceId) : null,
-        req.user!.id
-      ]
-    );
-    await syncProductAvailabilityFromWarehouse(client, productId);
-    await client.query('COMMIT');
-    return res.status(201).json({ message: 'Резерв создан' });
-  } catch (error) {
-    await client.query('ROLLBACK');
-    return res.status(500).json({ message: 'Не удалось создать резерв', error: error instanceof Error ? error.message : 'unknown' });
-  } finally {
-    client.release();
-  }
+  const warehouseId = body.warehouseId ? Number(body.warehouseId) : await getDefaultWarehouseId(db);
+  if (!(await assertWarehouseAccess(req, res, warehouseId))) return;
+  const operation = await postSingleStockOperation(db, {
+    operationType: 'manual_reserve',
+    idempotencyKey: String(req.headers['x-idempotency-key'] || ''),
+    payload: {
+      warehouseId,
+      productId,
+      quantity,
+      reason: String(body.reason || '').trim() || null,
+      referenceType: String(body.referenceType || '').trim() || null,
+      referenceId: body.referenceId ? Number(body.referenceId) : null
+    },
+    warehouseId,
+    productId,
+    quantity,
+    reason: String(body.reason || '').trim() || null,
+    referenceType: String(body.referenceType || '').trim() || 'manual_reserve',
+    referenceId: body.referenceId ? Number(body.referenceId) : null,
+    createdBy: req.user!.id
+  });
+  return res.status(operation.reused ? 200 : 201).json({
+    message: operation.reused ? 'Резерв уже был создан' : 'Резерв создан',
+    operationId: operation.operationId,
+    reused: operation.reused
+  });
 });
 
 app.post('/api/admin/pick-tasks/from-order', authRequired(JWT_SECRET), roleRequired('admin'), async (req, res) => {
@@ -3563,9 +4266,13 @@ app.post('/api/admin/pick-tasks/from-order', authRequired(JWT_SECRET), roleRequi
       body.assignedTo ? Number(body.assignedTo) : null
     );
     await client.query('COMMIT');
+    notifyOrderUpdated(orderId, 'picking_updated');
     return res.status(201).json({ message: 'Задача сборки создана', taskId });
   } catch (error) {
     await client.query('ROLLBACK');
+    if ((error as any)?.code === '23505') {
+      return res.status(409).json({ message: 'Задача сборки для заказа уже существует' });
+    }
     if (error instanceof Error && /У сборщика уже есть активная задача/i.test(error.message)) {
       return res.status(409).json({ message: error.message });
     }
@@ -3649,104 +4356,12 @@ app.patch('/api/admin/pick-tasks/:taskId', authRequired(JWT_SECRET), roleRequire
     }
 
     if (status === 'done' && currentStatus !== 'done') {
-      for (const item of itemRows) {
-        const productId = toNumber(item.product_id);
-        const qty = toNumber(item.requested_qty);
-        const stock = (await client.query(
-          `
-            SELECT quantity, reserved_quantity
-            FROM warehouse_stock
-            WHERE warehouse_id = $1 AND product_id = $2
-            FOR UPDATE
-          `,
-          [toNumber(task.warehouse_id), productId]
-        )).rows[0];
-        const quantity = toNumber(stock?.quantity ?? 0);
-        const reserved = toNumber(stock?.reserved_quantity ?? 0);
-        if (quantity < qty) {
-          await client.query('ROLLBACK');
-          return res.status(400).json({ message: `Недостаточно остатка для productId=${productId}` });
-        }
-
-        // Если резерв уменьшился (например, ручное снятие), дозарезервируем из доступного остатка
-        if (reserved < qty) {
-          const missingReserve = qty - reserved;
-          const available = quantity - reserved;
-          if (available < missingReserve) {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ message: `Недостаточно резерва для productId=${productId}` });
-          }
-          await client.query(
-            `
-              UPDATE warehouse_stock
-              SET reserved_quantity = reserved_quantity + $1, updated_at = NOW()
-              WHERE warehouse_id = $2 AND product_id = $3
-            `,
-            [missingReserve, toNumber(task.warehouse_id), productId]
-          );
-        }
-        await client.query(
-          `
-            UPDATE warehouse_stock
-            SET quantity = quantity - $1, reserved_quantity = reserved_quantity - $1, updated_at = NOW()
-            WHERE warehouse_id = $2 AND product_id = $3
-          `,
-          [qty, toNumber(task.warehouse_id), productId]
-        );
-        await client.query(
-          `
-            UPDATE pick_task_items
-            SET picked_qty = requested_qty
-            WHERE pick_task_id = $1 AND product_id = $2
-          `,
-          [taskId, productId]
-        );
-        await client.query(
-          `
-            INSERT INTO stock_movements (warehouse_id, product_id, movement_type, quantity, reason, reference_type, reference_id, created_by)
-            VALUES ($1, $2, 'pick', $3, $4, 'pick_task', $5, $6)
-          `,
-          [toNumber(task.warehouse_id), productId, qty, `Списано по задаче сборки #${taskId}`, taskId, req.user!.id]
-        );
-        await syncProductAvailabilityFromWarehouse(client, productId);
-      }
+      await consumePickTaskReservations(client, toNumber(task.order_id), taskId, req.user!.id);
+      await client.query('UPDATE pick_task_items SET picked_qty = requested_qty WHERE pick_task_id = $1', [taskId]);
     }
 
     if (status === 'cancelled' && currentStatus !== 'cancelled') {
-      for (const item of itemRows) {
-        const productId = toNumber(item.product_id);
-        const qty = toNumber(item.requested_qty);
-        const stock = (await client.query(
-          `
-            SELECT reserved_quantity
-            FROM warehouse_stock
-            WHERE warehouse_id = $1 AND product_id = $2
-            FOR UPDATE
-          `,
-          [toNumber(task.warehouse_id), productId]
-        )).rows[0];
-        const reserved = toNumber(stock?.reserved_quantity ?? 0);
-        if (reserved < qty) {
-          await client.query('ROLLBACK');
-          return res.status(400).json({ message: `Некорректный резерв для productId=${productId}` });
-        }
-        await client.query(
-          `
-            UPDATE warehouse_stock
-            SET reserved_quantity = reserved_quantity - $1, updated_at = NOW()
-            WHERE warehouse_id = $2 AND product_id = $3
-          `,
-          [qty, toNumber(task.warehouse_id), productId]
-        );
-        await client.query(
-          `
-            INSERT INTO stock_movements (warehouse_id, product_id, movement_type, quantity, reason, reference_type, reference_id, created_by)
-            VALUES ($1, $2, 'release', $3, $4, 'pick_task', $5, $6)
-          `,
-          [toNumber(task.warehouse_id), productId, qty, `Резерв снят по отмене задачи #${taskId}`, taskId, req.user!.id]
-        );
-        await syncProductAvailabilityFromWarehouse(client, productId);
-      }
+      await releaseOrderReservations(client, toNumber(task.order_id), taskId, req.user!.id);
     }
 
     const nextAssignedTo = body.assignedTo === undefined ? (task.assigned_to === null ? null : toNumber(task.assigned_to)) : body.assignedTo;
@@ -3774,11 +4389,124 @@ app.patch('/api/admin/pick-tasks/:taskId', authRequired(JWT_SECRET), roleRequire
     );
 
     await client.query('COMMIT');
+    notifyOrderUpdated(toNumber(task.order_id), 'picking_updated');
     await tryAssignOldestPendingPickTask();
     return res.json({ message: 'Задача сборки обновлена' });
   } catch (error) {
     await client.query('ROLLBACK');
+    if (error instanceof HttpError) {
+      return res.status(error.statusCode).json({ message: error.message });
+    }
     return res.status(500).json({ message: 'Не удалось обновить задачу сборки', error: error instanceof Error ? error.message : 'unknown' });
+  } finally {
+    client.release();
+  }
+});
+
+app.patch('/api/admin/pick-tasks/:taskId/items/:itemId', authRequired(JWT_SECRET), roleRequired('admin', 'picker'), async (req, res) => {
+  if (req.user!.role === 'admin') {
+    if (!(await requireAdminPermission(req, res, 'manage_warehouse'))) return;
+  }
+  const taskId = Number(req.params.taskId);
+  const itemId = Number(req.params.itemId);
+  if (!taskId || !itemId) return res.status(400).json({ message: 'Некорректный taskId или itemId' });
+  const body = req.body as {
+    resultStatus?: 'pending' | 'picked' | 'substituted' | 'missing';
+    substituteProductName?: string | null;
+    resultNote?: string | null;
+    barcode?: string | null;
+  };
+  const resultStatus = String(body.resultStatus || '').trim().toLowerCase();
+  if (!['pending', 'picked', 'substituted', 'missing'].includes(resultStatus)) {
+    return res.status(400).json({ message: 'Некорректный resultStatus' });
+  }
+
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    const task = (
+      await client.query(
+        `
+          SELECT id, warehouse_id, order_id, assigned_to
+          FROM pick_tasks
+          WHERE id = $1
+          FOR UPDATE
+        `,
+        [taskId]
+      )
+    ).rows[0];
+    if (!task) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Задача сборки не найдена' });
+    }
+    if (req.user!.role === 'admin') {
+      if (!(await assertWarehouseAccess(req, res, toNumber(task.warehouse_id)))) {
+        await client.query('ROLLBACK');
+        return;
+      }
+    } else if (task.assigned_to !== null && toNumber(task.assigned_to) !== req.user!.id) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ message: 'Задача уже назначена другому сборщику' });
+    }
+
+    const existingItem = (
+      await client.query(
+        `
+          SELECT id, product_id, requested_qty
+          FROM pick_task_items
+          WHERE id = $1 AND pick_task_id = $2
+          FOR UPDATE
+        `,
+        [itemId, taskId]
+      )
+    ).rows[0];
+    if (!existingItem) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Позиция задачи не найдена' });
+    }
+    const requestedQty = toNumber(existingItem.requested_qty);
+    const pickedQty = resultStatus === 'missing' || resultStatus === 'pending' ? 0 : requestedQty;
+    const substituteProductName =
+      resultStatus === 'substituted' ? (String(body.substituteProductName || '').trim() || 'Замена') : null;
+    const resultNote = String(body.resultNote || '').trim() || null;
+    const barcode = String(body.barcode || '').trim() || null;
+
+    await client.query(
+      `
+        UPDATE pick_task_items
+        SET result_status = $1,
+            substitute_product_name = $2,
+            result_note = $3,
+            barcode_scanned = $4,
+            picked_qty = $5
+        WHERE id = $6
+      `,
+      [resultStatus, substituteProductName, resultNote, barcode, pickedQty, itemId]
+    );
+    await client.query('COMMIT');
+    notifyOrderUpdated(toNumber(task.order_id), 'picking_updated');
+
+    if (resultStatus === 'substituted' || resultStatus === 'missing') {
+      const order = (await db.query('SELECT user_id FROM orders WHERE id = $1 LIMIT 1', [toNumber(task.order_id)])).rows[0];
+      if (order?.user_id) {
+        await createNotification({
+          userId: toNumber(order.user_id),
+          level: resultStatus === 'missing' ? 'warning' : 'info',
+          title: resultStatus === 'missing' ? `Позиция недоступна в заказе #${toNumber(task.order_id)}` : `В заказе #${toNumber(task.order_id)} предложена замена`,
+          body:
+            resultStatus === 'missing'
+              ? `Товар не найден на складе. ${resultNote || ''}`.trim()
+              : `Замена: ${substituteProductName || 'выбрана'}. ${resultNote || ''}`.trim(),
+          entityType: 'order',
+          entityId: toNumber(task.order_id)
+        });
+      }
+    }
+
+    return res.json({ message: 'Позиция задачи обновлена' });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    return res.status(500).json({ message: 'Не удалось обновить позицию задачи', error: error instanceof Error ? error.message : 'unknown' });
   } finally {
     client.release();
   }
@@ -3909,7 +4637,7 @@ app.get('/api/stores/couriers', authRequired(JWT_SECRET), roleRequired('customer
 });
 
 app.post('/api/couriers/me/heartbeat', authRequired(JWT_SECRET), roleRequired('courier'), async (req, res) => {
-  const body = req.body as { busy?: boolean };
+  const body = req.body as { busy?: boolean; lat?: number | null; lng?: number | null };
   const courierRow = (await db.query('SELECT * FROM couriers WHERE user_id = $1 LIMIT 1', [req.user!.id])).rows[0];
   if (!courierRow) return res.status(404).json({ message: 'Профиль курьера не найден' });
 
@@ -3918,23 +4646,41 @@ app.post('/api/couriers/me/heartbeat', authRequired(JWT_SECRET), roleRequired('c
     return res.status(403).json({ message: 'Сначала пройдите верификацию курьера' });
   }
 
+  const hasLat = body.lat !== undefined && body.lat !== null;
+  const hasLng = body.lng !== undefined && body.lng !== null;
+  if (hasLat !== hasLng) return res.status(400).json({ message: 'Координаты lat/lng должны передаваться парой' });
+  const nextLat = hasLat ? Number(body.lat) : null;
+  const nextLng = hasLng ? Number(body.lng) : null;
+  if (
+    (nextLat !== null && (!Number.isFinite(nextLat) || nextLat < -90 || nextLat > 90)) ||
+    (nextLng !== null && (!Number.isFinite(nextLng) || nextLng < -180 || nextLng > 180))
+  ) {
+    return res.status(400).json({ message: 'Некорректные координаты курьера' });
+  }
+
   const updated = (
     await db.query(
       `
         UPDATE couriers
         SET status = $1,
-            last_seen_at = NOW()
+            last_seen_at = NOW(),
+            current_lat = CASE WHEN $3::double precision IS NULL THEN current_lat ELSE $3::double precision END,
+            current_lng = CASE WHEN $4::double precision IS NULL THEN current_lng ELSE $4::double precision END,
+            current_location_updated_at = CASE WHEN $3::double precision IS NULL THEN current_location_updated_at ELSE NOW() END
         WHERE id = $2
         RETURNING *
       `,
-      [nextStatus, toNumber(courierRow.id)]
+      [nextStatus, toNumber(courierRow.id), nextLat, nextLng]
     )
   ).rows[0];
 
   return res.json({
     status: nextStatus,
     isOnline: courierIsOnline(updated),
-    lastSeenAt: updated.last_seen_at ? new Date(updated.last_seen_at).toISOString() : null
+    lastSeenAt: updated.last_seen_at ? new Date(updated.last_seen_at).toISOString() : null,
+    location: updated.current_lat === null || updated.current_lng === null
+      ? null
+      : { lat: Number(updated.current_lat), lng: Number(updated.current_lng), updatedAt: updated.current_location_updated_at ? toDateString(updated.current_location_updated_at) : null }
   });
 });
 
@@ -3995,7 +4741,7 @@ app.patch('/api/couriers/me/verification', authRequired(JWT_SECRET), roleRequire
   });
 });
 
-app.get('/api/admin/users', authRequired(JWT_SECRET), roleRequired('admin'), async (_req, res) => {
+app.get('/api/admin/users', authRequired(JWT_SECRET), roleRequired('owner'), async (_req, res) => {
   if (!(await requireAdminPermission(_req, res, 'manage_users'))) return;
   const rows = (await db.query(
     `
@@ -4021,7 +4767,7 @@ app.get('/api/admin/users', authRequired(JWT_SECRET), roleRequired('admin'), asy
   });
 });
 
-app.post('/api/admin/users/:userId/reset-password', authRequired(JWT_SECRET), roleRequired('admin'), async (req, res) => {
+app.post('/api/admin/users/:userId/reset-password', authRequired(JWT_SECRET), roleRequired('owner'), async (req, res) => {
   if (!(await requireAdminPermission(req, res, 'manage_users'))) return;
   const userId = Number(req.params.userId);
   const newPassword = String((req.body as { newPassword?: string }).newPassword || '');
@@ -4045,7 +4791,7 @@ app.post('/api/admin/users/:userId/reset-password', authRequired(JWT_SECRET), ro
   return res.json({ message: 'Пароль сброшен администратором' });
 });
 
-app.patch('/api/admin/users/:userId', authRequired(JWT_SECRET), roleRequired('admin'), async (req, res) => {
+app.patch('/api/admin/users/:userId', authRequired(JWT_SECRET), roleRequired('owner'), async (req, res) => {
   if (!(await requireAdminPermission(req, res, 'manage_users'))) return;
   const userId = Number(req.params.userId);
   if (!userId) return res.status(400).json({ message: 'Некорректный userId' });
@@ -4090,7 +4836,7 @@ app.patch('/api/admin/users/:userId', authRequired(JWT_SECRET), roleRequired('ad
 
   if (existing.id === req.user!.id) {
     if (!nextIsActive) return res.status(400).json({ message: 'Нельзя заблокировать самого себя' });
-    if (nextRole !== 'admin') return res.status(400).json({ message: 'Нельзя снять роль admin у самого себя' });
+    if (nextRole !== existing.role) return res.status(400).json({ message: 'Нельзя изменить собственную роль' });
   }
 
   const updatedRow = (await db.query(
@@ -4123,7 +4869,7 @@ app.patch('/api/admin/users/:userId', authRequired(JWT_SECRET), roleRequired('ad
   return res.json({ user: publicUser(normalizeUserRow(updatedRow)) });
 });
 
-app.post('/api/admin/users/:userId/force-logout', authRequired(JWT_SECRET), roleRequired('admin'), async (req, res) => {
+app.post('/api/admin/users/:userId/force-logout', authRequired(JWT_SECRET), roleRequired('owner'), async (req, res) => {
   if (!(await requireAdminPermission(req, res, 'manage_users'))) return;
   const userId = Number(req.params.userId);
   if (!userId) return res.status(400).json({ message: 'Некорректный userId' });
@@ -4140,7 +4886,7 @@ app.post('/api/admin/users/:userId/force-logout', authRequired(JWT_SECRET), role
   return res.json({ message: 'Все сессии пользователя завершены' });
 });
 
-app.delete('/api/admin/users/:userId', authRequired(JWT_SECRET), roleRequired('admin'), async (req, res) => {
+app.delete('/api/admin/users/:userId', authRequired(JWT_SECRET), roleRequired('owner'), async (req, res) => {
   if (!(await requireAdminPermission(req, res, 'manage_users'))) return;
   const userId = Number(req.params.userId);
   if (!userId) return res.status(400).json({ message: 'Некорректный userId' });
@@ -4160,7 +4906,7 @@ app.delete('/api/admin/users/:userId', authRequired(JWT_SECRET), roleRequired('a
   return res.json({ message: 'Пользователь удален' });
 });
 
-app.post('/api/admin/staff', authRequired(JWT_SECRET), roleRequired('admin'), async (req, res) => {
+app.post('/api/admin/staff', authRequired(JWT_SECRET), roleRequired('owner'), async (req, res) => {
   const adminUser = await getUserById(req.user!.id);
   if (!adminUser || !isSystemAdmin(adminUser)) {
     return res.status(403).json({ message: 'Только системный администратор может создавать сотрудников' });
@@ -4213,7 +4959,7 @@ app.post('/api/admin/staff', authRequired(JWT_SECRET), roleRequired('admin'), as
   return res.status(201).json({ user: publicUser(created) });
 });
 
-app.get('/api/admin/stores', authRequired(JWT_SECRET), roleRequired('admin'), async (req, res) => {
+app.get('/api/admin/stores', authRequired(JWT_SECRET), roleRequired('owner'), async (req, res) => {
   if (!(await requireChiefAdmin(req, res))) return;
   const status = String(req.query.status || '').trim().toLowerCase();
   const whereSql = ['pending', 'approved', 'rejected'].includes(status) ? 'WHERE s.status = $1' : '';
@@ -4243,7 +4989,7 @@ app.get('/api/admin/stores', authRequired(JWT_SECRET), roleRequired('admin'), as
   });
 });
 
-app.patch('/api/admin/stores/:storeId/review', authRequired(JWT_SECRET), roleRequired('admin'), async (req, res) => {
+app.patch('/api/admin/stores/:storeId/review', authRequired(JWT_SECRET), roleRequired('owner'), async (req, res) => {
   if (!(await requireChiefAdmin(req, res))) return;
   const storeId = Number(req.params.storeId);
   if (!storeId) return res.status(400).json({ message: 'Некорректный storeId' });
@@ -4278,11 +5024,19 @@ app.patch('/api/admin/stores/:storeId/review', authRequired(JWT_SECRET), roleReq
     decision,
     reason
   });
+  await createNotification({
+    userId: toNumber(existing.owner_user_id),
+    level: decision === 'approved' ? 'success' : 'warning',
+    title: decision === 'approved' ? 'Точка одобрена администратором' : 'Точка отклонена администратором',
+    body: reason || null,
+    entityType: 'store',
+    entityId: storeId
+  });
 
   return res.json({ store: merchantStoreView(updated) });
 });
 
-app.get('/api/admin/stores/:storeId/tenant-routing', authRequired(JWT_SECRET), roleRequired('admin'), async (req, res) => {
+app.get('/api/admin/stores/:storeId/tenant-routing', authRequired(JWT_SECRET), roleRequired('owner'), async (req, res) => {
   if (!(await requireChiefAdmin(req, res))) return;
   const storeId = Number(req.params.storeId);
   if (!storeId) return res.status(400).json({ message: 'Некорректный storeId' });
@@ -4305,7 +5059,7 @@ app.get('/api/admin/stores/:storeId/tenant-routing', authRequired(JWT_SECRET), r
   return res.json({ routing: tenantRoutingView(row) });
 });
 
-app.patch('/api/admin/stores/:storeId/tenant-routing', authRequired(JWT_SECRET), roleRequired('admin'), async (req, res) => {
+app.patch('/api/admin/stores/:storeId/tenant-routing', authRequired(JWT_SECRET), roleRequired('owner'), async (req, res) => {
   if (!(await requireChiefAdmin(req, res))) return;
   const storeId = Number(req.params.storeId);
   if (!storeId) return res.status(400).json({ message: 'Некорректный storeId' });
@@ -4359,7 +5113,7 @@ app.patch('/api/admin/stores/:storeId/tenant-routing', authRequired(JWT_SECRET),
   return res.json({ routing: tenantRoutingView(row) });
 });
 
-app.post('/api/admin/stores/:storeId/migrate-products', authRequired(JWT_SECRET), roleRequired('admin'), async (req, res) => {
+app.post('/api/admin/stores/:storeId/migrate-products', authRequired(JWT_SECRET), roleRequired('owner'), async (req, res) => {
   if (!(await requireChiefAdmin(req, res))) return;
   const storeId = Number(req.params.storeId);
   if (!storeId) return res.status(400).json({ message: 'Некорректный storeId' });
@@ -4406,7 +5160,7 @@ app.post('/api/admin/stores/:storeId/migrate-products', authRequired(JWT_SECRET)
   return res.json({ result });
 });
 
-app.get('/api/admin/stores/:storeId/courier-links', authRequired(JWT_SECRET), roleRequired('admin'), async (req, res) => {
+app.get('/api/admin/stores/:storeId/courier-links', authRequired(JWT_SECRET), roleRequired('owner'), async (req, res) => {
   if (!(await requireChiefAdmin(req, res))) return;
   const storeId = Number(req.params.storeId);
   if (!storeId) return res.status(400).json({ message: 'Некорректный storeId' });
@@ -4432,7 +5186,7 @@ app.get('/api/admin/stores/:storeId/courier-links', authRequired(JWT_SECRET), ro
   return res.json({ links: rows.map((row: any) => merchantCourierLinkView(row)) });
 });
 
-app.patch('/api/admin/stores/:storeId/courier-links/:linkId/review', authRequired(JWT_SECRET), roleRequired('admin'), async (req, res) => {
+app.patch('/api/admin/stores/:storeId/courier-links/:linkId/review', authRequired(JWT_SECRET), roleRequired('owner'), async (req, res) => {
   if (!(await requireChiefAdmin(req, res))) return;
   const storeId = Number(req.params.storeId);
   const linkId = Number(req.params.linkId);
@@ -4479,11 +5233,22 @@ app.patch('/api/admin/stores/:storeId/courier-links/:linkId/review', authRequire
     decision,
     reason
   });
+  const store = await getMerchantStoreById(storeId);
+  if (store) {
+    await createNotification({
+      userId: toNumber(store.owner_user_id),
+      level: decision === 'approved' ? 'success' : 'warning',
+      title: decision === 'approved' ? 'Курьер подключен к вашей точке' : 'Заявка на курьера отклонена',
+      body: reason || null,
+      entityType: 'store_courier_link',
+      entityId: linkId
+    });
+  }
 
   return res.json({ link: merchantCourierLinkView(updated) });
 });
 
-app.get('/api/admin/audit-logs', authRequired(JWT_SECRET), roleRequired('admin'), async (req, res) => {
+app.get('/api/admin/audit-logs', authRequired(JWT_SECRET), roleRequired('owner'), async (req, res) => {
   if (!(await requireAdminPermission(req, res, 'view_audit'))) return;
   const limitRaw = Number(req.query.limit);
   const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 500) : 100;
@@ -4526,7 +5291,7 @@ app.get('/api/admin/audit-logs', authRequired(JWT_SECRET), roleRequired('admin')
   });
 });
 
-app.get('/api/admin/search', authRequired(JWT_SECRET), roleRequired('admin'), async (req, res) => {
+app.get('/api/admin/search', authRequired(JWT_SECRET), roleRequired('owner'), async (req, res) => {
   if (!(await requireAdminPermission(req, res, 'search_db'))) return;
   const q = String(req.query.q || '').trim();
   const limitRaw = Number(req.query.limit);
@@ -4671,7 +5436,7 @@ app.get('/api/admin/search', authRequired(JWT_SECRET), roleRequired('admin'), as
   });
 });
 
-app.get('/api/admin/analytics', authRequired(JWT_SECRET), roleRequired('admin'), async (req, res) => {
+app.get('/api/admin/analytics', authRequired(JWT_SECRET), roleRequired('owner'), async (req, res) => {
   if (!(await requireAdminPermission(req, res, 'view_analytics'))) return;
 
   const [totalsRes, rangeRes, dailyRes, topProductsRes, topLocalitiesRes] = await Promise.all([
@@ -4814,6 +5579,14 @@ app.patch('/api/admin/couriers/:courierId/verification', authRequired(JWT_SECRET
     status: body.status,
     comment: reviewComment
   });
+  await createNotification({
+    userId: toNumber(reviewed.user_id),
+    level: body.status === 'approved' ? 'success' : 'warning',
+    title: body.status === 'approved' ? 'Верификация курьера подтверждена' : 'Верификация курьера отклонена',
+    body: reviewComment || null,
+    entityType: 'courier_verification',
+    entityId: courierId
+  });
 
   return res.json({
     courier: {
@@ -4853,13 +5626,12 @@ app.get('/api/cart', authRequired(JWT_SECRET), async (req, res) => {
   res.json({ items, total });
 });
 
-app.post('/api/cart/items', authRequired(JWT_SECRET), async (req, res) => {
+app.post('/api/cart/items', authRequired(JWT_SECRET), validateBody(cartAddItemBodySchema), async (req, res) => {
   const { productId, quantity } = req.body as { productId: number; quantity?: number };
   const qty = Number(quantity || 1);
-  if (!productId || Number.isNaN(qty) || qty <= 0) return res.status(400).json({ message: 'Неверные данные позиции корзины' });
 
   const product = (await db.query('SELECT id FROM products WHERE id = $1 AND in_stock = TRUE LIMIT 1', [productId])).rows[0];
-  if (!product) return res.status(404).json({ message: 'Товар не найден' });
+  if (!product) throw new HttpError(404, 'Товар не найден');
 
   await db.query(
     `
@@ -4874,30 +5646,41 @@ app.post('/api/cart/items', authRequired(JWT_SECRET), async (req, res) => {
   return res.status(201).json({ message: 'Товар добавлен в корзину' });
 });
 
-app.put('/api/cart/items/:itemId', authRequired(JWT_SECRET), async (req, res) => {
-  const itemId = Number(req.params.itemId);
-  const quantity = Number((req.body as { quantity?: number }).quantity);
-  if (!itemId || Number.isNaN(quantity) || quantity <= 0) return res.status(400).json({ message: 'itemId и quantity должны быть валидными' });
+app.put(
+  '/api/cart/items/:itemId',
+  authRequired(JWT_SECRET),
+  validateParams(cartItemParamsSchema),
+  validateBody(cartUpdateItemBodySchema),
+  async (req, res) => {
+    const { itemId } = req.params as unknown as { itemId: number };
+    const { quantity } = req.body as { quantity: number };
 
-  const updated = await db.query(
-    'UPDATE cart_items SET quantity = $1 WHERE id = $2 AND user_id = $3 RETURNING id',
-    [quantity, itemId, req.user!.id]
-  );
-  if (!updated.rows[0]) return res.status(404).json({ message: 'Позиция корзины не найдена' });
+    const updated = await db.query(
+      'UPDATE cart_items SET quantity = $1 WHERE id = $2 AND user_id = $3 RETURNING id',
+      [quantity, itemId, req.user!.id]
+    );
+    if (!updated.rows[0]) throw new HttpError(404, 'Позиция корзины не найдена');
 
-  return res.json({ message: 'Количество обновлено' });
-});
+    return res.json({ message: 'Количество обновлено' });
+  }
+);
 
-app.delete('/api/cart/items/:itemId', authRequired(JWT_SECRET), async (req, res) => {
-  const itemId = Number(req.params.itemId);
-  if (!itemId) return res.status(400).json({ message: 'Некорректный itemId' });
+app.delete('/api/cart/items/:itemId', authRequired(JWT_SECRET), validateParams(cartItemParamsSchema), async (req, res) => {
+  const { itemId } = req.params as unknown as { itemId: number };
 
   await db.query('DELETE FROM cart_items WHERE id = $1 AND user_id = $2', [itemId, req.user!.id]);
   return res.json({ message: 'Позиция удалена' });
 });
 
-app.post('/api/orders', authRequired(JWT_SECRET), async (req, res) => {
-  const body = req.body as { deliveryAddress?: string; deliveryLat?: number; deliveryLng?: number; paymentMethod?: string };
+app.post('/api/orders', authRequired(JWT_SECRET), validateBody(createOrderBodySchema), async (req, res) => {
+  const body = req.body as {
+    deliveryAddress?: string;
+    deliveryLat?: number;
+    deliveryLng?: number;
+    paymentMethod?: string;
+    substitutionPreference?: 'allow_similar' | 'no_substitution' | 'contact_me';
+    substitutionNote?: string;
+  };
   const user = await getUserById(req.user!.id);
   if (!user) return res.status(404).json({ message: 'Пользователь не найден' });
 
@@ -4966,6 +5749,11 @@ app.post('/api/orders', authRequired(JWT_SECRET), async (req, res) => {
   const paymentMethod = ['cash', 'wallet'].includes(String(body.paymentMethod || '').toLowerCase())
     ? String(body.paymentMethod).toLowerCase()
     : 'cash';
+  const substitutionPreferenceRaw = String(body.substitutionPreference || 'contact_me').trim().toLowerCase();
+  const substitutionPreference = ['allow_similar', 'no_substitution', 'contact_me'].includes(substitutionPreferenceRaw)
+    ? substitutionPreferenceRaw
+    : 'contact_me';
+  const substitutionNote = String(body.substitutionNote || '').trim() || null;
   const courierFee = deliveryQuote.deliveryFee ?? null;
 
   const client: PoolClient = await db.connect();
@@ -4978,9 +5766,9 @@ app.post('/api/orders', authRequired(JWT_SECRET), async (req, res) => {
           user_id, status, total, delivery_address, delivery_lat, delivery_lng,
           serviceable, delivery_zone, fulfillment_warehouse, fulfillment_warehouse_code,
           warehouse_distance_km, route_distance_km, delivery_eta_min, delivery_fee,
-          courier_fee, payment_method
+          courier_fee, payment_method, substitution_preference, substitution_note
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
         RETURNING *
       `,
       [
@@ -4999,7 +5787,9 @@ app.post('/api/orders', authRequired(JWT_SECRET), async (req, res) => {
         deliveryQuote.etaMin,
         deliveryQuote.deliveryFee,
         courierFee,
-        paymentMethod
+        paymentMethod,
+        substitutionPreference,
+        substitutionNote
       ]
     );
     const orderId = toNumber(orderInsert.rows[0].id);
@@ -5031,6 +5821,15 @@ app.post('/api/orders', authRequired(JWT_SECRET), async (req, res) => {
     await client.query('COMMIT');
 
     await tryAssignOldestPendingPickTask();
+    await createNotification({
+      userId: user.id,
+      level: 'success',
+      title: `Заказ #${orderId} создан`,
+      body: `Статус: собирается. ETA: ${deliveryQuote.etaMin ?? '—'} мин.`,
+      entityType: 'order',
+      entityId: orderId
+    });
+    notifyOrderUpdated(orderId, 'created');
 
     const orderRow = (await db.query('SELECT * FROM orders WHERE id = $1 LIMIT 1', [orderId])).rows[0];
     return res.status(201).json({ order: orderView(normalizeOrderRow(orderRow)) });
@@ -5089,6 +5888,120 @@ async function fetchOrderEvents(orderId: number) {
   }));
 }
 
+async function fetchOrderItemsStatus(orderId: number) {
+  const rows = (
+    await db.query(
+      `
+        SELECT pti.id,
+               pti.product_id,
+               pti.product_name,
+               pti.requested_qty,
+               pti.picked_qty,
+               pti.result_status,
+               pti.substitute_product_name,
+               pti.result_note
+        FROM pick_tasks pt
+        JOIN pick_task_items pti ON pti.pick_task_id = pt.id
+        WHERE pt.order_id = $1
+        ORDER BY pti.id ASC
+      `,
+      [orderId]
+    )
+  ).rows;
+
+  return rows.map((row: any) => ({
+    id: toNumber(row.id),
+    productId: toNumber(row.product_id),
+    productName: String(row.product_name),
+    requestedQty: toNumber(row.requested_qty),
+    pickedQty: toNumber(row.picked_qty),
+    resultStatus: String(row.result_status || 'pending'),
+    substituteProductName: row.substitute_product_name ?? null,
+    resultNote: row.result_note ?? null
+  }));
+}
+
+async function fetchOrderTracking(orderId: number) {
+  const row = (
+    await db.query(
+      `
+        SELECT o.*,
+               c.current_lat,
+               c.current_lng,
+               c.current_location_updated_at,
+               c.last_seen_at,
+               cu.full_name AS courier_name,
+               cu.phone AS courier_phone
+        FROM orders o
+        LEFT JOIN couriers c ON c.id = o.assigned_courier_id
+        LEFT JOIN users cu ON cu.id = c.user_id
+        WHERE o.id = $1
+        LIMIT 1
+      `,
+      [orderId]
+    )
+  ).rows[0];
+  if (!row) return null;
+
+  const order = normalizeOrderRow(row);
+  const hasCourierLocation = row.current_lat !== null && row.current_lng !== null;
+  const hasDeliveryPoint = order.delivery_lat !== null && order.delivery_lng !== null;
+  let liveDistanceKm: number | null = null;
+  let etaLiveMin: number | null = order.delivery_eta_min;
+  if (hasCourierLocation && hasDeliveryPoint) {
+    liveDistanceKm = haversineKm(Number(row.current_lat), Number(row.current_lng), Number(order.delivery_lat), Number(order.delivery_lng));
+    const speedKmPerHour = 25;
+    etaLiveMin = Math.max(Math.round((liveDistanceKm / speedKmPerHour) * 60) + 2, 1);
+  }
+
+  return {
+    orderId: order.id,
+    status: order.status,
+    etaBaseMin: order.delivery_eta_min,
+    etaLiveMin,
+    liveDistanceKm: liveDistanceKm === null ? null : round2(liveDistanceKm),
+    routeUrl:
+      order.delivery_lat !== null && order.delivery_lng !== null
+        ? `https://www.google.com/maps/dir/?api=1&destination=${order.delivery_lat},${order.delivery_lng}`
+        : null,
+    courier: row.assigned_courier_id
+      ? {
+          id: toNumber(row.assigned_courier_id),
+          name: row.courier_name || null,
+          phone: row.courier_phone || null,
+          isOnline: row.last_seen_at ? courierIsOnline({ last_seen_at: row.last_seen_at }) : false,
+          location: hasCourierLocation
+            ? {
+                lat: Number(row.current_lat),
+                lng: Number(row.current_lng),
+                updatedAt: row.current_location_updated_at ? toDateString(row.current_location_updated_at) : null
+              }
+            : null
+        }
+      : null
+  };
+}
+
+async function fetchOrderDetailsPayload(orderId: number) {
+  const orderRow = (await db.query('SELECT * FROM orders WHERE id = $1 LIMIT 1', [orderId])).rows[0];
+  if (!orderRow) return null;
+  const order = normalizeOrderRow(orderRow);
+  const [items, events, itemsStatus, tracking] = await Promise.all([
+    fetchOrderItems(orderId),
+    fetchOrderEvents(orderId),
+    fetchOrderItemsStatus(orderId),
+    fetchOrderTracking(orderId)
+  ]);
+
+  return {
+    order: orderView(order),
+    items,
+    itemsStatus,
+    events,
+    tracking
+  };
+}
+
 app.get('/api/orders/my', authRequired(JWT_SECRET), async (req, res) => {
   const rows = (
     await db.query(
@@ -5111,7 +6024,7 @@ app.get('/api/orders/my', authRequired(JWT_SECRET), async (req, res) => {
           ORDER BY pt.id DESC
           LIMIT 1
         ) pts ON TRUE
-        WHERE o.user_id = $1
+        WHERE o.user_id = $1 AND o.archived_at IS NULL
         ORDER BY o.id DESC
       `,
       [req.user!.id]
@@ -5183,6 +6096,64 @@ app.get('/api/orders/assigned', authRequired(JWT_SECRET), roleRequired('courier'
   )).rows;
 
   return res.json({ orders: rows.map((row: any) => orderView(normalizeOrderRow(row))) });
+});
+
+app.get('/api/couriers/me/route', authRequired(JWT_SECRET), roleRequired('courier'), async (req, res) => {
+  const courier = (await db.query('SELECT * FROM couriers WHERE user_id = $1 LIMIT 1', [req.user!.id])).rows[0];
+  if (!courier) return res.status(404).json({ message: 'Профиль курьера не найден' });
+  const courierId = toNumber(courier.id);
+  const currentLat = courier.current_lat === null ? null : Number(courier.current_lat);
+  const currentLng = courier.current_lng === null ? null : Number(courier.current_lng);
+  const rows = (
+    await db.query(
+      `
+        SELECT id, delivery_lat, delivery_lng, delivery_address, status, created_at
+        FROM orders
+        WHERE assigned_courier_id = $1
+          AND status IN ('courier_assigned', 'courier_picked', 'on_the_way', 'arrived')
+        ORDER BY
+          CASE status
+            WHEN 'on_the_way' THEN 1
+            WHEN 'courier_picked' THEN 2
+            WHEN 'arrived' THEN 3
+            ELSE 4
+          END ASC,
+          created_at ASC
+      `,
+      [courierId]
+    )
+  ).rows;
+
+  const waypoints = rows
+    .filter((row: any) => row.delivery_lat !== null && row.delivery_lng !== null)
+    .map((row: any) => ({
+      orderId: toNumber(row.id),
+      status: String(row.status),
+      lat: Number(row.delivery_lat),
+      lng: Number(row.delivery_lng),
+      address: String(row.delivery_address || '')
+    }));
+
+  const destination = waypoints[0] || null;
+  let routeUrl: string | null = null;
+  if (destination) {
+    const originPart = currentLat !== null && currentLng !== null ? `&origin=${currentLat},${currentLng}` : '';
+    routeUrl = `https://www.google.com/maps/dir/?api=1${originPart}&destination=${destination.lat},${destination.lng}&travelmode=driving`;
+  }
+
+  return res.json({
+    courierId,
+    currentLocation:
+      currentLat === null || currentLng === null
+        ? null
+        : {
+            lat: currentLat,
+            lng: currentLng,
+            updatedAt: courier.current_location_updated_at ? toDateString(courier.current_location_updated_at) : null
+          },
+    waypoints,
+    routeUrl
+  });
 });
 
 app.get('/api/orders/open', authRequired(JWT_SECRET), roleRequired('courier'), async (req, res) => {
@@ -5272,6 +6243,9 @@ app.get('/api/orders/history', authRequired(JWT_SECRET), roleRequired('courier',
       )
     ).rows;
   }
+  if (req.user!.role === 'admin') {
+    if (!(await requireAdminPermission(req, res, 'manage_orders'))) return;
+  }
 
   return res.json({ orders: rows.map((row: any) => orderView(normalizeOrderRow(row))) });
 });
@@ -5280,39 +6254,79 @@ app.post('/api/orders/:orderId/claim', authRequired(JWT_SECRET), roleRequired('c
   const orderId = Number(req.params.orderId);
   if (!orderId) return res.status(400).json({ message: 'Некорректный orderId' });
 
-  const courierRow = (await db.query('SELECT * FROM couriers WHERE user_id = $1 LIMIT 1', [req.user!.id])).rows[0];
-  if (!courierRow) return res.status(404).json({ message: 'Профиль курьера не найден' });
-  if (!courierEligible(courierRow)) {
-    return res.status(403).json({ message: 'Курьер не верифицирован. Добавьте данные транспорта и фото техпаспорта.' });
-  }
-  await db.query('UPDATE couriers SET last_seen_at = NOW() WHERE id = $1', [toNumber(courierRow.id)]);
-  const courierId = toNumber(courierRow.id);
-  const maxActive = toNumber(courierRow.max_active_orders);
-  const activeCount = await getActiveOrderCountForCourier(courierId);
-  if (activeCount >= maxActive) {
-    return res.status(409).json({ message: 'Достигнут лимит активных заказов курьера' });
+  const client = await db.connect();
+  let claimed: any;
+  try {
+    await client.query('BEGIN');
+    const courierRow = (
+      await client.query(
+        `
+          SELECT *
+          FROM couriers
+          WHERE user_id = $1
+          FOR UPDATE
+          LIMIT 1
+        `,
+        [req.user!.id]
+      )
+    ).rows[0];
+    if (!courierRow) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Профиль курьера не найден' });
+    }
+    if (!courierEligible(courierRow)) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ message: 'Курьер не верифицирован. Добавьте данные транспорта и фото техпаспорта.' });
+    }
+
+    const courierId = toNumber(courierRow.id);
+    const maxActive = toNumber(courierRow.max_active_orders);
+    const activeCount = await getActiveOrderCountForCourier(courierId, client);
+    if (activeCount >= maxActive) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ message: 'Достигнут лимит активных заказов курьера' });
+    }
+
+    await client.query('UPDATE couriers SET last_seen_at = NOW() WHERE id = $1', [courierId]);
+    claimed = (
+      await client.query(
+        `
+          UPDATE orders
+          SET assigned_courier_id = $1, status = $2, updated_at = NOW()
+          WHERE id = $3
+            AND status = $4
+            AND assigned_courier_id IS NULL
+          RETURNING *
+        `,
+        [courierId, ORDER_STATUS.courierAssigned, orderId, ORDER_STATUS.assembling]
+      )
+    ).rows[0];
+    if (!claimed) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ message: 'Заказ уже назначен курьеру или недоступен' });
+    }
+
+    await client.query(
+      'INSERT INTO order_events (order_id, status, comment, created_by) VALUES ($1, $2, $3, $4)',
+      [orderId, ORDER_STATUS.courierAssigned, 'Курьер принял заказ вручную', req.user!.id]
+    );
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
   }
 
-  const claimed = (await db.query(
-    `
-      UPDATE orders
-      SET assigned_courier_id = $1, status = $2
-      WHERE id = $3
-        AND status = $4
-        AND assigned_courier_id IS NULL
-      RETURNING *
-    `,
-    [courierId, ORDER_STATUS.courierAssigned, orderId, ORDER_STATUS.assembling]
-  )).rows[0];
-
-  if (!claimed) {
-    return res.status(409).json({ message: 'Заказ уже назначен курьеру или недоступен' });
-  }
-
-  await db.query(
-    'INSERT INTO order_events (order_id, status, comment, created_by) VALUES ($1, $2, $3, $4)',
-    [orderId, ORDER_STATUS.courierAssigned, 'Курьер принял заказ вручную', req.user!.id]
-  );
+  await createNotification({
+    userId: toNumber(claimed.user_id),
+    level: 'info',
+    title: `Курьер назначен на заказ #${orderId}`,
+    body: 'Заказ передан в доставку',
+    entityType: 'order',
+    entityId: orderId
+  });
+  notifyOrderUpdated(orderId, 'courier_assigned');
 
   return res.json({ order: orderView(normalizeOrderRow(claimed)) });
 });
@@ -5340,6 +6354,7 @@ app.get('/api/orders/all', authRequired(JWT_SECRET), roleRequired('admin'), asyn
           ORDER BY pt.id DESC
           LIMIT 1
         ) pts ON TRUE
+        WHERE o.archived_at IS NULL
         ORDER BY o.id DESC
         LIMIT 200
       `
@@ -5373,6 +6388,169 @@ app.get('/api/orders/:orderId', authRequired(JWT_SECRET), async (req, res) => {
     items: await fetchOrderItems(orderId),
     events: await fetchOrderEvents(orderId)
   });
+});
+
+app.get('/api/orders/:orderId/tracking', authRequired(JWT_SECRET), async (req, res) => {
+  const orderId = Number(req.params.orderId);
+  if (!orderId) return res.status(400).json({ message: 'Некорректный orderId' });
+  const row = (
+    await db.query(
+      `
+        SELECT o.*,
+               c.current_lat,
+               c.current_lng,
+               c.current_location_updated_at,
+               c.last_seen_at,
+               cu.full_name AS courier_name,
+               cu.phone AS courier_phone
+        FROM orders o
+        LEFT JOIN couriers c ON c.id = o.assigned_courier_id
+        LEFT JOIN users cu ON cu.id = c.user_id
+        WHERE o.id = $1
+        LIMIT 1
+      `,
+      [orderId]
+    )
+  ).rows[0];
+  if (!row) return res.status(404).json({ message: 'Заказ не найден' });
+
+  const order = normalizeOrderRow(row);
+  if (req.user!.role === 'customer' && order.user_id !== req.user!.id) {
+    return res.status(403).json({ message: 'Нет доступа к заказу' });
+  }
+  if (req.user!.role === 'courier') {
+    const courier = (await db.query('SELECT id FROM couriers WHERE user_id = $1 LIMIT 1', [req.user!.id])).rows[0];
+    if (!courier || order.assigned_courier_id !== toNumber(courier.id)) return res.status(403).json({ message: 'Нет доступа к заказу' });
+  }
+  if (req.user!.role === 'admin') {
+    if (!(await requireAdminPermission(req, res, 'view_orders'))) return;
+  }
+
+  const hasCourierLocation = row.current_lat !== null && row.current_lng !== null;
+  const hasDeliveryPoint = order.delivery_lat !== null && order.delivery_lng !== null;
+  let liveDistanceKm: number | null = null;
+  let etaLiveMin: number | null = order.delivery_eta_min;
+  if (hasCourierLocation && hasDeliveryPoint) {
+    liveDistanceKm = haversineKm(Number(row.current_lat), Number(row.current_lng), Number(order.delivery_lat), Number(order.delivery_lng));
+    const speedKmPerHour = 25;
+    etaLiveMin = Math.max(Math.round((liveDistanceKm / speedKmPerHour) * 60) + 2, 1);
+  }
+
+  return res.json({
+    orderId: order.id,
+    status: order.status,
+    etaBaseMin: order.delivery_eta_min,
+    etaLiveMin,
+    liveDistanceKm: liveDistanceKm === null ? null : round2(liveDistanceKm),
+    routeUrl:
+      order.delivery_lat !== null && order.delivery_lng !== null
+        ? `https://www.google.com/maps/dir/?api=1&destination=${order.delivery_lat},${order.delivery_lng}`
+        : null,
+    courier: row.assigned_courier_id
+      ? {
+          id: toNumber(row.assigned_courier_id),
+          name: row.courier_name || null,
+          phone: row.courier_phone || null,
+          isOnline: row.last_seen_at ? courierIsOnline({ last_seen_at: row.last_seen_at }) : false,
+          location: hasCourierLocation
+            ? {
+                lat: Number(row.current_lat),
+                lng: Number(row.current_lng),
+                updatedAt: row.current_location_updated_at ? toDateString(row.current_location_updated_at) : null
+              }
+            : null
+        }
+      : null
+  });
+});
+
+app.get('/api/orders/:orderId/stream', authRequired(JWT_SECRET), async (req, res) => {
+  const orderId = Number(req.params.orderId);
+  if (!orderId) return res.status(400).json({ message: 'Некорректный orderId' });
+
+  const orderRow = (await db.query('SELECT id, user_id, assigned_courier_id FROM orders WHERE id = $1 LIMIT 1', [orderId])).rows[0];
+  if (!orderRow) return res.status(404).json({ message: 'Заказ не найден' });
+
+  const ownerId = toNumber(orderRow.user_id);
+  if (req.user!.role === 'customer' && ownerId !== req.user!.id) {
+    return res.status(403).json({ message: 'Нет доступа к заказу' });
+  }
+  if (req.user!.role === 'courier') {
+    const courier = (await db.query('SELECT id FROM couriers WHERE user_id = $1 LIMIT 1', [req.user!.id])).rows[0];
+    if (!courier || toNumber(orderRow.assigned_courier_id ?? 0) !== toNumber(courier.id)) {
+      return res.status(403).json({ message: 'Нет доступа к заказу' });
+    }
+  }
+  if (req.user!.role === 'admin') {
+    if (!(await requireAdminPermission(req, res, 'view_orders'))) return;
+  }
+
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+  res.write('retry: 3000\n\n');
+
+  let streamClosed = false;
+  let snapshotInFlight = false;
+
+  const sendEvent = (event: string, payload: unknown) => {
+    if (streamClosed) return;
+    res.write(`event: ${event}\n`);
+    res.write(`data: ${JSON.stringify(payload)}\n\n`);
+  };
+
+  const sendSnapshot = async (reason: OrderUpdateReason = 'updated') => {
+    if (streamClosed || snapshotInFlight) return;
+    snapshotInFlight = true;
+    try {
+      const details = await fetchOrderDetailsPayload(orderId);
+      if (!details) {
+        sendEvent('error', { message: 'Заказ больше не доступен' });
+        return;
+      }
+      sendEvent('order_details', { ...details, reason });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Ошибка обновления заказа';
+      sendEvent('error', { message });
+    } finally {
+      snapshotInFlight = false;
+    }
+  };
+
+  const unsubscribe = subscribeOrderUpdates(orderId, (reason) => {
+    void sendSnapshot(reason);
+  });
+  await sendSnapshot('updated');
+  const keepAliveInterval = setInterval(() => {
+    if (!streamClosed) res.write(': keepalive\n\n');
+  }, 25_000);
+
+  req.on('close', () => {
+    streamClosed = true;
+    unsubscribe();
+    clearInterval(keepAliveInterval);
+    res.end();
+  });
+});
+
+app.get('/api/orders/:orderId/items-status', authRequired(JWT_SECRET), async (req, res) => {
+  const orderId = Number(req.params.orderId);
+  if (!orderId) return res.status(400).json({ message: 'Некорректный orderId' });
+  const orderRow = (await db.query('SELECT id, user_id, assigned_courier_id FROM orders WHERE id = $1 LIMIT 1', [orderId])).rows[0];
+  if (!orderRow) return res.status(404).json({ message: 'Заказ не найден' });
+  const ownerId = toNumber(orderRow.user_id);
+  if (req.user!.role === 'customer' && ownerId !== req.user!.id) return res.status(403).json({ message: 'Нет доступа к заказу' });
+  if (req.user!.role === 'courier') {
+    const courier = (await db.query('SELECT id FROM couriers WHERE user_id = $1 LIMIT 1', [req.user!.id])).rows[0];
+    if (!courier || toNumber(orderRow.assigned_courier_id ?? 0) !== toNumber(courier.id)) return res.status(403).json({ message: 'Нет доступа к заказу' });
+  }
+  if (req.user!.role === 'admin') {
+    if (!(await requireAdminPermission(req, res, 'view_orders'))) return;
+  }
+
+  const items = await fetchOrderItemsStatus(orderId);
+  return res.json({ items });
 });
 
 app.post('/api/orders/:orderId/pay', authRequired(JWT_SECRET), async (req, res) => {
@@ -5414,6 +6592,9 @@ app.post('/api/orders/:orderId/pay', authRequired(JWT_SECRET), async (req, res) 
       [idempotencyKey]
     )).rows[0];
     if (existing) {
+      if (toNumber(existing.order_id) !== orderId || toNumber(existing.user_id) !== req.user!.id) {
+        return res.status(409).json({ message: 'x-idempotency-key уже использован для другого платежа' });
+      }
       return res.json({
         ok: true,
         reused: true,
@@ -5482,7 +6663,7 @@ app.post('/api/orders/:orderId/pay', authRequired(JWT_SECRET), async (req, res) 
     };
     const webhookJson = JSON.stringify(webhookBody);
 
-    return res.status(201).json({
+    const responseBody: Record<string, unknown> = {
       ok: true,
       payment: {
         provider: PAYMENT_PROVIDER,
@@ -5490,16 +6671,19 @@ app.post('/api/orders/:orderId/pay', authRequired(JWT_SECRET), async (req, res) 
         status: inserted.status,
         amount: Number(inserted.amount),
         currency: inserted.currency
-      },
-      webhookTest: {
+      }
+    };
+    if (NODE_ENV !== 'production') {
+      responseBody.webhookTest = {
         method: 'POST',
         url: '/api/payments/webhook',
         headers: {
           'x-webhook-signature': signWebhookPayload(webhookJson)
         },
         body: webhookBody
-      }
-    });
+      };
+    }
+    return res.status(201).json(responseBody);
   } catch (error: any) {
     if (error?.code === '23505' && idempotencyKey) {
       const existing = (await db.query(
@@ -5512,6 +6696,9 @@ app.post('/api/orders/:orderId/pay', authRequired(JWT_SECRET), async (req, res) 
         [idempotencyKey]
       )).rows[0];
       if (existing) {
+        if (toNumber(existing.order_id) !== orderId || toNumber(existing.user_id) !== req.user!.id) {
+          return res.status(409).json({ message: 'x-idempotency-key уже использован для другого платежа' });
+        }
         return res.json({
           ok: true,
           reused: true,
@@ -5532,6 +6719,7 @@ app.post('/api/orders/:orderId/pay', authRequired(JWT_SECRET), async (req, res) 
 
 app.post('/api/payments/webhook', async (req, res) => {
   const signature = String(req.headers['x-webhook-signature'] || '').trim().toLowerCase();
+  const rawBody = String(req.rawBody || '');
   const body = req.body as {
     providerPaymentId?: string;
     status?: string;
@@ -5542,13 +6730,8 @@ app.post('/api/payments/webhook', async (req, res) => {
   };
 
   if (!signature) return res.status(401).json({ message: 'Missing webhook signature' });
-  const canonicalBody = JSON.stringify({
-    providerPaymentId: body.providerPaymentId || '',
-    status: body.status || '',
-    amount: body.amount ?? null,
-    currency: body.currency || 'USD'
-  });
-  const expectedSignature = signWebhookPayload(canonicalBody);
+  if (!rawBody.length) return res.status(400).json({ message: 'Invalid webhook payload' });
+  const expectedSignature = signWebhookPayload(rawBody);
   if (!safeEqualHex(signature, expectedSignature)) {
     return res.status(401).json({ message: 'Invalid webhook signature' });
   }
@@ -5556,6 +6739,7 @@ app.post('/api/payments/webhook', async (req, res) => {
   const providerPaymentId = String(body.providerPaymentId || '').trim();
   if (!providerPaymentId) return res.status(400).json({ message: 'providerPaymentId обязателен' });
   const nextStatus = normalizePaymentStatus(body.status);
+  let changedOrderId: number | null = null;
 
   const client = await db.connect();
   try {
@@ -5625,10 +6809,11 @@ app.post('/api/payments/webhook', async (req, res) => {
       }
 
       if (currentOrderStatus !== ORDER_STATUS.paid) {
-        await client.query('UPDATE orders SET status = $1, updated_at = NOW() WHERE id = $2', [ORDER_STATUS.paid, toNumber(orderRow.id)]);
+        changedOrderId = toNumber(orderRow.id);
+        await client.query('UPDATE orders SET status = $1, updated_at = NOW() WHERE id = $2', [ORDER_STATUS.paid, changedOrderId]);
         await client.query(
           'INSERT INTO order_events (order_id, status, comment, created_by) VALUES ($1, $2, $3, NULL)',
-          [toNumber(orderRow.id), ORDER_STATUS.paid, `Оплата подтверждена (${PAYMENT_PROVIDER})`]
+          [changedOrderId, ORDER_STATUS.paid, `Оплата подтверждена (${PAYMENT_PROVIDER})`]
         );
       }
     }
@@ -5644,12 +6829,20 @@ app.post('/api/payments/webhook', async (req, res) => {
 
   await tryAssignOldestPendingOrder();
   await tryAssignOldestPendingPickTask();
+  if (changedOrderId) {
+    notifyOrderUpdated(changedOrderId, 'payment_updated');
+  }
   return res.json({ ok: true });
 });
 
-app.patch('/api/orders/:orderId/status', authRequired(JWT_SECRET), async (req, res) => {
-  const orderId = Number(req.params.orderId);
-  const { status, comment } = req.body as { status?: string; comment?: string };
+app.patch(
+  '/api/orders/:orderId/status',
+  authRequired(JWT_SECRET),
+  validateParams(orderIdParamsSchema),
+  validateBody(updateOrderStatusBodySchema),
+  async (req, res) => {
+  const { orderId } = req.params as unknown as { orderId: number };
+  const { status, comment } = req.body as { status: OrderStatus; comment?: string | null };
   const allowed: OrderStatus[] = [
     ORDER_STATUS.assembling,
     ORDER_STATUS.courierAssigned,
@@ -5661,7 +6854,7 @@ app.patch('/api/orders/:orderId/status', authRequired(JWT_SECRET), async (req, r
     ORDER_STATUS.cancelled
   ];
 
-  if (!orderId || !status || !allowed.includes(status as OrderStatus)) {
+  if (!allowed.includes(status as OrderStatus)) {
     return res.status(400).json({ message: 'Некорректный статус или orderId' });
   }
   const nextStatus = status as OrderStatus;
@@ -5678,6 +6871,9 @@ app.patch('/api/orders/:orderId/status', authRequired(JWT_SECRET), async (req, r
       return res.status(403).json({ message: 'Клиент может менять только свой заказ' });
     }
     if (nextStatus === ORDER_STATUS.cancelled) {
+      if (order.status === ORDER_STATUS.cancelled) {
+        return res.json({ order: orderView(order), idempotent: true });
+      }
       if (!CUSTOMER_EDITABLE_STATUSES.includes(order.status as OrderStatus)) {
         return res.status(403).json({ message: 'Отмена доступна только на этапах "Собирается" или "Назначен курьер"' });
       }
@@ -5685,6 +6881,8 @@ app.patch('/api/orders/:orderId/status', authRequired(JWT_SECRET), async (req, r
       return res.status(403).json({ message: 'Клиент может только отменить заказ' });
     }
   }
+
+  if (req.user!.role === 'admin' && !(await requireAdminPermission(req, res, 'manage_orders'))) return;
 
   if (req.user!.role === 'courier') {
     const courier = (await db.query('SELECT * FROM couriers WHERE user_id = $1 LIMIT 1', [req.user!.id])).rows[0];
@@ -5717,6 +6915,56 @@ app.patch('/api/orders/:orderId/status', authRequired(JWT_SECRET), async (req, r
         return res.status(409).json({ message: 'Сборщик ещё не передал заказ курьеру' });
       }
     }
+  }
+
+  if (nextStatus === ORDER_STATUS.cancelled) {
+    const client = await db.connect();
+    try {
+      await client.query('BEGIN');
+      const lockedOrder = (
+        await client.query('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [orderId])
+      ).rows[0];
+      if (!lockedOrder) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ message: 'Заказ не найден' });
+      }
+      if (String(lockedOrder.status) === ORDER_STATUS.cancelled) {
+        await client.query('COMMIT');
+        return res.json({ order: orderView(normalizeOrderRow(lockedOrder)), idempotent: true });
+      }
+      const task = (
+        await client.query(
+          `SELECT id, status FROM pick_tasks WHERE order_id = $1 ORDER BY id DESC LIMIT 1 FOR UPDATE`,
+          [orderId]
+        )
+      ).rows[0];
+      if (task && ['done', 'handed_to_courier'].includes(String(task.status))) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ message: 'Товар уже физически списан. Используйте отдельную операцию возврата.' });
+      }
+      if (task && ['new', 'in_progress'].includes(String(task.status))) {
+        await releaseOrderReservations(client, orderId, toNumber(task.id), req.user!.id);
+        await client.query(
+          `UPDATE pick_tasks SET status = 'cancelled', completed_at = NOW(), updated_at = NOW() WHERE id = $1`,
+          [toNumber(task.id)]
+        );
+      }
+      await client.query('UPDATE orders SET status = $1 WHERE id = $2', [ORDER_STATUS.cancelled, orderId]);
+      await client.query(
+        'INSERT INTO order_events (order_id, status, comment, created_by) VALUES ($1, $2, $3, $4)',
+        [orderId, ORDER_STATUS.cancelled, comment || null, req.user!.id]
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      if (error instanceof HttpError) return res.status(error.statusCode).json({ message: error.message });
+      throw error;
+    } finally {
+      client.release();
+    }
+    const cancelledRow = (await db.query('SELECT * FROM orders WHERE id = $1', [orderId])).rows[0];
+    notifyOrderUpdated(orderId, 'status_changed');
+    return res.json({ order: orderView(normalizeOrderRow(cancelledRow)) });
   }
 
   const statusFlow: Partial<Record<OrderStatus, OrderStatus[]>> = {
@@ -5753,14 +7001,33 @@ app.patch('/api/orders/:orderId/status', authRequired(JWT_SECRET), async (req, r
     }
   }
 
-  if (nextStatus === ORDER_STATUS.cancelled) {
-    await tryAssignOldestPendingOrder();
-    await tryAssignOldestPendingPickTask();
-  }
-
   const updatedRow = (await db.query('SELECT * FROM orders WHERE id = $1 LIMIT 1', [orderId])).rows[0];
-  return res.json({ order: orderView(normalizeOrderRow(updatedRow)) });
-});
+  const updatedOrder = normalizeOrderRow(updatedRow);
+  await createNotification({
+    userId: updatedOrder.user_id,
+    level: 'info',
+    title: `Статус заказа #${orderId}: ${nextStatus}`,
+    body: comment ? String(comment) : null,
+    entityType: 'order',
+    entityId: orderId
+  });
+  if (updatedOrder.assigned_courier_id) {
+    const courierUser = (await db.query('SELECT user_id FROM couriers WHERE id = $1 LIMIT 1', [updatedOrder.assigned_courier_id])).rows[0];
+    if (courierUser?.user_id) {
+      await createNotification({
+        userId: toNumber(courierUser.user_id),
+        level: 'info',
+        title: `Обновление заказа #${orderId}: ${nextStatus}`,
+        body: comment ? String(comment) : null,
+        entityType: 'order',
+        entityId: orderId
+      });
+    }
+  }
+  notifyOrderUpdated(orderId, 'status_changed');
+  return res.json({ order: orderView(updatedOrder) });
+}
+);
 
 app.patch('/api/orders/:orderId/edit', authRequired(JWT_SECRET), async (req, res) => {
   const orderId = Number(req.params.orderId);
@@ -5779,7 +7046,7 @@ app.patch('/api/orders/:orderId/edit', authRequired(JWT_SECRET), async (req, res
       return res.status(409).json({ message: 'Изменение доступно только на этапах "Собирается" или "Назначен курьер"' });
     }
   } else if (req.user!.role === 'admin') {
-    if (!(await requireAdminPermission(req, res, 'view_orders'))) return;
+    if (!(await requireAdminPermission(req, res, 'manage_orders'))) return;
   } else {
     return res.status(403).json({ message: 'Недостаточно прав для изменения заказа' });
   }
@@ -5832,49 +7099,55 @@ app.patch('/api/orders/:orderId/edit', authRequired(JWT_SECRET), async (req, res
     return res.status(409).json({ message: deliveryQuote.reason || 'Доставка по этому адресу недоступна' });
   }
 
-  await db.query(
-    `
-      UPDATE orders
-      SET
-        delivery_address = $1,
-        delivery_lat = $2,
-        delivery_lng = $3,
-        serviceable = $4,
-        delivery_zone = $5,
-        fulfillment_warehouse = $6,
-        fulfillment_warehouse_code = $7,
-        warehouse_distance_km = $8,
-        route_distance_km = $9,
-        delivery_eta_min = $10,
-        delivery_fee = $11
-      WHERE id = $12
-    `,
-    [
-      nextAddress,
-      deliveryLat,
-      deliveryLng,
-      deliveryQuote.serviceable,
-      deliveryQuote.zoneName,
-      deliveryQuote.warehouseName,
-      deliveryQuote.warehouseCode,
-      deliveryQuote.warehouseDistanceKm,
-      deliveryQuote.routeDistanceKm,
-      deliveryQuote.etaMin,
-      deliveryQuote.deliveryFee,
-      orderId
-    ]
-  );
-  await db.query(
-    'INSERT INTO order_events (order_id, status, comment, created_by) VALUES ($1, $2, $3, $4)',
-    [
-      orderId,
-      order.status,
-      req.user!.role === 'admin' ? 'Администратор изменил адрес заказа' : 'Клиент изменил адрес заказа',
-      req.user!.id
-    ]
-  );
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    const lockedOrder = (await client.query('SELECT status FROM orders WHERE id = $1 FOR UPDATE', [orderId])).rows[0];
+    if (!lockedOrder || !CUSTOMER_EDITABLE_STATUSES.includes(String(lockedOrder.status) as OrderStatus)) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ message: 'Заказ уже нельзя редактировать' });
+    }
+    const reservedWarehouse = (
+      await client.query(
+        `
+          SELECT w.code
+          FROM pick_tasks pt JOIN warehouses w ON w.id = pt.warehouse_id
+          WHERE pt.order_id = $1 AND pt.status IN ('new', 'in_progress')
+          LIMIT 1 FOR UPDATE OF pt
+        `,
+        [orderId]
+      )
+    ).rows[0];
+    if (reservedWarehouse && String(reservedWarehouse.code) !== String(deliveryQuote.warehouseCode || '')) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ message: 'Новый адрес требует другого склада. Отмените заказ и оформите новый.' });
+    }
+    await client.query(
+      `
+        UPDATE orders
+        SET delivery_address = $1, delivery_lat = $2, delivery_lng = $3, serviceable = $4,
+            delivery_zone = $5, fulfillment_warehouse = $6, fulfillment_warehouse_code = $7,
+            warehouse_distance_km = $8, route_distance_km = $9, delivery_eta_min = $10, delivery_fee = $11
+        WHERE id = $12
+      `,
+      [nextAddress, deliveryLat, deliveryLng, deliveryQuote.serviceable, deliveryQuote.zoneName,
+        deliveryQuote.warehouseName, deliveryQuote.warehouseCode, deliveryQuote.warehouseDistanceKm,
+        deliveryQuote.routeDistanceKm, deliveryQuote.etaMin, deliveryQuote.deliveryFee, orderId]
+    );
+    await client.query(
+      'INSERT INTO order_events (order_id, status, comment, created_by) VALUES ($1, $2, $3, $4)',
+      [orderId, order.status, req.user!.role === 'admin' ? 'Администратор изменил адрес заказа' : 'Клиент изменил адрес заказа', req.user!.id]
+    );
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
 
   const updatedRow = (await db.query('SELECT * FROM orders WHERE id = $1 LIMIT 1', [orderId])).rows[0];
+  notifyOrderUpdated(orderId, 'address_changed');
   return res.json({ order: orderView(normalizeOrderRow(updatedRow)) });
 });
 
@@ -5882,7 +7155,7 @@ app.delete('/api/orders/:orderId', authRequired(JWT_SECRET), async (req, res) =>
   const orderId = Number(req.params.orderId);
   if (!orderId) return res.status(400).json({ message: 'Некорректный orderId' });
 
-  const row = (await db.query('SELECT id, user_id, status FROM orders WHERE id = $1 LIMIT 1', [orderId])).rows[0];
+  const row = (await db.query('SELECT id, user_id, status, archived_at FROM orders WHERE id = $1 LIMIT 1', [orderId])).rows[0];
   if (!row) return res.status(404).json({ message: 'Заказ не найден' });
 
   const ownerId = toNumber(row.user_id);
@@ -5893,12 +7166,19 @@ app.delete('/api/orders/:orderId', authRequired(JWT_SECRET), async (req, res) =>
     if (status !== ORDER_STATUS.cancelled && status !== ORDER_STATUS.paid) {
       return res.status(409).json({ message: 'Удаление доступно только для отмененных или завершенных заказов' });
     }
-  } else if (req.user!.role !== 'admin') {
+  } else if (req.user!.role === 'admin') {
+    if (!(await requireAdminPermission(req, res, 'manage_orders'))) return;
+  } else {
     return res.status(403).json({ message: 'Недостаточно прав для удаления заказа' });
   }
 
-  await db.query('DELETE FROM orders WHERE id = $1', [orderId]);
-  return res.json({ message: 'Заказ удален' });
+  if (status !== ORDER_STATUS.cancelled && status !== ORDER_STATUS.paid) {
+    return res.status(409).json({ message: 'Физическое удаление запрещено. Сначала отмените или завершите заказ.' });
+  }
+  if (row.archived_at) return res.json({ message: 'Заказ уже архивирован', idempotent: true });
+  await db.query('UPDATE orders SET archived_at = NOW() WHERE id = $1', [orderId]);
+  notifyOrderUpdated(orderId, 'deleted');
+  return res.json({ message: 'Заказ перемещен в архив' });
 });
 
 app.post('/api/couriers/connect', authRequired(JWT_SECRET), roleRequired('customer', 'courier', 'admin'), async (req, res) => {
@@ -5929,7 +7209,8 @@ app.post('/api/couriers/connect', authRequired(JWT_SECRET), roleRequired('custom
         UPDATE couriers
         SET vehicle_type = $1,
             status = $2,
-            last_seen_at = NOW()
+            last_seen_at = NOW(),
+            max_active_orders = 1
         WHERE id = $3
         RETURNING *
       `,
@@ -5993,32 +7274,53 @@ app.get('/api/couriers', authRequired(JWT_SECRET), roleRequired('admin'), async 
   return res.json({ couriers });
 });
 
-app.use((error: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+app.use((error: unknown, req: express.Request, res: express.Response, next: express.NextFunction) => {
   if (res.headersSent) return next(error);
 
-  // Логируем все необработанные ошибки в консоль сервера
-  console.error('[ERROR]', req.method, req.originalUrl, '-', error?.message || error, error?.stack || '');
+  const requestId = req.requestId || 'unknown';
+  const errorMessage = error instanceof Error ? error.message : String(error);
+  const errorStack = error instanceof Error ? error.stack || '' : '';
+  console.error('[ERROR]', requestId, req.method, req.originalUrl, '-', errorMessage, errorStack);
+
+  const sendError = (statusCode: number, message: string, details?: Record<string, unknown>) => {
+    const safeStatusCode = Math.max(400, Math.min(599, Math.floor(Number(statusCode) || 500)));
+    return res.status(safeStatusCode).json({
+      error: {
+        code: mapErrorCode(safeStatusCode),
+        message,
+        requestId,
+        ...(details ? { details } : {})
+      }
+    });
+  };
 
   if (error instanceof multer.MulterError) {
     if (error.code === 'LIMIT_FILE_SIZE') {
-      return res.status(413).json({ message: `Файл слишком большой. Максимум ${Math.round(MAX_UPLOAD_FILE_SIZE_BYTES / (1024 * 1024))} МБ` });
+      return sendError(413, `Файл слишком большой. Максимум ${Math.round(MAX_UPLOAD_FILE_SIZE_BYTES / (1024 * 1024))} МБ`);
     }
-    return res.status(400).json({ message: 'Ошибка загрузки файла' });
+    return sendError(400, 'Ошибка загрузки файла');
   }
 
-  if (error?.code === 'ENOSPC') {
-    return res.status(507).json({ message: 'На сервере закончилось место для загрузки файлов' });
+  if (error && typeof error === 'object' && 'code' in error && (error as { code?: string }).code === 'ENOSPC') {
+    return sendError(507, 'На сервере закончилось место для загрузки файлов');
   }
 
-  const statusCode = Number(error?.statusCode);
+  const statusCode =
+    error && typeof error === 'object' && 'statusCode' in error
+      ? Number((error as { statusCode?: unknown }).statusCode)
+      : NaN;
   const isHttpStatus = Number.isInteger(statusCode) && statusCode >= 400 && statusCode <= 599;
   if (isHttpStatus) {
-    const exposeMessage = Boolean(error?.exposeMessage ?? statusCode < 500);
-    const message = exposeMessage && typeof error?.message === 'string' && error.message.trim() ? error.message : 'Внутренняя ошибка сервера';
-    return res.status(statusCode).json({ message });
+    const exposeMessage =
+      error && typeof error === 'object' && 'exposeMessage' in error
+        ? Boolean((error as { exposeMessage?: unknown }).exposeMessage)
+        : statusCode < 500;
+    const message =
+      exposeMessage && error instanceof Error && error.message.trim() ? error.message : 'Внутренняя ошибка сервера';
+    return sendError(statusCode, message);
   }
 
-  return res.status(500).json({ message: 'Внутренняя ошибка сервера' });
+  return sendError(500, 'Внутренняя ошибка сервера');
 });
 
 const frontendDist = path.join(__dirname, '..', 'frontend', 'dist');
@@ -6054,25 +7356,26 @@ if (!process.env.VERCEL) {
   const shutdown = async (signal: string) => {
     if (shuttingDown) return;
     shuttingDown = true;
-    console.log(`[SHUTDOWN] ${signal} received, stopping server...`);
 
-    try {
-      if (runtimeServer) {
-        await new Promise<void>((resolve) => {
-          runtimeServer!.close(() => resolve());
-        });
+    setImmediate(() => {
+      try {
+        runtimeServer?.close?.();
+        (runtimeServer as any)?.closeAllConnections?.();
+      } catch (e) {
+        // ignore
       }
-    } catch (error) {
-      console.error('[SHUTDOWN] Error while closing HTTP server:', error);
-    }
-
-    try {
-      await Promise.all([tenantDbResolver.close(), db.end(), mapDb.end()]);
-    } catch (error) {
-      console.error('[SHUTDOWN] Error while closing DB pools:', error);
-    }
-
-    process.exit(0);
+      
+      try {
+        db.end?.().catch(() => {});
+        mapDb.end?.().catch(() => {});
+        tenantDbResolver.close?.();
+      } catch (e) {
+        // ignore
+      }
+      
+      // Exit on next tick
+      setImmediate(() => process.exit(0));
+    });
   };
 
   process.on('SIGINT', () => {

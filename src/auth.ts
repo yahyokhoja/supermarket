@@ -59,7 +59,8 @@ export function authRequired(secret: string) {
 
 export function roleRequired(...roles: UserRole[]) {
   return (req: Request, res: Response, next: NextFunction) => {
-    if (!req.user || !roles.includes(req.user.role)) {
+    const effectiveRole = req.user?.role === 'owner' && roles.includes('admin') ? 'admin' : req.user?.role;
+    if (!effectiveRole || !roles.includes(effectiveRole)) {
       return res.status(403).json({ message: 'Недостаточно прав' });
     }
     return next();

@@ -1,6 +1,7 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
 import DeliveryMapPicker from './components/DeliveryMapPicker';
 import AdminWarehouseLocationMap from './components/AdminWarehouseLocationMap';
+import InventoryDocumentsPanel from './components/InventoryDocumentsPanel';
 
 type Role = 'customer' | 'courier' | 'admin' | 'picker';
 type Status =
@@ -67,8 +68,11 @@ type Order = {
   deliveryFee: number | null;
   courierFee: number | null;
   paymentMethod: string | null;
+  substitutionPreference?: 'allow_similar' | 'no_substitution' | 'contact_me' | string | null;
+  substitutionNote?: string | null;
   assignedCourierId: number | null;
   createdAt: string;
+  updatedAt: string;
   customerName?: string | null;
   customerPhone?: string | null;
   pickTaskStatus?: string | null;
@@ -81,6 +85,48 @@ type OrderItem = {
   name: string;
   quantity: number;
   unitPrice: number;
+};
+type OrderEvent = {
+  status: string;
+  comment: string | null;
+  createdAt: string;
+  createdBy: string | null;
+};
+type OrderTracking = {
+  orderId: number;
+  status: string;
+  etaBaseMin: number | null;
+  etaLiveMin: number | null;
+  liveDistanceKm: number | null;
+  routeUrl: string | null;
+  courier: {
+    id: number;
+    name: string | null;
+    phone: string | null;
+    isOnline: boolean;
+    location: {
+      lat: number;
+      lng: number;
+      updatedAt: string | null;
+    } | null;
+  } | null;
+};
+type OrderItemStatus = {
+  id: number;
+  productId: number;
+  productName: string;
+  requestedQty: number;
+  pickedQty: number;
+  resultStatus: string;
+  substituteProductName: string | null;
+  resultNote: string | null;
+};
+type OrderDetailsState = {
+  order: Order;
+  items: OrderItem[];
+  itemsStatus: OrderItemStatus[];
+  events: OrderEvent[];
+  tracking: OrderTracking | null;
 };
 
 type Courier = {
@@ -250,6 +296,17 @@ type CourierProfile = {
   canRevertToCustomer?: boolean;
   revertToCustomerReason?: string | null;
 };
+type UserNotification = {
+  id: number;
+  level: string;
+  title: string;
+  body: string | null;
+  entityType: string | null;
+  entityId: number | null;
+  isRead: boolean;
+  createdAt: string;
+  readAt: string | null;
+};
 
 type SavedDelivery = {
   locality: string;
@@ -396,6 +453,7 @@ function buildWarehouseRoutePath(warehouseCode: string, category: string) {
 
 const ADMIN_PERMISSION_OPTIONS = [
   { key: 'view_orders', label: 'Просмотр заказов' },
+  { key: 'manage_orders', label: 'Управление заказами' },
   { key: 'view_analytics', label: 'Бизнес-аналитика' },
   { key: 'manage_products', label: 'Управление товарами' },
   { key: 'manage_warehouse', label: 'Управление складом' },
@@ -406,6 +464,13 @@ const ADMIN_PERMISSION_OPTIONS = [
 ] as const;
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.trim() || '';
+
+function newIdempotencyKey(prefix: string) {
+  const suffix = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return `${prefix}:${suffix}`;
+}
 const STATUS_LABELS: Record<Status, string> = {
   assembling: 'Собирается',
   courier_assigned: 'Назначен курьер',
@@ -416,6 +481,49 @@ const STATUS_LABELS: Record<Status, string> = {
   paid: 'Оплачен',
   cancelled: 'Отменен'
 };
+const CUSTOMER_ORDER_FLOW: Status[] = ['assembling', 'courier_assigned', 'courier_picked', 'on_the_way', 'arrived', 'received', 'paid'];
+type OrderFlowState = 'done' | 'current' | 'todo' | 'cancelled';
+
+function getOrderFlowState(orderStatus: Status, step: Status): OrderFlowState {
+  if (orderStatus === 'cancelled') return 'cancelled';
+  const currentIndex = CUSTOMER_ORDER_FLOW.indexOf(orderStatus);
+  const stepIndex = CUSTOMER_ORDER_FLOW.indexOf(step);
+  if (currentIndex === -1 || stepIndex === -1) return 'todo';
+  if (stepIndex < currentIndex) return 'done';
+  if (stepIndex === currentIndex) return 'current';
+  return 'todo';
+}
+
+function shouldAutoRefreshOrderDetails(status: Status) {
+  return status !== 'paid' && status !== 'cancelled';
+}
+
+function parseSseEventBlock(rawBlock: string): { event: string; data: string } | null {
+  const lines = rawBlock.split(/\r?\n/);
+  let eventName = 'message';
+  const dataLines: string[] = [];
+  for (const line of lines) {
+    if (!line || line.startsWith(':')) continue;
+    if (line.startsWith('event:')) {
+      eventName = line.slice(6).trim() || 'message';
+      continue;
+    }
+    if (line.startsWith('data:')) {
+      dataLines.push(line.slice(5).trimStart());
+    }
+  }
+  if (dataLines.length === 0) return null;
+  return { event: eventName, data: dataLines.join('\n') };
+}
+
+function formatUpdatedAgo(seconds: number) {
+  if (seconds < 5) return 'только что';
+  if (seconds < 60) return `${seconds} сек назад`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} мин назад`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours} ч назад`;
+}
 
 const STATUS_ACTION_LABELS: Record<Status, string> = {
   assembling: 'Собирается',
@@ -433,6 +541,13 @@ const PICK_TASK_STATUS_LABELS: Record<string, string> = {
   done: 'Собрана',
   handed_to_courier: 'Отдана курьеру',
   cancelled: 'Отменена'
+};
+const PICK_ITEM_RESULT_LABELS: Record<string, string> = {
+  pending: 'Ожидает',
+  picked: 'Собрано',
+  substituted: 'Заменено',
+  missing: 'Нет в наличии',
+  cancelled: 'Отменено'
 };
 const ACTIVE_PICK_TASK_STATUSES: PickTask['status'][] = ['new', 'in_progress'];
 
@@ -655,8 +770,20 @@ export default function App() {
   const [token, setToken] = useState<string | null>(() => localStorage.getItem('token'));
   const [user, setUser] = useState<User | null>(null);
   const [products, setProducts] = useState<Product[]>([]);
+  const [productsLoading, setProductsLoading] = useState(false);
+  const [productsError, setProductsError] = useState('');
   const [cart, setCart] = useState<{ items: CartItem[]; total: number }>({ items: [], total: 0 });
   const [orders, setOrders] = useState<Order[]>([]);
+  const [orderDetailsOpen, setOrderDetailsOpen] = useState(false);
+  const [orderDetailsLoading, setOrderDetailsLoading] = useState(false);
+  const [orderDetailsRefreshing, setOrderDetailsRefreshing] = useState(false);
+  const [orderDetailsError, setOrderDetailsError] = useState('');
+  const [orderDetails, setOrderDetails] = useState<OrderDetailsState | null>(null);
+  const [orderDetailsLastUpdatedAt, setOrderDetailsLastUpdatedAt] = useState<number | null>(null);
+  const [orderDetailsLiveConnected, setOrderDetailsLiveConnected] = useState(false);
+  const [orderDetailsClockMs, setOrderDetailsClockMs] = useState<number>(Date.now());
+  const [customerOrderFilter, setCustomerOrderFilter] = useState<'all' | Status>('all');
+  const [customerOrderQuery, setCustomerOrderQuery] = useState('');
   const [repeatingOrderId, setRepeatingOrderId] = useState<number | null>(null);
   const [editingOrderId, setEditingOrderId] = useState<number | null>(null);
   const [cancellingOrderId, setCancellingOrderId] = useState<number | null>(null);
@@ -701,7 +828,10 @@ export default function App() {
     topProducts: [],
     topLocalities: []
   });
-  const [adminTab, setAdminTab] = useState<AdminTab>('orders');
+  const [adminTab, setAdminTab] = useState<AdminTab>(() => {
+    const requested = new URLSearchParams(window.location.search).get('legacyAdmin') as AdminTab | null;
+    return requested && ['orders','analytics','products','warehouse','users','couriers','audit','search','merchants','pickTasks'].includes(requested) ? requested : 'orders';
+  });
   const [adminSearchQuery, setAdminSearchQuery] = useState('');
   const [adminSearchLoading, setAdminSearchLoading] = useState(false);
   const [adminSearchData, setAdminSearchData] = useState<AdminSearchResponse>({
@@ -713,6 +843,8 @@ export default function App() {
   const [deliveryAddress, setDeliveryAddress] = useState('');
   const [deliveryHouseNumber, setDeliveryHouseNumber] = useState('');
   const [checkoutPaymentMethod, setCheckoutPaymentMethod] = useState<'cash' | 'wallet'>('wallet');
+  const [checkoutSubstitutionPreference, setCheckoutSubstitutionPreference] = useState<'allow_similar' | 'no_substitution' | 'contact_me'>('contact_me');
+  const [checkoutSubstitutionNote, setCheckoutSubstitutionNote] = useState('');
   const [deliveryLocation, setDeliveryLocation] = useState<{ lat: number; lng: number } | null>(null);
   const [deliveryQuote, setDeliveryQuote] = useState<DeliveryQuote | null>(null);
   const [deliveryQuoteLoading, setDeliveryQuoteLoading] = useState(false);
@@ -768,6 +900,8 @@ export default function App() {
     }
   });
   const [toast, setToast] = useState('');
+  const [notifications, setNotifications] = useState<UserNotification[]>([]);
+  const [notificationsUnreadCount, setNotificationsUnreadCount] = useState(0);
 
   const [loginState, setLoginState] = useState({ email: '', password: '' });
   const [registerState, setRegisterState] = useState({ fullName: '', email: '', password: '', phone: '', address: '' });
@@ -787,7 +921,7 @@ export default function App() {
   const [adminResetPasswordValue, setAdminResetPasswordValue] = useState('');
   const [adminReviewComments, setAdminReviewComments] = useState<Record<number, string>>({});
   const [stockActionForm, setStockActionForm] = useState({
-    movementType: 'receive' as StockMovementType,
+    movementType: 'reserve' as StockMovementType,
     warehouseId: 0,
     productId: 0,
     quantity: '1',
@@ -883,6 +1017,8 @@ export default function App() {
   const [profileOpen, setProfileOpen] = useState(false);
   const [storeOpen, setStoreOpen] = useState(false);
   const [cartOpen, setCartOpen] = useState(false);
+  const [checkoutStep, setCheckoutStep] = useState<1 | 2 | 3>(1);
+  const [checkoutSubmitting, setCheckoutSubmitting] = useState(false);
   const [deliveryMapOpen, setDeliveryMapOpen] = useState(false);
   const profileSectionRef = useRef<HTMLElement | null>(null);
   const catalogSectionRef = useRef<HTMLElement | null>(null);
@@ -897,6 +1033,9 @@ export default function App() {
   const warehouseOperationQuantityRef = useRef<HTMLInputElement | null>(null);
   const sessionExpiredHandledRef = useRef(false);
   const previousPickTaskIdsRef = useRef<Set<number>>(new Set());
+  const orderDetailsStreamAbortRef = useRef<AbortController | null>(null);
+  const orderDetailsStreamReconnectTimerRef = useRef<number | null>(null);
+  const orderDetailsStreamRetryAttemptRef = useRef(0);
 
   const loggedIn = Boolean(token && user);
   const isSystemAdmin = user?.email?.trim().toLowerCase() === 'admin@universal.local';
@@ -952,6 +1091,18 @@ export default function App() {
     }
     return map;
   }, [cart.items]);
+  const filteredCustomerOrders = useMemo(() => {
+    const query = customerOrderQuery.trim().toLowerCase();
+    return orders.filter((order) => {
+      if (customerOrderFilter !== 'all' && order.status !== customerOrderFilter) return false;
+      if (!query) return true;
+
+      const inId = String(order.id).includes(query);
+      const inAddress = String(order.deliveryAddress || '').toLowerCase().includes(query);
+      const inStatus = String(STATUS_LABELS[order.status] || '').toLowerCase().includes(query);
+      return inId || inAddress || inStatus;
+    });
+  }, [orders, customerOrderFilter, customerOrderQuery]);
 
   const adminCategoryMap = useMemo(() => {
     const map = new Map<string, Set<string>>();
@@ -1285,7 +1436,11 @@ export default function App() {
     }
 
     if (!res.ok) {
-      throw new Error(data.message || 'Ошибка API');
+      const message =
+        (data && typeof data.message === 'string' && data.message) ||
+        (data && data.error && typeof data.error.message === 'string' && data.error.message) ||
+        'Ошибка API';
+      throw new Error(message);
     }
 
     return data as T;
@@ -1327,8 +1482,27 @@ export default function App() {
   }
 
   async function loadProducts() {
-    const data = await api<{ products: Product[] }>('/api/products');
-    setProducts(data.products);
+    setProductsLoading(true);
+    setProductsError('');
+    try {
+      const data = await api<{ products: Product[] }>('/api/products');
+      setProducts(data.products);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Не удалось загрузить каталог';
+      setProducts([]);
+      setProductsError(message);
+      throw error;
+    } finally {
+      setProductsLoading(false);
+    }
+  }
+
+  async function retryLoadProducts() {
+    try {
+      await loadProducts();
+    } catch {
+      // notification is handled where needed
+    }
   }
 
   async function loadMe() {
@@ -1377,6 +1551,86 @@ export default function App() {
     if (!token) return;
     const data = await api<{ orders: Order[] }>('/api/orders/my');
     setOrders(data.orders);
+  }
+
+  async function refreshOrderDetails(orderId: number, options?: { silent?: boolean }) {
+    const silent = Boolean(options?.silent);
+    if (silent) {
+      setOrderDetailsRefreshing(true);
+    } else {
+      setOrderDetailsLoading(true);
+      setOrderDetailsError('');
+    }
+    try {
+      const [base, tracking, itemsStatus] = await Promise.all([
+        api<{ order: Order; items: OrderItem[]; events: OrderEvent[] }>(`/api/orders/${orderId}`),
+        api<OrderTracking>(`/api/orders/${orderId}/tracking`).catch(() => null),
+        api<{ items: OrderItemStatus[] }>(`/api/orders/${orderId}/items-status`).catch(() => ({ items: [] }))
+      ]);
+      setOrderDetails({
+        order: base.order,
+        items: Array.isArray(base.items) ? base.items : [],
+        itemsStatus: Array.isArray(itemsStatus.items) ? itemsStatus.items : [],
+        events: Array.isArray(base.events) ? base.events : [],
+        tracking
+      });
+      setOrderDetailsLastUpdatedAt(Date.now());
+      if (!silent) setOrderDetailsError('');
+    } catch (error) {
+      if (!silent) {
+        setOrderDetails(null);
+        setOrderDetailsError(error instanceof Error ? error.message : 'Не удалось загрузить детали заказа');
+      }
+    } finally {
+      if (silent) {
+        setOrderDetailsRefreshing(false);
+      } else {
+        setOrderDetailsLoading(false);
+      }
+    }
+  }
+
+  async function openOrderDetails(orderId: number) {
+    setOrderDetailsOpen(true);
+    setOrderDetails(null);
+    setOrderDetailsError('');
+    setOrderDetailsLastUpdatedAt(null);
+    setOrderDetailsLiveConnected(false);
+    await refreshOrderDetails(orderId);
+  }
+
+  function closeOrderDetails() {
+    orderDetailsStreamAbortRef.current?.abort();
+    orderDetailsStreamAbortRef.current = null;
+    if (orderDetailsStreamReconnectTimerRef.current !== null) {
+      window.clearTimeout(orderDetailsStreamReconnectTimerRef.current);
+      orderDetailsStreamReconnectTimerRef.current = null;
+    }
+    orderDetailsStreamRetryAttemptRef.current = 0;
+    setOrderDetailsOpen(false);
+    setOrderDetailsError('');
+    setOrderDetailsLoading(false);
+    setOrderDetailsRefreshing(false);
+    setOrderDetailsLastUpdatedAt(null);
+    setOrderDetailsLiveConnected(false);
+    setOrderDetails(null);
+  }
+
+  async function loadNotifications() {
+    if (!token) return;
+    const data = await api<{ unreadCount: number; notifications: UserNotification[] }>('/api/notifications?limit=30');
+    setNotifications(data.notifications || []);
+    setNotificationsUnreadCount(Number(data.unreadCount || 0));
+  }
+
+  async function markNotificationRead(notificationId: number) {
+    await api(`/api/notifications/${notificationId}/read`, { method: 'POST' });
+    await loadNotifications();
+  }
+
+  async function markAllNotificationsRead() {
+    await api('/api/notifications/read-all', { method: 'POST' });
+    await loadNotifications();
   }
 
   async function loadDeliveryQuote(address: string, location: { lat: number; lng: number } | null) {
@@ -1447,9 +1701,22 @@ export default function App() {
   async function sendCourierHeartbeat(busy?: boolean) {
     if (user?.role !== 'courier') return;
     try {
+      let lat: number | null = null;
+      let lng: number | null = null;
+      if (typeof navigator !== 'undefined' && navigator.geolocation) {
+        try {
+          const pos = await new Promise<GeolocationPosition>((resolve, reject) =>
+            navigator.geolocation.getCurrentPosition(resolve, reject, { enableHighAccuracy: false, timeout: 2500, maximumAge: 60000 })
+          );
+          lat = pos.coords.latitude;
+          lng = pos.coords.longitude;
+        } catch {
+          // ignore: heartbeat should still work without GPS
+        }
+      }
       const data = await api<{ status: string; isOnline: boolean; lastSeenAt: string | null }>('/api/couriers/me/heartbeat', {
         method: 'POST',
-        body: JSON.stringify({ busy: Boolean(busy) })
+        body: JSON.stringify({ busy: Boolean(busy), lat, lng })
       });
       setCourierProfile((prev) =>
         prev
@@ -1716,6 +1983,8 @@ export default function App() {
       setUser(null);
       setOrders([]);
       setCart({ items: [], total: 0 });
+      setNotifications([]);
+      setNotificationsUnreadCount(0);
       setOpenCourierOrders([]);
       setMyStore(null);
       setMyStoreProducts([]);
@@ -1732,7 +2001,7 @@ export default function App() {
     sessionExpiredHandledRef.current = false;
 
     loadMe()
-      .then(() => Promise.all([loadCart(), loadOrders(), loadPickTasksForPicker()]))
+      .then(() => Promise.all([loadCart(), loadOrders(), loadPickTasksForPicker(), loadNotifications()]))
       .catch(() => {
         setToken(null);
         localStorage.removeItem('token');
@@ -1754,6 +2023,7 @@ export default function App() {
       if (user?.role === 'picker') {
         loadPickTasksForPicker().catch(() => undefined);
       }
+      loadNotifications().catch(() => undefined);
     }, 20000);
     return () => window.clearInterval(interval);
   }, [token, user?.role]);
@@ -1767,6 +2037,7 @@ export default function App() {
     loadAdminData().catch(() => undefined);
     loadWarehouseData().catch(() => undefined);
     loadMyStoreData().catch(() => undefined);
+    loadNotifications().catch(() => undefined);
   }, [user]);
 
   useEffect(() => {
@@ -1909,6 +2180,9 @@ export default function App() {
       setUser(data.user);
       localStorage.setItem('token', data.token);
       notify('Вход выполнен');
+      if (data.user.role === 'admin') {
+        window.location.assign('/admin/orders');
+      }
     } catch (err) {
       notify((err as Error).message);
     }
@@ -1991,9 +2265,52 @@ export default function App() {
     });
   }
 
+  function goCheckoutStep(step: 1 | 2 | 3) {
+    if (step === 2 && !checkoutCanProceedAddress) {
+      notify(checkoutAddressErrors[0] || 'Проверьте адрес доставки');
+      return;
+    }
+    if (step === 3 && (!checkoutCanProceedAddress || checkoutBlockedByZone)) {
+      notify(checkoutBlockedByZone ? (deliveryQuote?.reason || 'Доставка по адресу недоступна') : 'Проверьте адрес доставки');
+      return;
+    }
+    setCheckoutStep(step);
+  }
+
+  async function submitCheckout() {
+    if (!checkoutCanProceedAddress) {
+      notify(checkoutAddressErrors[0] || 'Проверьте адрес доставки');
+      return;
+    }
+    if (checkoutBlockedByZone) {
+      notify(deliveryQuote?.reason || 'Доставка по этому адресу недоступна');
+      return;
+    }
+
+    setCheckoutSubmitting(true);
+    try {
+      await checkout();
+      setCheckoutStep(1);
+      setCartOpen(false);
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'Не удалось оформить заказ');
+    } finally {
+      setCheckoutSubmitting(false);
+    }
+  }
+
   async function checkoutLastAddress() {
     if (!lastDelivery) return;
-    await createOrderAndRefresh(lastDelivery);
+    setCheckoutSubmitting(true);
+    try {
+      await createOrderAndRefresh(lastDelivery);
+      setCheckoutStep(1);
+      setCartOpen(false);
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'Не удалось оформить заказ');
+    } finally {
+      setCheckoutSubmitting(false);
+    }
   }
 
   async function createOrderAndRefresh(payload: SavedDelivery) {
@@ -2023,7 +2340,9 @@ export default function App() {
         deliveryAddress: fullAddress,
         deliveryLat: payload.location?.lat ?? null,
         deliveryLng: payload.location?.lng ?? null,
-        paymentMethod: checkoutPaymentMethod
+        paymentMethod: checkoutPaymentMethod,
+        substitutionPreference: checkoutSubstitutionPreference,
+        substitutionNote: checkoutSubstitutionNote.trim() || null
       })
     });
     await Promise.all([loadCart(), loadOrders(), loadCourierOrders(), loadAdminData()]);
@@ -2051,6 +2370,24 @@ export default function App() {
     return `${locality}, ${street}, дом ${house}`;
   }, [deliveryLocality, deliveryAddress, deliveryHouseNumber]);
 
+  const checkoutAddressErrors = useMemo(() => {
+    const errors: string[] = [];
+    const locality = deliveryLocality.trim();
+    const street = normalizeStreetInput(deliveryAddress, locality);
+    const house = normalizeHouseNumber(deliveryHouseNumber);
+
+    if (!hasLocalityName(locality)) errors.push('Укажите город или населенный пункт');
+    if (!hasStreetName(street)) errors.push('Укажите корректное название улицы');
+    if (!isValidHouseNumber(house)) errors.push('Укажите номер дома (например, 44 или 12/1)');
+
+    return errors;
+  }, [deliveryLocality, deliveryAddress, deliveryHouseNumber]);
+
+  const checkoutDeliveryFee = deliveryQuote?.deliveryFee ?? 0;
+  const checkoutEstimatedTotal = Number((cart.total + checkoutDeliveryFee).toFixed(2));
+  const checkoutCanProceedAddress = checkoutAddressErrors.length === 0;
+  const checkoutBlockedByZone = deliveryQuote?.serviceable === false;
+
   useEffect(() => {
     if (!token) return;
     const draft: SavedDelivery = {
@@ -2077,6 +2414,139 @@ export default function App() {
     }, 350);
     return () => window.clearTimeout(t);
   }, [token, quickAddress, deliveryLocation]);
+
+  useEffect(() => {
+    if (!cartOpen || cart.items.length === 0) {
+      setCheckoutStep(1);
+    }
+  }, [cartOpen, cart.items.length]);
+
+  useEffect(() => {
+    if (!orderDetailsOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        closeOrderDetails();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [orderDetailsOpen]);
+
+  useEffect(() => {
+    if (!orderDetailsOpen || !orderDetailsLastUpdatedAt) return;
+    const tickId = window.setInterval(() => {
+      setOrderDetailsClockMs(Date.now());
+    }, 1000);
+    return () => window.clearInterval(tickId);
+  }, [orderDetailsOpen, orderDetailsLastUpdatedAt]);
+
+  useEffect(() => {
+    if (!orderDetailsOpen || !orderDetails || !token) return;
+    if (!shouldAutoRefreshOrderDetails(orderDetails.order.status)) return;
+    let disposed = false;
+
+    const clearReconnectTimer = () => {
+      if (orderDetailsStreamReconnectTimerRef.current !== null) {
+        window.clearTimeout(orderDetailsStreamReconnectTimerRef.current);
+        orderDetailsStreamReconnectTimerRef.current = null;
+      }
+    };
+
+    const scheduleReconnect = () => {
+      if (disposed) return;
+      const attempt = orderDetailsStreamRetryAttemptRef.current + 1;
+      orderDetailsStreamRetryAttemptRef.current = attempt;
+      const baseDelay = Math.min(30_000, 1_000 * 2 ** Math.min(attempt - 1, 5));
+      const jitter = Math.floor(Math.random() * 350);
+      clearReconnectTimer();
+      orderDetailsStreamReconnectTimerRef.current = window.setTimeout(() => {
+        void connect();
+      }, baseDelay + jitter);
+    };
+
+    const connect = async () => {
+      if (disposed) return;
+      const streamAbort = new AbortController();
+      orderDetailsStreamAbortRef.current?.abort();
+      orderDetailsStreamAbortRef.current = streamAbort;
+      try {
+        const response = await fetch(`${API_BASE}/api/orders/${orderDetails.order.id}/stream`, {
+          method: 'GET',
+          headers: {
+            Accept: 'text/event-stream',
+            Authorization: `Bearer ${token}`
+          },
+          signal: streamAbort.signal
+        });
+        if (!response.ok || !response.body) throw new Error('Live stream unavailable');
+
+        orderDetailsStreamRetryAttemptRef.current = 0;
+        setOrderDetailsLiveConnected(true);
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (!disposed) {
+          const chunk = await reader.read();
+          if (chunk.done) break;
+          buffer += decoder.decode(chunk.value, { stream: true });
+
+          let separatorMatch = buffer.match(/\r?\n\r?\n/);
+          while (separatorMatch && separatorMatch.index !== undefined) {
+            const separatorStart = separatorMatch.index;
+            const separatorLength = separatorMatch[0].length;
+            const rawBlock = buffer.slice(0, separatorStart);
+            buffer = buffer.slice(separatorStart + separatorLength);
+            const parsed = parseSseEventBlock(rawBlock);
+            if (parsed?.event === 'order_details') {
+              try {
+                const payload = JSON.parse(parsed.data) as OrderDetailsState;
+                setOrderDetails(payload);
+                setOrderDetailsLastUpdatedAt(Date.now());
+              } catch {
+                // ignore malformed event payload
+              }
+            }
+            separatorMatch = buffer.match(/\r?\n\r?\n/);
+          }
+        }
+
+        if (!disposed && !streamAbort.signal.aborted) {
+          setOrderDetailsLiveConnected(false);
+          scheduleReconnect();
+        }
+      } catch {
+        if (!disposed && !streamAbort.signal.aborted) {
+          setOrderDetailsLiveConnected(false);
+          scheduleReconnect();
+        }
+      }
+    };
+
+    setOrderDetailsLiveConnected(false);
+    clearReconnectTimer();
+    orderDetailsStreamRetryAttemptRef.current = 0;
+    void connect();
+
+    return () => {
+      disposed = true;
+      clearReconnectTimer();
+      orderDetailsStreamRetryAttemptRef.current = 0;
+      orderDetailsStreamAbortRef.current?.abort();
+      orderDetailsStreamAbortRef.current = null;
+      setOrderDetailsLiveConnected(false);
+    };
+  }, [orderDetailsOpen, orderDetails?.order.id, orderDetails?.order.status, token]);
+
+  useEffect(() => {
+    if (!orderDetailsOpen || !orderDetails) return;
+    if (!shouldAutoRefreshOrderDetails(orderDetails.order.status)) return;
+    if (orderDetailsLiveConnected) return;
+    const intervalId = window.setInterval(() => {
+      void refreshOrderDetails(orderDetails.order.id, { silent: true });
+    }, 15000);
+    return () => window.clearInterval(intervalId);
+  }, [orderDetailsOpen, orderDetails?.order.id, orderDetails?.order.status, orderDetailsLiveConnected]);
 
   async function updateProfile(e: FormEvent) {
     e.preventDefault();
@@ -2834,7 +3304,6 @@ export default function App() {
         category: combinedCategory,
         imageUrl: productForm.imageUrl,
         inStock: productForm.inStock,
-        stockQuantity: Number(productForm.stockQuantity),
         warehouseId: Number(productForm.warehouseId)
       };
       if (!payload.warehouseId || !Number.isFinite(payload.warehouseId)) {
@@ -2971,12 +3440,7 @@ export default function App() {
   async function setProductAvailability(product: AdminProduct, inStock: boolean) {
     try {
       if (inStock && Number(product.stockQuantity || 0) <= 0) {
-        await api(`/api/admin/products/${product.id}`, {
-          method: 'PUT',
-          body: JSON.stringify({ stockQuantity: 1, inStock: true })
-        });
-        await Promise.all([loadAdminData(), loadProducts()]);
-        notify('Товар возвращен в наличие (остаток: 1 шт.)');
+        notify('Сначала оформите приёмку товара на складе');
         return;
       }
       await api(`/api/admin/products/${product.id}`, {
@@ -3004,6 +3468,7 @@ export default function App() {
     try {
       await api(path, {
         method: 'POST',
+        headers: { 'x-idempotency-key': newIdempotencyKey(`stock-${stockActionForm.movementType}`) },
         body: JSON.stringify({
           warehouseId,
           productId,
@@ -3140,6 +3605,7 @@ export default function App() {
     try {
       await api(getStockMovementPath(movementType), {
         method: 'POST',
+        headers: { 'x-idempotency-key': newIdempotencyKey(`stock-${movementType}`) },
         body: JSON.stringify({
           warehouseId: item.warehouseId,
           productId: item.productId,
@@ -3208,6 +3674,7 @@ export default function App() {
       selectedWarehouseStockItems.map((item) =>
         api(path, {
           method: 'POST',
+          headers: { 'x-idempotency-key': newIdempotencyKey(`bulk-${bulkStockForm.movementType}-${item.warehouseId}-${item.productId}`) },
           body: JSON.stringify({
             warehouseId: item.warehouseId,
             productId: item.productId,
@@ -3414,9 +3881,14 @@ export default function App() {
   return (
     <>
       <header className={`topbar${!loggedIn ? ' topbar-guest' : ''}`}>
-        <h1>Universal Market Delivery</h1>
+        <div className="topbar-brand">
+          <h1>Universal Market Delivery</h1>
+          <p>Быстрая доставка продуктов рядом с вами</p>
+        </div>
         <div className="topbar-actions">
-          {loggedIn && user?.role !== 'picker' ? <button type="button" onClick={goToCatalog}>Товары</button> : null}
+          {loggedIn && user?.role !== 'picker' ? (
+            <button type="button" className={catalogOpen ? 'nav-btn active' : 'nav-btn'} onClick={goToCatalog}>Товары</button>
+          ) : null}
           {loggedIn && user?.role === 'customer' ? <button type="button" onClick={goToStore}>Онлайн магазин</button> : null}
           {loggedIn && user?.role !== 'courier' && user?.role !== 'picker' ? (
             <div className="topbar-filters">
@@ -3443,23 +3915,47 @@ export default function App() {
             </div>
           ) : null}
             {loggedIn ? (
-              <button type="button" onClick={goToProfile} title="Редактировать профиль">☰ Кабинет</button>
+              <button type="button" className={profileOpen ? 'nav-btn active' : 'nav-btn'} onClick={goToProfile} title="Редактировать профиль">☰ Кабинет</button>
             ) : null}
           {loggedIn && cart.items.length > 0 ? (
-            <button type="button" onClick={goToCart}>☰ Корзина ({cartItemsCount})</button>
+            <button type="button" className={cartOpen ? 'nav-btn active' : 'nav-btn'} onClick={goToCart}>☰ Корзина ({cartItemsCount})</button>
           ) : null}
-          {loggedIn && cart.items.length > 0 ? <button type="button" onClick={goToMap}>Карта</button> : null}
+          {loggedIn && cart.items.length > 0 ? <button type="button" className={deliveryMapOpen ? 'nav-btn active' : 'nav-btn'} onClick={goToMap}>Карта</button> : null}
             {!loggedIn ? (
               <>
                 <button type="button" onClick={() => goToAuth('login')}>Войти</button>
                 <button type="button" onClick={() => goToAuth('register')}>Регистрация</button>
               </>
             ) : null}
-            <span>{user ? `${user.fullName} (${ROLE_LABELS[user.role]})` : 'Гость'}</span>
+            <span className="topbar-userpill">{user ? `${user.fullName} (${ROLE_LABELS[user.role]})` : 'Гость'}</span>
           </div>
         </header>
 
       <main className="layout">
+        {loggedIn ? (
+          <section className="panel">
+            <div className="inline-actions" style={{ justifyContent: 'space-between' }}>
+              <h2 style={{ margin: 0 }}>Уведомления ({notificationsUnreadCount})</h2>
+              <button type="button" onClick={markAllNotificationsRead} disabled={!notifications.length || notificationsUnreadCount === 0}>
+                Прочитать все
+              </button>
+            </div>
+            {notifications.length === 0 ? <div className="muted">Новых уведомлений пока нет.</div> : null}
+            {notifications.slice(0, 8).map((n) => (
+              <div className="row" key={`notif-${n.id}`}>
+                <strong>{n.title}</strong>
+                <div className="muted">{n.body || 'Без деталей'}</div>
+                <div className="muted">{new Date(n.createdAt).toLocaleString()}</div>
+                {!n.isRead ? (
+                  <button type="button" onClick={() => markNotificationRead(n.id)}>
+                    Прочитано
+                  </button>
+                ) : null}
+              </div>
+            ))}
+          </section>
+        ) : null}
+
         {!loggedIn && (
           <section className="panel" ref={authSectionRef}>
             <h2>Вход / Регистрация</h2>
@@ -3505,20 +4001,49 @@ export default function App() {
         {!loggedIn ? (
           <section className="panel" ref={catalogSectionRef}>
             <h2>Каталог</h2>
-            <div className="cards">
-              {filteredProducts.map((p) => (
-                <article className="card" key={p.id}>
-                  <img src={p.imageUrl} alt={p.name} />
-                  <div className="card-content">
-                    <h3>{p.name}</h3>
-                    <p className="muted card-desc">{p.description}</p>
-                    <div className="price">${p.price.toFixed(2)}</div>
-                    <div className="muted">Ед. изм.: {p.unit || 'шт'}</div>
-                    <button onClick={() => addToCart(p.id)}>В корзину</button>
-                  </div>
-                </article>
-              ))}
-            </div>
+            {productsLoading ? (
+              <div className="cards cards-skeleton">
+                {Array.from({ length: 6 }).map((_, index) => (
+                  <article className="card card-skeleton" key={`guest-skeleton-${index}`}>
+                    <div className="skeleton skeleton-image" />
+                    <div className="card-content">
+                      <div className="skeleton skeleton-title" />
+                      <div className="skeleton skeleton-line" />
+                      <div className="skeleton skeleton-line short" />
+                    </div>
+                  </article>
+                ))}
+              </div>
+            ) : null}
+            {!productsLoading && productsError ? (
+              <div className="empty-state">
+                <h3>Не удалось загрузить товары</h3>
+                <p className="muted">{productsError}</p>
+                <button type="button" onClick={retryLoadProducts}>Повторить</button>
+              </div>
+            ) : null}
+            {!productsLoading && !productsError && filteredProducts.length === 0 ? (
+              <div className="empty-state">
+                <h3>Товары не найдены</h3>
+                <p className="muted">Попробуйте изменить фильтр категории или зайти позже.</p>
+              </div>
+            ) : null}
+            {!productsLoading && !productsError && filteredProducts.length > 0 ? (
+              <div className="cards">
+                {filteredProducts.map((p) => (
+                  <article className="card" key={p.id}>
+                    <img src={p.imageUrl} alt={p.name} />
+                    <div className="card-content">
+                      <h3>{p.name}</h3>
+                      <p className="muted card-desc">{p.description}</p>
+                      <div className="price">${p.price.toFixed(2)}</div>
+                      <div className="muted">Ед. изм.: {p.unit || 'шт'}</div>
+                      <button onClick={() => addToCart(p.id)}>В корзину</button>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            ) : null}
           </section>
         ) : (
           <section className="panel" ref={catalogSectionRef}>
@@ -3531,25 +4056,52 @@ export default function App() {
             ) : null}
             {catalogOpen ? (
               <div className="cards">
-                {filteredProducts.map((p) => (
-                  <article className="card" key={p.id}>
-                  <img src={p.imageUrl} alt={p.name} />
-                  <div className="card-content">
-                    <h3>{p.name}</h3>
-                    <p className="muted card-desc">{p.description}</p>
-                    <div className="price">${p.price.toFixed(2)}</div>
-                    <div className="muted">Ед. изм.: {p.unit || 'шт'}</div>
-                    <div className="card-actions">
-                      <button onClick={() => addToCart(p.id)}>В корзину</button>
-                      <div className="card-qty">
-                        <button type="button" onClick={() => adjustProductQty(p.id, -1)}>-</button>
-                        <span>{cartQuantityByProduct.get(p.id)?.quantity || 0}</span>
-                        <button type="button" onClick={() => adjustProductQty(p.id, 1)}>+</button>
-                      </div>
-                    </div>
+                {productsLoading
+                  ? Array.from({ length: 6 }).map((_, index) => (
+                      <article className="card card-skeleton" key={`user-skeleton-${index}`}>
+                        <div className="skeleton skeleton-image" />
+                        <div className="card-content">
+                          <div className="skeleton skeleton-title" />
+                          <div className="skeleton skeleton-line" />
+                          <div className="skeleton skeleton-line short" />
+                        </div>
+                      </article>
+                    ))
+                  : null}
+                {!productsLoading && productsError ? (
+                  <div className="empty-state">
+                    <h3>Не удалось загрузить товары</h3>
+                    <p className="muted">{productsError}</p>
+                    <button type="button" onClick={retryLoadProducts}>Повторить</button>
                   </div>
-                </article>
-                ))}
+                ) : null}
+                {!productsLoading && !productsError && filteredProducts.length === 0 ? (
+                  <div className="empty-state">
+                    <h3>По вашему фильтру ничего не найдено</h3>
+                    <p className="muted">Сбросьте категорию или подкатегорию в верхней панели.</p>
+                  </div>
+                ) : null}
+                {!productsLoading && !productsError
+                  ? filteredProducts.map((p) => (
+                      <article className="card" key={p.id}>
+                        <img src={p.imageUrl} alt={p.name} />
+                        <div className="card-content">
+                          <h3>{p.name}</h3>
+                          <p className="muted card-desc">{p.description}</p>
+                          <div className="price">${p.price.toFixed(2)}</div>
+                          <div className="muted">Ед. изм.: {p.unit || 'шт'}</div>
+                          <div className="card-actions">
+                            <button onClick={() => addToCart(p.id)}>В корзину</button>
+                            <div className="card-qty">
+                              <button type="button" onClick={() => adjustProductQty(p.id, -1)}>-</button>
+                              <span>{cartQuantityByProduct.get(p.id)?.quantity || 0}</span>
+                              <button type="button" onClick={() => adjustProductQty(p.id, 1)}>+</button>
+                            </div>
+                          </div>
+                        </div>
+                      </article>
+                    ))
+                  : null}
               </div>
             ) : null}
           </section>
@@ -3573,182 +4125,315 @@ export default function App() {
                       </div>
                     </div>
                   ))}
-                  <h3>Сумма: ${cart.total.toFixed(2)}</h3>
-                  <div className="row">
-                    <strong>Быстрое оформление</strong>
-                    <div className="muted">
-                      {quickAddress
-                        ? `Адрес: ${quickAddress}`
-                        : lastDelivery
-                          ? `Последний адрес: ${lastDelivery.locality}, ${lastDelivery.address}, дом ${lastDelivery.houseNumber}`
-                          : 'Укажите улицу и номер дома в форме ниже, затем нажмите одну кнопку.'}
-                    </div>
-                    {deliveryQuoteLoading ? <div className="muted">Считаем доставку...</div> : null}
-                    {deliveryQuote ? (
-                      <div className="muted">
-                        {deliveryQuote.serviceable === false ? (
-                          <>Недоступно: {deliveryQuote.reason || 'вне зоны доставки'}</>
-                        ) : (
-                          <>
-                            {deliveryQuote.zoneName ? `Зона: ${deliveryQuote.zoneName}. ` : ''}
-                            {deliveryQuote.warehouseName ? `Склад: ${deliveryQuote.warehouseName}. ` : ''}
-                            {deliveryQuote.warehouseDistanceKm !== null ? `Расстояние: ${deliveryQuote.warehouseDistanceKm.toFixed(2)} км. ` : ''}
-                            {deliveryQuote.routeDistanceKm !== null ? `Маршрут: ${deliveryQuote.routeDistanceKm.toFixed(2)} км. ` : ''}
-                            {deliveryQuote.etaMin !== null ? `ETA: ~${deliveryQuote.etaMin} мин. ` : ''}
-                            {deliveryQuote.deliveryFee !== null ? `Доставка: $${deliveryQuote.deliveryFee.toFixed(2)}.` : ''}
-                            {deliveryQuote.reason ? ` ${deliveryQuote.reason}` : ''}
-                          </>
-                        )}
+                  <div className="checkout-shell">
+                    <div className="checkout-main">
+                      <div className="checkout-stepper">
+                        <button type="button" className={checkoutStep === 1 ? 'active' : ''} onClick={() => goCheckoutStep(1)}>
+                          1. Адрес
+                        </button>
+                        <button type="button" className={checkoutStep === 2 ? 'active' : ''} onClick={() => goCheckoutStep(2)}>
+                          2. Оплата
+                        </button>
+                        <button type="button" className={checkoutStep === 3 ? 'active' : ''} onClick={() => goCheckoutStep(3)}>
+                          3. Подтверждение
+                        </button>
                       </div>
-                    ) : null}
-                    <div className="inline-actions" style={{ marginTop: '8px' }}>
-                      <label>
-                        Способ оплаты:
-                        <select
-                          value={checkoutPaymentMethod}
-                          onChange={(e) => setCheckoutPaymentMethod((e.target.value as 'cash' | 'wallet') || 'wallet')}
-                        >
-                          <option value="wallet">Кошелёк (онлайн)</option>
-                          <option value="cash">Наличные</option>
-                        </select>
-                      </label>
+
+                      {checkoutStep === 1 ? (
+                        <div className="row">
+                          <strong>Шаг 1: адрес доставки</strong>
+                          <div className="muted">
+                            {quickAddress
+                              ? `Адрес: ${quickAddress}`
+                              : lastDelivery
+                                ? `Последний адрес: ${lastDelivery.locality}, ${lastDelivery.address}, дом ${lastDelivery.houseNumber}`
+                                : 'Укажите улицу и номер дома, затем проверьте адрес на карте.'}
+                          </div>
+                          {checkoutAddressErrors.length ? (
+                            <div className="checkout-errors">
+                              {checkoutAddressErrors.map((error) => (
+                                <div key={`checkout-address-error-${error}`} className="checkout-error-item">{error}</div>
+                              ))}
+                            </div>
+                          ) : null}
+                          <div className="inline-actions" style={{ justifyContent: 'space-between', marginBottom: '8px' }}>
+                            <strong>Карта доставки</strong>
+                            {user?.role !== 'courier' ? (
+                              <button type="button" onClick={toggleMapInCart}>
+                                {deliveryMapOpen ? 'Скрыть карту' : 'Показать карту'}
+                              </button>
+                            ) : null}
+                          </div>
+                          {deliveryMapOpen ? (
+                            <div className="checkout">
+                              <DeliveryMapPicker
+                                locality={deliveryLocality}
+                                onLocalityChange={setDeliveryLocality}
+                                address={deliveryAddress}
+                                onAddressChange={setDeliveryAddress}
+                                houseNumber={deliveryHouseNumber}
+                                onHouseNumberChange={setDeliveryHouseNumber}
+                                location={deliveryLocation}
+                                onLocationChange={setDeliveryLocation}
+                              />
+                              <div className="muted">Чтобы получить точный ETA и цену доставки, выберите точку на карте.</div>
+                            </div>
+                          ) : null}
+                          <div className="inline-actions">
+                            <button type="button" onClick={() => goCheckoutStep(2)} disabled={!checkoutCanProceedAddress}>
+                              Продолжить к оплате
+                            </button>
+                          </div>
+                        </div>
+                      ) : null}
+
+                      {checkoutStep === 2 ? (
+                        <div className="row">
+                          <strong>Шаг 2: способ оплаты и замены</strong>
+                          <label>
+                            Способ оплаты:
+                            <select
+                              value={checkoutPaymentMethod}
+                              onChange={(e) => setCheckoutPaymentMethod((e.target.value as 'cash' | 'wallet') || 'wallet')}
+                            >
+                              <option value="wallet">Кошелёк (онлайн)</option>
+                              <option value="cash">Наличные</option>
+                            </select>
+                          </label>
+                          <label>
+                            Если товара нет:
+                            <select
+                              value={checkoutSubstitutionPreference}
+                              onChange={(e) =>
+                                setCheckoutSubstitutionPreference((e.target.value as 'allow_similar' | 'no_substitution' | 'contact_me') || 'contact_me')
+                              }
+                            >
+                              <option value="contact_me">Свяжитесь со мной</option>
+                              <option value="allow_similar">Заменить похожим</option>
+                              <option value="no_substitution">Не заменять</option>
+                            </select>
+                          </label>
+                          <input
+                            placeholder="Комментарий по заменам (опц.)"
+                            value={checkoutSubstitutionNote}
+                            onChange={(e) => setCheckoutSubstitutionNote(e.target.value)}
+                          />
+                          <div className="inline-actions">
+                            <button type="button" onClick={() => goCheckoutStep(1)}>Назад</button>
+                            <button type="button" onClick={() => goCheckoutStep(3)}>Продолжить</button>
+                          </div>
+                        </div>
+                      ) : null}
+
+                      {checkoutStep === 3 ? (
+                        <div className="row">
+                          <strong>Шаг 3: подтверждение заказа</strong>
+                          <div className="muted">Адрес: {quickAddress || '—'}</div>
+                          <div className="muted">Оплата: {checkoutPaymentMethod === 'wallet' ? 'Кошелёк (онлайн)' : 'Наличные'}</div>
+                          <div className="muted">
+                            Замены: {checkoutSubstitutionPreference === 'allow_similar'
+                              ? 'Заменить похожим'
+                              : checkoutSubstitutionPreference === 'no_substitution'
+                                ? 'Не заменять'
+                                : 'Связаться со мной'}
+                          </div>
+                          {checkoutSubstitutionNote.trim() ? (
+                            <div className="muted">Комментарий: {checkoutSubstitutionNote.trim()}</div>
+                          ) : null}
+                          {deliveryQuoteLoading ? <div className="muted">Считаем доставку...</div> : null}
+                          {deliveryQuote ? (
+                            <div className="muted">
+                              {deliveryQuote.serviceable === false ? (
+                                <>Недоступно: {deliveryQuote.reason || 'вне зоны доставки'}</>
+                              ) : (
+                                <>
+                                  {deliveryQuote.zoneName ? `Зона: ${deliveryQuote.zoneName}. ` : ''}
+                                  {deliveryQuote.warehouseName ? `Склад: ${deliveryQuote.warehouseName}. ` : ''}
+                                  {deliveryQuote.warehouseDistanceKm !== null ? `Расстояние: ${deliveryQuote.warehouseDistanceKm.toFixed(2)} км. ` : ''}
+                                  {deliveryQuote.routeDistanceKm !== null ? `Маршрут: ${deliveryQuote.routeDistanceKm.toFixed(2)} км. ` : ''}
+                                  {deliveryQuote.etaMin !== null ? `ETA: ~${deliveryQuote.etaMin} мин. ` : ''}
+                                  {deliveryQuote.deliveryFee !== null ? `Доставка: $${deliveryQuote.deliveryFee.toFixed(2)}.` : ''}
+                                  {deliveryQuote.reason ? ` ${deliveryQuote.reason}` : ''}
+                                </>
+                              )}
+                            </div>
+                          ) : (
+                            <div className="muted">Для точного ETA и цены доставки выберите точку на карте.</div>
+                          )}
+                          <div className="inline-actions">
+                            <button type="button" onClick={() => goCheckoutStep(2)} disabled={checkoutSubmitting}>Назад</button>
+                            <button type="button" onClick={submitCheckout} disabled={checkoutSubmitting || checkoutBlockedByZone || !checkoutCanProceedAddress}>
+                              {checkoutSubmitting ? 'Оформляем...' : 'Оформить заказ'}
+                            </button>
+                            <button type="button" onClick={checkoutLastAddress} disabled={!lastDelivery || checkoutSubmitting}>
+                              Повторить прошлый адрес
+                            </button>
+                          </div>
+                        </div>
+                      ) : null}
                     </div>
-                    <div className="inline-actions" style={{ marginTop: '8px' }}>
-                      <button onClick={checkout} disabled={!quickAddress || deliveryQuoteLoading || deliveryQuote?.serviceable === false}>
-                        Оформить за 1 клик
-                      </button>
-                      <button onClick={checkoutLastAddress} disabled={!lastDelivery}>
-                        Повторить прошлый адрес
-                      </button>
-                    </div>
+
+                    <aside className="checkout-summary">
+                      <h3>Сводка</h3>
+                      <div className="muted">Позиций: {cart.items.length}</div>
+                      <div className="muted">Товары: ${cart.total.toFixed(2)}</div>
+                      <div className="muted">Доставка: {deliveryQuote?.deliveryFee !== null && deliveryQuote?.deliveryFee !== undefined ? `$${checkoutDeliveryFee.toFixed(2)}` : 'уточняется'}</div>
+                      <div className="checkout-total">Итого: ${checkoutEstimatedTotal.toFixed(2)}</div>
+                      {checkoutBlockedByZone ? <div className="checkout-error-item">{deliveryQuote?.reason || 'Адрес вне зоны доставки'}</div> : null}
+                    </aside>
                   </div>
-                  <div className="inline-actions" style={{ justifyContent: 'space-between', marginBottom: '8px' }}>
-                    <strong>Карта доставки</strong>
-                    {user?.role !== 'courier' ? (
-                      <button type="button" onClick={toggleMapInCart}>
-                        {deliveryMapOpen ? 'Скрыть карту' : 'Показать карту'}
-                      </button>
-                    ) : null}
-                  </div>
-                  {deliveryMapOpen ? (
-                    <div className="checkout">
-                      <DeliveryMapPicker
-                        locality={deliveryLocality}
-                        onLocalityChange={setDeliveryLocality}
-                        address={deliveryAddress}
-                        onAddressChange={setDeliveryAddress}
-                        houseNumber={deliveryHouseNumber}
-                        onHouseNumberChange={setDeliveryHouseNumber}
-                        location={deliveryLocation}
-                        onLocationChange={setDeliveryLocation}
-                      />
-                      <div className="muted">Если адрес и точка уже выбраны, используйте кнопку "Оформить за 1 клик" выше.</div>
-                    </div>
-                  ) : null}
                 </>
               ) : null}
           </section>
         )}
 
-        {loggedIn && user?.role === 'customer' && orders.length > 0 ? (
-            <section className="panel">
-              <h2>Мои заказы</h2>
-              {orders.map((order) => (
-                <div className="row" key={order.id}>
-                  <div><strong>Заказ #{order.id}</strong> <span className={`badge ${order.status}`}>{STATUS_LABELS[order.status]}</span></div>
-                  <div>Сумма: ${order.total.toFixed(2)} | Адрес: {order.deliveryAddress}</div>
+        {loggedIn && user?.role === 'customer' ? (
+          <section className="panel">
+            <h2>Мои заказы</h2>
+            <div className="orders-toolbar">
+              <select value={customerOrderFilter} onChange={(e) => setCustomerOrderFilter((e.target.value as 'all' | Status) || 'all')}>
+                <option value="all">Все статусы</option>
+                {Object.entries(STATUS_LABELS).map(([value, label]) => (
+                  <option key={`order-filter-${value}`} value={value}>{label}</option>
+                ))}
+              </select>
+              <input
+                placeholder="Поиск по № заказа, адресу или статусу"
+                value={customerOrderQuery}
+                onChange={(e) => setCustomerOrderQuery(e.target.value)}
+              />
+            </div>
+
+            {orders.length === 0 ? (
+              <div className="empty-state">
+                <h3>Заказов пока нет</h3>
+                <p className="muted">Добавьте товары в корзину и оформите первый заказ.</p>
+              </div>
+            ) : null}
+
+            {orders.length > 0 && filteredCustomerOrders.length === 0 ? (
+              <div className="empty-state">
+                <h3>Ничего не найдено</h3>
+                <p className="muted">Попробуйте изменить статус или поисковый запрос.</p>
+              </div>
+            ) : null}
+
+            {filteredCustomerOrders.map((order) => (
+              <div className="row order-card" key={order.id}>
+                <div><strong>Заказ #{order.id}</strong> <span className={`badge ${order.status}`}>{STATUS_LABELS[order.status]}</span></div>
+                <div>Сумма: ${order.total.toFixed(2)} | Адрес: {order.deliveryAddress}</div>
+                <div className="order-timeline">
+                  {CUSTOMER_ORDER_FLOW.map((step) => {
+                    const stepState = getOrderFlowState(order.status, step);
+                    return (
+                      <div key={`order-${order.id}-step-${step}`} className={`order-timeline-step ${stepState}`}>
+                        {STATUS_LABELS[step]}
+                      </div>
+                    );
+                  })}
+                </div>
+                <div className="muted">
+                  Склад сборки: {order.fulfillmentWarehouse || order.fulfillmentWarehouseCode || 'подбирается'}
+                </div>
+                <div className="muted">
+                  Сборщик: {order.pickerName || (order.pickerId ? `#${order.pickerId}` : '—')}; Статус сборки: {order.pickTaskStatus ? PICK_TASK_STATUS_LABELS[order.pickTaskStatus] || order.pickTaskStatus : '—'}
+                </div>
+                <div className="muted">
+                  Замены: {order.substitutionPreference === 'allow_similar' ? 'Разрешены похожие' : order.substitutionPreference === 'no_substitution' ? 'Не заменять' : 'Связаться с покупателем'}
+                  {order.substitutionNote ? ` | Комментарий: ${order.substitutionNote}` : ''}
+                </div>
+                {order.fulfillmentWarehouse || order.deliveryEtaMin !== null || order.deliveryFee !== null ? (
                   <div className="muted">
-                    Склад сборки: {order.fulfillmentWarehouse || order.fulfillmentWarehouseCode || 'подбирается'}
+                    {order.deliveryZone ? `Зона: ${order.deliveryZone}. ` : ''}
+                    {order.fulfillmentWarehouse ? `Склад: ${order.fulfillmentWarehouse}. ` : ''}
+                    {order.warehouseDistanceKm !== null ? `Расстояние: ${order.warehouseDistanceKm.toFixed(2)} км. ` : ''}
+                    {order.routeDistanceKm !== null ? `Маршрут: ${order.routeDistanceKm.toFixed(2)} км. ` : ''}
+                    {order.deliveryEtaMin !== null ? `ETA: ~${order.deliveryEtaMin} мин. ` : ''}
+                    {order.deliveryFee !== null ? `Доставка: $${order.deliveryFee.toFixed(2)}.` : ''}
                   </div>
+                ) : null}
+                {Array.isArray(order.items) && order.items.length > 0 ? (
                   <div className="muted">
-                    Сборщик: {order.pickerName || (order.pickerId ? `#${order.pickerId}` : '—')}; Статус сборки: {order.pickTaskStatus ? PICK_TASK_STATUS_LABELS[order.pickTaskStatus] || order.pickTaskStatus : '—'}
+                    Товары: {order.items.map((item) => `${item.name} x${item.quantity} ($${item.unitPrice.toFixed(2)})`).join(' | ')}
                   </div>
-                  {order.fulfillmentWarehouse || order.deliveryEtaMin !== null || order.deliveryFee !== null ? (
-                    <div className="muted">
-                      {order.deliveryZone ? `Зона: ${order.deliveryZone}. ` : ''}
-                      {order.fulfillmentWarehouse ? `Склад: ${order.fulfillmentWarehouse}. ` : ''}
-                      {order.warehouseDistanceKm !== null ? `Расстояние: ${order.warehouseDistanceKm.toFixed(2)} км. ` : ''}
-                      {order.routeDistanceKm !== null ? `Маршрут: ${order.routeDistanceKm.toFixed(2)} км. ` : ''}
-                      {order.deliveryEtaMin !== null ? `ETA: ~${order.deliveryEtaMin} мин. ` : ''}
-                      {order.deliveryFee !== null ? `Доставка: $${order.deliveryFee.toFixed(2)}.` : ''}
-                    </div>
-                  ) : null}
-                  {Array.isArray(order.items) && order.items.length > 0 ? (
-                    <div className="muted">
-                      Товары: {order.items.map((item) => `${item.name} x${item.quantity} ($${item.unitPrice.toFixed(2)})`).join(' | ')}
-                    </div>
-                  ) : null}
-                  <div className="inline-actions">
+                ) : null}
+                <div className="order-actions-grid">
+                  <button
+                    type="button"
+                    onClick={() => openOrderDetails(order.id).catch((e: Error) => notify(e.message))}
+                  >
+                    Детали
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => repeatOrderForEditing(order.id)}
+                    disabled={repeatingOrderId === order.id}
+                  >
+                    {repeatingOrderId === order.id ? 'Переносим...' : 'Повторить'}
+                  </button>
+                  {order.status === 'assembling' || order.status === 'courier_assigned' ? (
                     <button
                       type="button"
-                      onClick={() => repeatOrderForEditing(order.id)}
-                      disabled={repeatingOrderId === order.id}
+                      onClick={() => editMyOrder(order)}
+                      disabled={editingOrderId === order.id}
                     >
-                      {repeatingOrderId === order.id ? 'Переносим...' : 'Повторить и редактировать'}
+                      {editingOrderId === order.id ? 'Сохраняем...' : 'Изменить'}
                     </button>
-                    {order.status === 'assembling' || order.status === 'courier_assigned' ? (
-                      <button
-                        type="button"
-                        onClick={() => editMyOrder(order)}
-                        disabled={editingOrderId === order.id}
-                      >
-                        {editingOrderId === order.id ? 'Сохраняем...' : 'Изменить'}
-                      </button>
-                    ) : (
-                      <button
-                        type="button"
-                        onClick={() => notify('Изменение доступно только для заказов в статусе "Собирается" или "Назначен курьер"')}
-                      >
-                        Изменить
-                      </button>
-                    )}
-                    {order.status === 'assembling' || order.status === 'courier_assigned' ? (
-                      <button
-                        type="button"
-                        onClick={() => cancelMyOrder(order.id)}
-                        disabled={cancellingOrderId === order.id}
-                      >
-                        {cancellingOrderId === order.id ? 'Отменяем...' : 'Отменить'}
-                      </button>
-                    ) : (
-                      <button
-                        type="button"
-                        onClick={() => notify('Отмена доступна только для заказов в статусе "Собирается" или "Назначен курьер"')}
-                      >
-                        Отменить
-                      </button>
-                    )}
-                    {order.status === 'cancelled' || order.status === 'paid' ? (
-                      <button
-                        type="button"
-                        className="danger"
-                        onClick={() => deleteMyOrder(order.id)}
-                        disabled={deletingOrderId === order.id}
-                      >
-                        {deletingOrderId === order.id ? 'Удаляем...' : 'Удалить'}
-                      </button>
-                    ) : (
-                      <button
-                        type="button"
-                        className="danger"
-                        onClick={() => notify('Удаление доступно только для отмененных или завершенных заказов')}
-                      >
-                        Удалить
-                      </button>
-                    )}
-                    {order.status === 'received' && order.paymentMethod === 'wallet' ? (
-                      <button
-                        type="button"
-                        onClick={() => payMyOrder(order.id)}
-                        disabled={payingOrderId === order.id}
-                      >
-                        {payingOrderId === order.id ? 'Оплата...' : 'Оплатить'}
-                      </button>
-                    ) : null}
-                  </div>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => notify('Изменение доступно только для заказов в статусе "Собирается" или "Назначен курьер"')}
+                    >
+                      Изменить
+                    </button>
+                  )}
+                  {order.status === 'assembling' || order.status === 'courier_assigned' ? (
+                    <button
+                      type="button"
+                      onClick={() => cancelMyOrder(order.id)}
+                      disabled={cancellingOrderId === order.id}
+                    >
+                      {cancellingOrderId === order.id ? 'Отменяем...' : 'Отменить'}
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => notify('Отмена доступна только для заказов в статусе "Собирается" или "Назначен курьер"')}
+                    >
+                      Отменить
+                    </button>
+                  )}
+                  {order.status === 'cancelled' || order.status === 'paid' ? (
+                    <button
+                      type="button"
+                      className="danger"
+                      onClick={() => deleteMyOrder(order.id)}
+                      disabled={deletingOrderId === order.id}
+                    >
+                      {deletingOrderId === order.id ? 'Удаляем...' : 'Удалить'}
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      className="danger"
+                      onClick={() => notify('Удаление доступно только для отмененных или завершенных заказов')}
+                    >
+                      Удалить
+                    </button>
+                  )}
+                  {order.status === 'received' && order.paymentMethod === 'wallet' ? (
+                    <button
+                      type="button"
+                      onClick={() => payMyOrder(order.id)}
+                      disabled={payingOrderId === order.id}
+                    >
+                      {payingOrderId === order.id ? 'Оплата...' : 'Оплатить'}
+                    </button>
+                  ) : null}
                 </div>
-              ))}
-            </section>
+              </div>
+            ))}
+          </section>
         ) : null}
 
         {loggedIn && user?.role === 'customer' && storeOpen ? (
@@ -4251,28 +4936,32 @@ export default function App() {
                     <div>Координаты: {order.deliveryLat !== null && order.deliveryLng !== null ? `${order.deliveryLat.toFixed(6)}, ${order.deliveryLng.toFixed(6)}` : 'не указаны'}</div>
                     <div>Покупатель: {order.customerName || '—'} | Телефон: {order.customerPhone || '—'}</div>
                     <div className="inline-actions">
-                      <button
-                        type="button"
-                        onClick={() => toggleAdminOrderEditor(order)}
-                        disabled={adminEditingOrderId === order.id}
-                      >
-                        {adminOrderEdit?.orderId === order.id ? 'Свернуть' : 'Редактировать'}
-                      </button>
-                      <button
-                        type="button"
-                        className="danger"
-                        onClick={() => adminDeleteOrder(order.id)}
-                        disabled={adminDeletingOrderId === order.id}
-                      >
-                        {adminDeletingOrderId === order.id ? 'Удаляем...' : 'Удалить'}
-                      </button>
+                      {hasAdminPermission('manage_orders') ? (
+                        <button
+                          type="button"
+                          onClick={() => toggleAdminOrderEditor(order)}
+                          disabled={adminEditingOrderId === order.id}
+                        >
+                          {adminOrderEdit?.orderId === order.id ? 'Свернуть' : 'Редактировать'}
+                        </button>
+                      ) : null}
+                      {hasAdminPermission('manage_orders') ? (
+                        <button
+                          type="button"
+                          className="danger"
+                          onClick={() => adminDeleteOrder(order.id)}
+                          disabled={adminDeletingOrderId === order.id}
+                        >
+                          {adminDeletingOrderId === order.id ? 'Удаляем...' : 'Удалить'}
+                        </button>
+                      ) : null}
                       {order.routeUrl ? (
                         <a className="button ghost" href={order.routeUrl} target="_blank" rel="noreferrer">
                           Маршрут
                         </a>
                       ) : null}
                     </div>
-                    {adminOrderEdit?.orderId === order.id ? (
+                    {hasAdminPermission('manage_orders') && adminOrderEdit?.orderId === order.id ? (
                       <div className="row">
                         <strong>Редактирование заказа #{order.id}</strong>
                         <div className="checkout">
@@ -4465,22 +5154,9 @@ export default function App() {
                   />
                   <input placeholder="Описание" value={productForm.description} onChange={(e) => setProductForm({ ...productForm, description: e.target.value })} />
                   <input placeholder="Цена" type="number" step="0.01" min="0.01" value={productForm.price} onChange={(e) => setProductForm({ ...productForm, price: e.target.value })} required />
-                  <input
-                    placeholder="Количество в наличии"
-                    type="number"
-                    step="1"
-                    min="0"
-                    value={productForm.stockQuantity}
-                    onChange={(e) => {
-                      const nextQty = Number(e.target.value);
-                      setProductForm({
-                        ...productForm,
-                        stockQuantity: e.target.value,
-                        inStock: Number.isFinite(nextQty) && nextQty <= 0 ? false : productForm.inStock
-                      });
-                    }}
-                    required
-                  />
+                  <div className="muted">
+                    Остаток изменяется только через складские операции. Новый товар создаётся с нулевым остатком.
+                  </div>
                   <select
                     value={productFormCategory}
                     onChange={(e) => {
@@ -4551,7 +5227,6 @@ export default function App() {
                     <input
                       type="checkbox"
                       checked={productForm.inStock}
-                      disabled={Number(productForm.stockQuantity || 0) <= 0}
                       onChange={(e) => setProductForm({ ...productForm, inStock: e.target.checked })}
                     />
                     В наличии
@@ -4602,6 +5277,12 @@ export default function App() {
             {adminTab === 'warehouse' && hasAdminPermission('manage_warehouse') && (
               <div>
                 <h3>Склад</h3>
+                <InventoryDocumentsPanel
+                  api={api}
+                  warehouses={warehouseOverview.warehouses}
+                  products={products}
+                  onChanged={() => { void loadWarehouseData(); }}
+                />
                 <div className="row">
                   <strong>Создать точку</strong>
                   <form onSubmit={createWarehousePoint}>
@@ -4743,14 +5424,12 @@ export default function App() {
 
                 {warehouseOverview.warehouses.length > 0 ? (
                 <div className="row">
-                  <strong>Складская операция</strong>
+                  <strong>Ручной резерв</strong>
                   <form onSubmit={submitStockMovement} ref={warehouseOperationFormRef}>
                     <select
                       value={stockActionForm.movementType}
                       onChange={(e) => setStockActionForm((prev) => ({ ...prev, movementType: e.target.value as StockMovementType }))}
                     >
-                      <option value="receive">Приемка</option>
-                      <option value="writeoff">Списание</option>
                       <option value="reserve">Резерв</option>
                     </select>
                     <select
@@ -4982,8 +5661,6 @@ export default function App() {
                       value={bulkStockForm.movementType}
                       onChange={(e) => setBulkStockForm((prev) => ({ ...prev, movementType: e.target.value as StockMovementType }))}
                     >
-                      <option value="receive">Приемка</option>
-                      <option value="writeoff">Списание</option>
                       <option value="reserve">Резерв</option>
                     </select>
                     <input
@@ -5030,20 +5707,6 @@ export default function App() {
                           Выбрать для массовой операции
                         </label>
                         <div className="inline-actions">
-                          <button
-                            type="button"
-                            disabled={quickStockSubmittingKey !== ''}
-                            onClick={() => quickStockMovement(item, 'receive', 10)}
-                          >
-                            +10 приемка
-                          </button>
-                          <button
-                            type="button"
-                            disabled={quickStockSubmittingKey !== ''}
-                            onClick={() => quickStockMovement(item, 'writeoff', 1)}
-                          >
-                            Списать 1
-                          </button>
                           <button
                             type="button"
                             disabled={quickStockSubmittingKey !== ''}
@@ -5641,6 +6304,160 @@ export default function App() {
           </section>
         )}
       </main>
+
+      {orderDetailsOpen ? (
+        <div className="order-drawer-backdrop" onClick={closeOrderDetails}>
+          <aside
+            className="order-drawer"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Детали заказа"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="order-drawer-head">
+              <h3>{orderDetails ? `Заказ #${orderDetails.order.id}` : 'Детали заказа'}</h3>
+              <div className="order-drawer-head-actions">
+                {orderDetails ? (
+                  <button
+                    type="button"
+                    onClick={() => refreshOrderDetails(orderDetails.order.id, { silent: true }).catch(() => {})}
+                    disabled={orderDetailsLoading || orderDetailsRefreshing}
+                  >
+                    {orderDetailsRefreshing ? 'Обновляем...' : 'Обновить сейчас'}
+                  </button>
+                ) : null}
+                <button type="button" className="danger" onClick={closeOrderDetails}>Закрыть</button>
+              </div>
+            </div>
+
+            {orderDetailsLoading ? (
+              <div className="order-drawer-body">
+                <div className="skeleton skeleton-title" />
+                <div className="skeleton skeleton-line" />
+                <div className="skeleton skeleton-line" />
+                <div className="skeleton skeleton-line short" />
+              </div>
+            ) : null}
+
+            {!orderDetailsLoading && orderDetailsError ? (
+              <div className="order-drawer-body">
+                <div className="checkout-error-item">{orderDetailsError}</div>
+              </div>
+            ) : null}
+
+            {!orderDetailsLoading && !orderDetailsError && orderDetails ? (
+              <div className="order-drawer-body">
+                <div className="row">
+                  <div className="order-live-meta">
+                    <span className={`order-live-pill ${orderDetailsLiveConnected ? 'connected' : 'fallback'}`}>
+                      {orderDetailsLiveConnected ? 'live' : 'polling'}
+                    </span>
+                    {orderDetailsLastUpdatedAt ? (
+                      <span className="muted">Обновлено: {formatUpdatedAgo(Math.max(0, Math.floor((orderDetailsClockMs - orderDetailsLastUpdatedAt) / 1000)))}</span>
+                    ) : (
+                      <span className="muted">Обновляем данные...</span>
+                    )}
+                  </div>
+                  {shouldAutoRefreshOrderDetails(orderDetails.order.status) ? (
+                    <div className="muted">{orderDetailsLiveConnected ? 'Push-обновления включены' : 'Автообновление каждые 15 секунд'}</div>
+                  ) : (
+                    <div className="muted">Заказ завершён, автообновление выключено</div>
+                  )}
+                  <div><strong>Статус:</strong> <span className={`badge ${orderDetails.order.status}`}>{STATUS_LABELS[orderDetails.order.status]}</span></div>
+                  <div className="muted">Адрес: {orderDetails.order.deliveryAddress}</div>
+                  <div className="muted">Сумма: ${orderDetails.order.total.toFixed(2)}</div>
+                  <div className="muted">
+                    ETA: {orderDetails.tracking?.etaLiveMin ?? orderDetails.tracking?.etaBaseMin ?? orderDetails.order.deliveryEtaMin ?? '—'} мин
+                  </div>
+                  <div className="muted">
+                    Дистанция: {orderDetails.tracking?.liveDistanceKm !== null && orderDetails.tracking?.liveDistanceKm !== undefined
+                      ? `${orderDetails.tracking.liveDistanceKm.toFixed(2)} км`
+                      : orderDetails.order.routeDistanceKm !== null
+                        ? `${orderDetails.order.routeDistanceKm.toFixed(2)} км`
+                        : '—'}
+                  </div>
+                  {orderDetails.tracking?.routeUrl || orderDetails.order.routeUrl ? (
+                    <a href={orderDetails.tracking?.routeUrl || orderDetails.order.routeUrl || '#'} target="_blank" rel="noreferrer">
+                      Открыть маршрут в картах
+                    </a>
+                  ) : null}
+                </div>
+
+                <div className="row">
+                  <strong>Состав заказа</strong>
+                  {orderDetails.items.length === 0 ? (
+                    <div className="muted">Позиции заказа недоступны.</div>
+                  ) : (
+                    <div className="order-drawer-items">
+                      {orderDetails.items.map((item) => (
+                        <div key={`order-detail-item-${orderDetails.order.id}-${item.productId}`} className="order-drawer-item">
+                          <div>{item.name}</div>
+                          <div className="muted">{item.quantity} x ${item.unitPrice.toFixed(2)}</div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                <div className="row">
+                  <strong>Результаты сборки</strong>
+                  {orderDetails.itemsStatus.length === 0 ? (
+                    <div className="muted">Сборка ещё не началась или данные недоступны.</div>
+                  ) : (
+                    <div className="order-drawer-items">
+                      {orderDetails.itemsStatus.map((item) => {
+                        const statusKey = String(item.resultStatus || 'pending').toLowerCase();
+                        const statusLabel = PICK_ITEM_RESULT_LABELS[statusKey] || item.resultStatus;
+                        return (
+                          <div key={`order-detail-pick-${orderDetails.order.id}-${item.id}`} className="order-drawer-item">
+                            <div className="inline-actions" style={{ justifyContent: 'space-between' }}>
+                              <strong>{item.productName}</strong>
+                              <span className={`badge pick-result-${statusKey}`}>{statusLabel}</span>
+                            </div>
+                            <div className="muted">
+                              Собрано: {item.pickedQty}/{item.requestedQty}
+                            </div>
+                            {item.substituteProductName ? (
+                              <div className="muted">Замена: {item.substituteProductName}</div>
+                            ) : null}
+                            {item.resultNote ? (
+                              <div className="muted">Комментарий: {item.resultNote}</div>
+                            ) : null}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+
+                <div className="row">
+                  <strong>События заказа</strong>
+                  {orderDetails.events.length === 0 ? (
+                    <div className="muted">Событий пока нет.</div>
+                  ) : (
+                    <div className="order-events-list">
+                      {orderDetails.events.map((event, index) => {
+                        const statusKey = event.status as Status;
+                        const label = STATUS_LABELS[statusKey] || event.status;
+                        return (
+                          <div key={`order-event-${orderDetails.order.id}-${index}`} className="order-event">
+                            <div className="order-event-dot" />
+                            <div>
+                              <div><strong>{label}</strong> <span className="muted">{new Date(event.createdAt).toLocaleString()}</span></div>
+                              {event.comment ? <div className="muted">{event.comment}</div> : null}
+                              {event.createdBy ? <div className="muted">Кто: {event.createdBy}</div> : null}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              </div>
+            ) : null}
+          </aside>
+        </div>
+      ) : null}
 
       {loggedIn ? (
         <nav className="mobile-dock" aria-label="Мобильная навигация">
